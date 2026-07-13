@@ -202,8 +202,10 @@ SELECT * FROM multinom_evaluate('species_model', 'iris', 'species');
 ```
 
 The outcome is the class-label column (any type); every other column is a
-numeric/boolean feature — dummy-encode categoricals first (below). Regularization,
-offset, and weights aren't available for multinomial yet.
+numeric/boolean feature — dummy-encode categoricals first (below). `multinom_fit`
+takes optional `l2` / `l1` (ridge / lasso / elastic-net, penalizing each class's
+standardized coefficients, intercepts excluded); offset and weights aren't
+available for multinomial.
 
 ## Categorical features: `dummy_encode_sql`
 

@@ -839,7 +839,7 @@ CREATE OR REPLACE MACRO dummy_encode_sql(tbl, outcome) AS (
 --       + probs MAP(VARCHAR, DOUBLE) (full class distribution; probs['label']).
 --   multinom_evaluate(model, tbl, outcome) -> (n, accuracy, log_loss).
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE MACRO multinom_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10) AS TABLE
+CREATE OR REPLACE MACRO multinom_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, l1 := 0.0) AS TABLE
 WITH RECURSIVE
 __reg_mnum AS MATERIALIZED (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
 __reg_mflong AS MATERIALIZED (
@@ -874,6 +874,8 @@ __reg_mchk AS (
       THEN error('multinom_fit: outcome column "' || outcome || '" must have at least 2 distinct classes')
     WHEN (SELECT d FROM __reg_mfeats) = 0
       THEN error('multinom_fit: no feature columns besides the outcome')
+    WHEN l2 < 0 THEN error('multinom_fit: l2 must be >= 0, got ' || l2)
+    WHEN l1 < 0 THEN error('multinom_fit: l1 must be >= 0, got ' || l1)
     ELSE true END AS ok
 ),
 __reg_mpacked AS MATERIALIZED (
@@ -892,7 +894,9 @@ __reg_mpacked AS MATERIALIZED (
   )
 ),
 __reg_mcfg AS (
-  SELECT coalesce(learning_rate, 2.0 / D1) AS step
+  -- softmax gradient is L-Lipschitz with L <= (d+1)/2 on standardized data,
+  -- plus l2 from the ridge penalty
+  SELECT coalesce(learning_rate, 2.0 / (D1 + 2.0 * l2)) AS step
   FROM __reg_mpacked, __reg_mchk WHERE ok
 ),
 __reg_mgd AS (
@@ -907,10 +911,20 @@ __reg_mgd AS (
              list_aggregate(list_transform(bk, lambda v, j: abs(v - look[k][j])), 'max')), 'max')
   FROM (
     SELECT it, B, look,
-           list_transform(look, lambda bk, k: list_transform(bk, lambda lkj, j:
-               lkj + step * (list_sum(list_transform(res, lambda ob: ob.r[k] * ob.xs[j])) / n))) AS newB
+           -- L1 prox (soft-threshold) on the L2-inclusive gradient step, per
+           -- class per coefficient; the intercept (j=1) is unpenalized. No-op
+           -- when l1 = 0, so unpenalized / pure-ridge fits are unchanged.
+           list_transform(zstep, lambda zk, k: list_transform(zk, lambda zkj, j:
+               CASE WHEN j = 1 THEN zkj
+                    ELSE sign(zkj) * greatest(abs(zkj) - threshl1, 0.0) END)) AS newB
     FROM (
-      SELECT it, B, n, step, look,
+      SELECT it, B, look, step * l1 AS threshl1,
+             -- z[k][j] = look + step*((1/n) sum_i xs_ij r_ik - l2*look [not intercept])
+             list_transform(look, lambda bk, k: list_transform(bk, lambda lkj, j:
+                 lkj + step * (list_sum(list_transform(res, lambda ob: ob.r[k] * ob.xs[j])) / n
+                               - CASE WHEN j = 1 THEN 0.0 ELSE l2 * lkj END))) AS zstep
+      FROM (
+        SELECT it, B, n, step, look,
              list_transform(rows, lambda rw: struct_pack(
                  xs := rw.xs,
                  r := list_transform(rw.yv, lambda yvk, k:
@@ -924,6 +938,7 @@ __reg_mgd AS (
         FROM __reg_mgd g, __reg_mpacked p, __reg_mcfg c
         WHERE g.it < max_iter AND g.move >= tol
       )
+    )
     )
   )
 ),

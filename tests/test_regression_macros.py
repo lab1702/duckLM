@@ -935,6 +935,45 @@ class TestMultinomial:
         preds = con.execute("SELECT DISTINCT pred FROM multinom_predict('mmodel','mtrain')").df()["pred"]
         assert set(preds) <= {"low", "mid", "high"}
 
+    def test_l1_produces_sparsity_and_l2_shrinks(self, con):
+        rng = np.random.default_rng(307)
+        n, d = 4000, 5
+        X = rng.normal(0, 1, (n, d)) * [1, 2, 0.5, 3, 1]
+        Xs = (X - X.mean(0)) / X.std(0)
+        # sparse per-class truth (several genuinely-zero coefficients)
+        eta = np.column_stack([np.zeros(n),
+                               Xs @ [0.8, 0, -1.0, 0, 0.5],
+                               Xs @ [-0.5, 0.9, 0, 0, 0]])
+        P = np.exp(eta); P /= P.sum(1, keepdims=True)
+        y = np.array([rng.choice(3, p=P[i]) for i in range(n)])
+        cols = [f"x{i + 1}" for i in range(d)]
+        df = pd.DataFrame(X, columns=cols).assign(y=y)
+        _load(con, "mtrain", df)
+
+        def coefs(**kw):
+            extra = _params(kw)
+            rows = con.execute(f"SELECT class, feature, coefficient FROM multinom_fit('mtrain','y'{extra})").fetchall()
+            return {(c, f): v for c, f, v in rows}
+
+        lasso = coefs(l1=0.05)
+        zeros = [k for k, v in lasso.items() if k[1] != "(Intercept)" and k[0] != "0" and v == 0.0]
+        assert len(zeros) >= 3                              # feature selection per class
+        # l1=l2=0 is a no-op
+        base, plain = coefs(l1=0.0, l2=0.0), coefs()
+        assert max(abs(base[k] - plain[k]) for k in plain) < 1e-9
+        # L2 shrinks the (non-intercept) coefficient norm
+        def norm(m):
+            return sum(v * v for k, v in m.items() if k[1] != "(Intercept)")
+        assert norm(coefs(l2=2.0)) < norm(coefs())
+
+    def test_negative_penalty_errors(self, con):
+        df, X, y = self._softmax_data(308, n=200)
+        _load(con, "mtrain", df)
+        for p in ("l1", "l2"):
+            with pytest.raises(DuckDBError) as e:
+                con.execute(f"SELECT * FROM multinom_fit('mtrain','y', {p} := -1.0)").fetchall()
+            assert f"{p} must be >= 0" in str(e.value)
+
     def test_single_class_errors(self, con):
         df = pd.DataFrame({"x1": [0.1, 0.2, 0.3], "y": [1, 1, 1]})
         _load(con, "mtrain", df)
