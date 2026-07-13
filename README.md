@@ -122,15 +122,27 @@ SELECT * FROM gamma_predict('severity_model', 'open_claims');
   string — score with the same column spellings you trained with.
 - The training set is materialized as an in-memory list during optimization —
   comfortable up to a few hundred thousand rows × dozens of features.
-- `__reg_fit` and `__reg_score` are internal helpers; call the four public
+- `__reg_fit` and `__reg_score` are internal helpers; call the eight public
   macros instead.
+
+## Testing
+
+Two independent paths (details in [tests/README.md](tests/README.md)):
+
+```bash
+# Python suite: every fit/predict checked against scikit-learn on fixed-seed data
+python -m venv .venv && .venv/Scripts/python -m pip install -r tests/requirements.txt
+.venv/Scripts/python -m pytest tests/ -q
+
+# Pure-SQL smoke test: no Python, just the DuckDB CLI
+duckdb < tests/smoke.sql
+```
 
 ## Files
 
-- [regression_macros.sql](regression_macros.sql) — all four macros + shared core
+- [regression_macros.sql](regression_macros.sql) — all eight macros + shared core
+- [tests/](tests) — pytest suite (vs scikit-learn) and a pure-SQL smoke test
 - [LICENSE](LICENSE) — MIT
-- `.venv/` — project-local Python venv (numpy/scikit-learn/duckdb) used only
-  for validating the macros against reference implementations
 
 ## License
 

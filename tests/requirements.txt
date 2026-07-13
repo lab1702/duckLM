@@ -1,0 +1,7 @@
+# Test dependencies for the Python suite (tests/test_regression_macros.py).
+# The pure-SQL smoke test (tests/smoke.sql) needs only the DuckDB CLI.
+duckdb>=1.5
+numpy
+pandas
+scikit-learn
+pytest

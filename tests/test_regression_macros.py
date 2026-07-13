@@ -1,0 +1,451 @@
+"""Deterministic test suite for the duckLM DuckDB regression macros.
+
+Every fit/predict is checked against an independent scikit-learn reference on
+the same data (fixed seeds), so a failure means the macros disagree with a
+trusted implementation -- not merely that some previously-recorded number
+changed. Mirrors the adversarial verification the macros were developed under,
+in a form anyone can reproduce with `pytest`.
+
+Run from the repo root:  pytest -q
+"""
+
+import warnings
+from pathlib import Path
+
+import duckdb
+import numpy as np
+import pandas as pd
+import pytest
+from sklearn.linear_model import (
+    GammaRegressor,
+    LinearRegression,
+    LogisticRegression,
+    PoissonRegressor,
+    Ridge,
+)
+
+warnings.filterwarnings("ignore")  # silence sklearn solver/deprecation chatter
+
+MACRO_FILE = Path(__file__).resolve().parents[1] / "regression_macros.sql"
+DuckDBError = getattr(duckdb, "Error", Exception)
+
+
+# --------------------------------------------------------------------------- #
+# Fixtures & helpers
+# --------------------------------------------------------------------------- #
+@pytest.fixture(scope="session")
+def con():
+    c = duckdb.connect()
+    c.execute(MACRO_FILE.read_text())
+    return c
+
+
+def _load(con, name, df):
+    con.register(f"_src_{name}", df)
+    con.execute(f"CREATE OR REPLACE TABLE {name} AS SELECT * FROM _src_{name}")
+    con.unregister(f"_src_{name}")
+
+
+def _params(kw):
+    return "".join(f", {k} := {v}" for k, v in kw.items())
+
+
+def fit(con, macro, df, outcome="y", **kw):
+    """Return {feature: coefficient} from a *_fit macro."""
+    _load(con, "traindata", df)
+    rows = con.execute(
+        f"SELECT feature, coefficient FROM {macro}('traindata', '{outcome}'{_params(kw)})"
+    ).fetchall()
+    return {f: c for f, c in rows}
+
+
+def predict(con, macro, coefs, data, **kw):
+    """Run a *_predict macro given a coefficient dict and a scoring DataFrame."""
+    model = pd.DataFrame({"feature": list(coefs), "coefficient": list(coefs.values())})
+    _load(con, "modeltbl", model)
+    _load(con, "scoredata", data)
+    return con.execute(
+        f"SELECT * FROM {macro}('modeltbl', 'scoredata'{_params(kw)})"
+    ).df()
+
+
+def zscore(X):
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0)  # population sd (ddof=0), matching the macro
+    return (X - mu) / sd, mu, sd
+
+
+def mixed_features(seed, n=800):
+    """Three features with deliberately different means and scales."""
+    rng = np.random.default_rng(seed)
+    return np.column_stack([
+        rng.normal(2, 3, n),
+        rng.normal(-1, 0.5, n),
+        rng.normal(10, 4, n),
+    ])
+
+
+def frame(X, y):
+    df = pd.DataFrame(X, columns=[f"x{i + 1}" for i in range(X.shape[1])])
+    df["y"] = y
+    return df
+
+
+NAMES = ["x1", "x2", "x3"]
+
+
+def assert_coefs(coefs, intercept, slopes, *, atol, rtol, names=NAMES):
+    assert coefs["(Intercept)"] == pytest.approx(intercept, abs=atol, rel=rtol)
+    for name, ref in zip(names, slopes):
+        assert coefs[name] == pytest.approx(ref, abs=atol, rel=rtol)
+
+
+def logreg_unpenalized(X, y):
+    return LogisticRegression(
+        C=np.inf, solver="newton-cholesky", max_iter=10000, tol=1e-11
+    ).fit(X, y)
+
+
+# --------------------------------------------------------------------------- #
+# Statistical correctness vs scikit-learn (unpenalized)
+# --------------------------------------------------------------------------- #
+class TestStatisticalCorrectness:
+    def test_linreg_matches_sklearn(self, con):
+        X = mixed_features(11)
+        rng = np.random.default_rng(101)
+        y = 3 + X @ [1.5, -2.0, 0.4] + rng.normal(0, 2, len(X))
+        coefs = fit(con, "linreg_fit", frame(X, y))
+        ref = LinearRegression().fit(X, y)
+        assert_coefs(coefs, ref.intercept_, ref.coef_, atol=1e-6, rtol=1e-6)
+
+    def test_linreg_noiseless_exact_recovery(self, con):
+        X = mixed_features(14, n=1000)
+        y = 2.5 + X @ [-1.2, 0.3, 0.05]  # no noise
+        coefs = fit(con, "linreg_fit", frame(X, y))
+        assert_coefs(coefs, 2.5, [-1.2, 0.3, 0.05], atol=1e-7, rtol=0)
+
+    def test_logit_matches_sklearn(self, con):
+        X = mixed_features(1)
+        Xs, _, _ = zscore(X)
+        rng = np.random.default_rng(1)
+        y = rng.binomial(1, 1 / (1 + np.exp(-(0.5 + Xs @ [1.0, -0.8, 0.3]))))
+        coefs = fit(con, "logit_fit", frame(X, y))
+        ref = logreg_unpenalized(X, y)
+        assert_coefs(coefs, ref.intercept_[0], ref.coef_[0], atol=1e-4, rtol=1e-4)
+
+    def test_poisson_matches_sklearn(self, con):
+        X = mixed_features(2)
+        Xs, _, _ = zscore(X)
+        rng = np.random.default_rng(2)
+        y = rng.poisson(np.exp(0.8 + Xs @ [0.4, -0.3, 0.2])).astype(float)
+        coefs = fit(con, "poisson_fit", frame(X, y))
+        ref = PoissonRegressor(alpha=0, max_iter=20000, tol=1e-12).fit(X, y)
+        assert_coefs(coefs, ref.intercept_, ref.coef_, atol=1e-5, rtol=1e-4)
+
+    def test_gamma_matches_sklearn(self, con):
+        X = mixed_features(3)
+        Xs, _, _ = zscore(X)
+        rng = np.random.default_rng(3)
+        mu = np.exp(1.0 + Xs @ [0.5, -0.2, 0.3])
+        y = rng.gamma(2.0, mu / 2.0)  # positive, mean mu
+        coefs = fit(con, "gamma_fit", frame(X, y))
+        ref = GammaRegressor(alpha=0, max_iter=20000, tol=1e-12).fit(X, y)
+        assert_coefs(coefs, ref.intercept_, ref.coef_, atol=1e-5, rtol=1e-4)
+
+
+# --------------------------------------------------------------------------- #
+# Ridge (L2) regularization
+# --------------------------------------------------------------------------- #
+class TestRidge:
+    L2 = 0.5
+
+    def test_ridge_linear(self, con):
+        X = mixed_features(21)
+        rng = np.random.default_rng(201)
+        y = 3 + X @ [1.5, -2.0, 0.5] + rng.normal(0, 2, len(X))
+        n = len(X)
+        _, _, sd = zscore(X)
+        coefs = fit(con, "linreg_fit", frame(X, y), l2=self.L2)
+        Xs, _, _ = zscore(X)
+        ref = Ridge(alpha=n * self.L2).fit(Xs, (y - y.mean()) / y.std())
+        got = np.array([coefs[c] for c in NAMES]) * sd / y.std()
+        assert got == pytest.approx(ref.coef_, abs=1e-7)
+
+    def test_ridge_logistic(self, con):
+        X = mixed_features(22)
+        Xs, _, sd = zscore(X)
+        rng = np.random.default_rng(202)
+        y = rng.binomial(1, 1 / (1 + np.exp(-(0.4 + Xs @ [1.1, -0.9, 0.5]))))
+        n = len(X)
+        coefs = fit(con, "logit_fit", frame(X, y), l2=self.L2)
+        ref = LogisticRegression(
+            C=1 / (n * self.L2), solver="newton-cholesky", max_iter=20000, tol=1e-12
+        ).fit(Xs, y)
+        got = np.array([coefs[c] for c in NAMES]) * sd
+        assert got == pytest.approx(ref.coef_[0], abs=1e-7)
+
+    def test_ridge_poisson(self, con):
+        X = mixed_features(23)
+        Xs, _, sd = zscore(X)
+        rng = np.random.default_rng(203)
+        y = rng.poisson(np.exp(0.5 + Xs @ [0.4, -0.3, 0.2])).astype(float)
+        coefs = fit(con, "poisson_fit", frame(X, y), l2=self.L2)
+        ref = PoissonRegressor(alpha=self.L2, max_iter=20000, tol=1e-12).fit(
+            Xs, y / y.mean()
+        )
+        got = np.array([coefs[c] for c in NAMES]) * sd
+        assert got == pytest.approx(ref.coef_, abs=1e-7)
+
+    def test_ridge_gamma(self, con):
+        X = mixed_features(24)
+        Xs, _, sd = zscore(X)
+        rng = np.random.default_rng(204)
+        y = rng.gamma(2.0, np.exp(0.6 + Xs @ [0.3, -0.2, 0.25]) / 2.0)
+        coefs = fit(con, "gamma_fit", frame(X, y), l2=self.L2)
+        ref = GammaRegressor(alpha=self.L2, max_iter=20000, tol=1e-12).fit(
+            Xs, y / y.mean()
+        )
+        got = np.array([coefs[c] for c in NAMES]) * sd
+        assert got == pytest.approx(ref.coef_, abs=1e-7)
+
+    def test_l2_zero_equals_unpenalized(self, con):
+        X = mixed_features(25)
+        rng = np.random.default_rng(205)
+        y = 1 + X @ [0.7, -1.1, 0.2] + rng.normal(0, 1, len(X))
+        base = fit(con, "linreg_fit", frame(X, y))
+        zero = fit(con, "linreg_fit", frame(X, y), l2=0.0)
+        for k in base:
+            assert zero[k] == pytest.approx(base[k], abs=1e-12)
+
+    def test_l2_monotonic_shrinkage(self, con):
+        X = mixed_features(26)
+        Xs, _, sd = zscore(X)
+        rng = np.random.default_rng(206)
+        y = rng.binomial(1, 1 / (1 + np.exp(-(0.3 + Xs @ [1.2, -1.0, 0.6]))))
+        df = frame(X, y)
+        norms = []
+        for l2 in [0.01, 0.1, 1.0, 10.0, 100.0]:
+            coefs = fit(con, "logit_fit", df, l2=l2)
+            std_slopes = np.array([coefs[c] for c in NAMES]) * sd
+            norms.append(np.linalg.norm(std_slopes))
+        assert all(a > b for a, b in zip(norms, norms[1:])), norms
+
+    def test_ridge_matches_drop_null_reference(self, con):
+        """Ridge standardizes over complete rows: matches drop-NULLs-then-fit."""
+        X = mixed_features(27)
+        rng = np.random.default_rng(207)
+        y = 2 + X @ [1.0, -1.5, 0.3] + rng.normal(0, 1.5, len(X))
+        df = frame(X, y)
+        mask = rng.random(len(X)) < 0.12
+        df.loc[mask, "x1"] = np.nan  # NULLs in one column only
+        coefs = fit(con, "linreg_fit", df, l2=self.L2)
+        comp = ~mask
+        Xc = X[comp]
+        _, _, sdc = zscore(Xc)
+        yc = y[comp]
+        Xsc, _, _ = zscore(Xc)
+        ref = Ridge(alpha=comp.sum() * self.L2).fit(Xsc, (yc - yc.mean()) / yc.std())
+        got = np.array([coefs[c] for c in NAMES]) * sdc / yc.std()
+        assert got == pytest.approx(ref.coef_, abs=1e-7)
+
+
+# --------------------------------------------------------------------------- #
+# Predict semantics
+# --------------------------------------------------------------------------- #
+class TestPredict:
+    def _simple_model(self, con):
+        X = mixed_features(31, n=400)
+        rng = np.random.default_rng(301)
+        y = rng.binomial(1, 1 / (1 + np.exp(-(0.2 + zscore(X)[0] @ [1.0, -0.7, 0.4]))))
+        return fit(con, "logit_fit", frame(X, y)), frame(X, y)
+
+    def test_logit_predict_prob_and_pred(self, con):
+        coefs, df = self._simple_model(con)
+        out = predict(con, "logit_predict", coefs, df.drop(columns="y"))
+        z = coefs["(Intercept)"] + df[NAMES].to_numpy() @ [coefs[c] for c in NAMES]
+        assert out["prob"].to_numpy() == pytest.approx(1 / (1 + np.exp(-z)), abs=1e-12)
+        assert (out["pred"] == (out["prob"] >= 0.5)).all()
+        assert ((out["prob"] >= 0) & (out["prob"] <= 1)).all()
+
+    def test_threshold(self, con):
+        coefs, df = self._simple_model(con)
+        default = predict(con, "logit_predict", coefs, df.drop(columns="y"))
+        high = predict(con, "logit_predict", coefs, df.drop(columns="y"), threshold=0.9)
+        assert (default["prob"].to_numpy() == pytest.approx(high["prob"].to_numpy()))
+        assert (high["pred"] == (high["prob"] >= 0.9)).all()
+
+    def test_linreg_predict_is_score(self, con):
+        X = mixed_features(32, n=300)
+        rng = np.random.default_rng(302)
+        y = 1 + X @ [0.5, -0.3, 0.2] + rng.normal(0, 1, len(X))
+        coefs = fit(con, "linreg_fit", frame(X, y))
+        out = predict(con, "linreg_predict", coefs, frame(X, y).drop(columns="y"))
+        expected = coefs["(Intercept)"] + X @ [coefs[c] for c in NAMES]
+        assert out["prediction"].to_numpy() == pytest.approx(expected, abs=1e-10)
+
+    def test_poisson_predict_is_exp_score(self, con):
+        X = mixed_features(33, n=300)
+        rng = np.random.default_rng(303)
+        y = rng.poisson(np.exp(0.5 + zscore(X)[0] @ [0.3, -0.2, 0.1])).astype(float)
+        coefs = fit(con, "poisson_fit", frame(X, y))
+        out = predict(con, "poisson_predict", coefs, frame(X, y).drop(columns="y"))
+        z = coefs["(Intercept)"] + X @ [coefs[c] for c in NAMES]
+        assert out["prediction"].to_numpy() == pytest.approx(np.exp(z), rel=1e-10)
+        assert (out["prediction"] > 0).all()
+
+    def test_gamma_predict_is_exp_score(self, con):
+        X = mixed_features(34, n=300)
+        rng = np.random.default_rng(304)
+        y = rng.gamma(2.0, np.exp(0.6 + zscore(X)[0] @ [0.3, -0.2, 0.2]) / 2.0)
+        coefs = fit(con, "gamma_fit", frame(X, y))
+        out = predict(con, "gamma_predict", coefs, frame(X, y).drop(columns="y"))
+        z = coefs["(Intercept)"] + X @ [coefs[c] for c in NAMES]
+        assert out["prediction"].to_numpy() == pytest.approx(np.exp(z), rel=1e-10)
+
+    def test_null_feature_gives_null_prediction(self, con):
+        coefs, df = self._simple_model(con)
+        data = df.drop(columns="y").copy()
+        data.loc[[0, 5, 9], "x1"] = np.nan
+        out = predict(con, "logit_predict", coefs, data)
+        assert out["prob"].isna().to_numpy().nonzero()[0].tolist() == [0, 5, 9]
+
+    def test_missing_column_gives_null(self, con):
+        coefs, df = self._simple_model(con)
+        out = predict(con, "logit_predict", coefs, df.drop(columns=["y", "x3"]))
+        assert out["prob"].isna().all()
+
+    def test_extra_columns_passthrough_and_order(self, con):
+        coefs, df = self._simple_model(con)
+        data = df.drop(columns="y").copy()
+        data.insert(0, "id", range(len(data)))
+        data["label"] = ["row%d" % i for i in range(len(data))]
+        out = predict(con, "logit_predict", coefs, data)
+        assert out["id"].tolist() == list(range(len(data)))  # order preserved
+        assert out["label"].tolist() == data["label"].tolist()
+        base = predict(con, "logit_predict", coefs, df.drop(columns="y"))
+        assert out["prob"].to_numpy() == pytest.approx(base["prob"].to_numpy())
+
+
+# --------------------------------------------------------------------------- #
+# Edge cases
+# --------------------------------------------------------------------------- #
+class TestEdgeCases:
+    @pytest.mark.parametrize("value", [4.0, 5.0, 4.2, 0.1, np.pi, -7.3, 1e6])
+    def test_constant_feature_coefficient_exactly_zero(self, con, value):
+        X = mixed_features(41, n=300)[:, :2]
+        rng = np.random.default_rng(401)
+        y = 1 + X @ [1.2, -0.8] + rng.normal(0, 1, len(X))
+        df = pd.DataFrame({"x1": X[:, 0], "x2": X[:, 1], "cst": value, "y": y})
+        coefs = fit(con, "linreg_fit", df)
+        assert coefs["cst"] == 0.0  # exactly, not merely near 0
+
+    def test_null_rows_dropped_matches_complete_fit(self, con):
+        X = mixed_features(42, n=500)
+        rng = np.random.default_rng(402)
+        y = 1 + X @ [0.8, -1.2, 0.4] + rng.normal(0, 1, len(X))
+        df = frame(X, y)
+        fmask = rng.random(len(X)) < 0.1
+        ymask = rng.random(len(X)) < 0.05
+        df.loc[fmask, "x1"] = np.nan
+        df.loc[ymask, "y"] = np.nan
+        coefs = fit(con, "linreg_fit", df)
+        comp = ~(fmask | ymask)
+        ref = LinearRegression().fit(X[comp], y[comp])
+        assert_coefs(coefs, ref.intercept_, ref.coef_, atol=1e-4, rtol=1e-4)
+
+    def test_boolean_outcome(self, con):
+        X = mixed_features(43, n=300)
+        rng = np.random.default_rng(403)
+        yb = rng.binomial(1, 1 / (1 + np.exp(-(0.3 + zscore(X)[0] @ [1.0, -0.6, 0.3]))))
+        df = frame(X, yb)
+        df["y"] = df["y"].astype(bool)
+        coefs = fit(con, "logit_fit", df)
+        ref = logreg_unpenalized(X, yb)
+        assert_coefs(coefs, ref.intercept_[0], ref.coef_[0], atol=1e-4, rtol=1e-4)
+
+    def test_integer_and_decimal_features(self, con):
+        rng = np.random.default_rng(404)
+        n = 400
+        xi = rng.integers(-10, 10, n)
+        xd = np.round(rng.normal(0, 1, n), 3)
+        y = 1 + 0.2 * xi - 0.5 * xd + rng.normal(0, 1, n)
+        con.execute("CREATE OR REPLACE TABLE traindata AS SELECT * FROM (VALUES "
+                    + ",".join(f"({int(a)}, {b}, {c})" for a, b, c in zip(xi, xd, y))
+                    + ") AS t(xi, xd, y)")
+        rows = con.execute(
+            "SELECT feature, coefficient FROM linreg_fit('traindata', 'y')"
+        ).fetchall()
+        coefs = {f: c for f, c in rows}
+        ref = LinearRegression().fit(np.column_stack([xi, xd]), y)
+        assert coefs["xi"] == pytest.approx(ref.coef_[0], abs=1e-6)
+        assert coefs["xd"] == pytest.approx(ref.coef_[1], abs=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# Error handling & reserved names
+# --------------------------------------------------------------------------- #
+class TestErrors:
+    def _tiny(self, con, cols="x DOUBLE, y INTEGER", rows="(1.0, 1), (2.0, 0)"):
+        con.execute(f"CREATE OR REPLACE TABLE traindata AS SELECT * FROM (VALUES {rows}) "
+                    f"AS t({', '.join(c.split()[0] for c in cols.split(','))})")
+
+    def _err(self, con, sql):
+        with pytest.raises(DuckDBError) as e:
+            con.execute(sql).fetchall()
+        return str(e.value)
+
+    def test_logit_nonbinary(self, con):
+        con.execute("CREATE OR REPLACE TABLE t AS SELECT * FROM (VALUES (1.0,1),(2.0,2)) v(x,y)")
+        assert "binary" in self._err(con, "SELECT * FROM logit_fit('t','y')")
+
+    def test_poisson_negative(self, con):
+        con.execute("CREATE OR REPLACE TABLE t AS SELECT * FROM (VALUES (1.0,-1.0),(2.0,3.0)) v(x,y)")
+        assert "non-negative" in self._err(con, "SELECT * FROM poisson_fit('t','y')")
+
+    def test_gamma_nonpositive(self, con):
+        con.execute("CREATE OR REPLACE TABLE t AS SELECT * FROM (VALUES (1.0,0.0),(2.0,3.0)) v(x,y)")
+        assert "strictly positive" in self._err(con, "SELECT * FROM gamma_fit('t','y')")
+
+    def test_entirely_null_feature(self, con):
+        con.execute("CREATE OR REPLACE TABLE t AS SELECT NULL::DOUBLE x1, 2.0 x2, 1 y "
+                    "UNION ALL SELECT NULL, 3.0, 0")
+        msg = self._err(con, "SELECT * FROM logit_fit('t','y')")
+        assert "entirely NULL" in msg and "x1" in msg
+
+    def test_no_feature_columns(self, con):
+        con.execute("CREATE OR REPLACE TABLE t AS SELECT * FROM (VALUES (1),(0)) v(y)")
+        assert "no feature columns" in self._err(con, "SELECT * FROM linreg_fit('t','y')")
+
+    def test_no_complete_rows(self, con):
+        con.execute("CREATE OR REPLACE TABLE t AS SELECT NULL::DOUBLE x1, 2.0 x2, 1 y "
+                    "UNION ALL SELECT 3.0, NULL, 0")
+        assert "no complete" in self._err(con, "SELECT * FROM logit_fit('t','y')")
+
+    def test_negative_l2(self, con):
+        con.execute("CREATE OR REPLACE TABLE t AS SELECT * FROM (VALUES (1.0,1),(2.0,0)) v(x,y)")
+        assert "l2 must be >= 0" in self._err(con, "SELECT * FROM logit_fit('t','y', l2 := -1.0)")
+
+    def test_reserved_column_name(self, con):
+        con.execute('CREATE OR REPLACE TABLE t AS SELECT 1.0 "__reg_rid__", 1 y '
+                    "UNION ALL SELECT 2.0, 0")
+        assert "reserved" in self._err(con, "SELECT * FROM logit_fit('t','y')")
+
+    def test_intercept_feature_name(self, con):
+        con.execute('CREATE OR REPLACE TABLE t AS SELECT 1.0 "(Intercept)", 1 y '
+                    "UNION ALL SELECT 2.0, 0")
+        assert "(Intercept)" in self._err(con, "SELECT * FROM logit_fit('t','y')")
+
+    def test_prob_pred_collision(self, con):
+        con.execute("CREATE OR REPLACE TABLE m AS SELECT 'x' feature, 1.0 coefficient")
+        con.execute("CREATE OR REPLACE TABLE d AS SELECT 1.0 x, 0.5 prob")
+        assert "prob" in self._err(con, "SELECT * FROM logit_predict('m','d')")
+
+    def test_prediction_collision(self, con):
+        con.execute("CREATE OR REPLACE TABLE m AS SELECT 'x' feature, 1.0 coefficient")
+        con.execute("CREATE OR REPLACE TABLE d AS SELECT 1.0 x, 0.5 prediction")
+        assert "prediction" in self._err(con, "SELECT * FROM linreg_predict('m','d')")
+
+    def test_nonexistent_table(self, con):
+        assert "no_such_table" in self._err(
+            con, "SELECT * FROM linreg_fit('no_such_table','y')"
+        )
