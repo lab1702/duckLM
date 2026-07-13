@@ -77,7 +77,7 @@
 -- same name. The __reg_ prefix is reserved (and enforced below) so that
 -- shadowing cannot happen.
 
-CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2) AS TABLE
+CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2, offset_col) AS TABLE
 WITH RECURSIVE
 -- Every column cast to DOUBLE, with a synthetic row id.
 __reg_wide AS MATERIALIZED (
@@ -131,24 +131,34 @@ __reg_namecheck AS (
     FROM __reg_cols
 ),
 -- Feature columns that have at least one non-NULL value anywhere. Used for
--- the "entirely NULL column" check and to define a complete row.
+-- the "entirely NULL column" check and to define a complete row. The outcome
+-- and the optional offset column are not features. coalesce(offset_col, '')
+-- turns "no offset" into a name no real column can have.
 __reg_featcols AS (
-    SELECT DISTINCT col AS colname FROM __reg_long WHERE col != outcome
+    SELECT DISTINCT col AS colname FROM __reg_long
+    WHERE col != outcome AND col != coalesce(offset_col, '')
 ),
--- Rows used for training: every feature column AND the outcome non-NULL.
--- Standardization (below) is computed over exactly these rows so that ridge,
--- whose penalty is on the standardized coefficients, matches "drop the NULL
--- rows, then standardize" no matter which columns the NULLs sit in. For
--- unpenalized fits and for tables with no NULLs this changes nothing (the fit
--- is invariant to the standardization scale, and with no NULLs every row is
--- complete).
+-- Number of columns every complete row must have non-NULL: features + outcome
+-- + offset (when supplied).
+__reg_reqn AS (
+    SELECT (SELECT count(*) FROM __reg_featcols) + 1
+           + CASE WHEN offset_col IS NOT NULL THEN 1 ELSE 0 END AS req
+),
+-- Rows used for training: every feature column, the outcome, and the offset
+-- (if any) non-NULL. Standardization (below) is computed over exactly these
+-- rows so that ridge, whose penalty is on the standardized coefficients,
+-- matches "drop the NULL rows, then standardize" no matter which columns the
+-- NULLs sit in. For unpenalized fits and for tables with no NULLs this changes
+-- nothing (the fit is invariant to the standardization scale, and with no
+-- NULLs every row is complete).
 __reg_complete AS (
-    SELECT x.rid
-    FROM __reg_long x
-    JOIN __reg_long yv ON yv.rid = x.rid AND yv.col = outcome
-    WHERE x.col != outcome
-    GROUP BY x.rid
-    HAVING count(*) = (SELECT count(*) FROM __reg_featcols)
+    SELECT rid
+    FROM __reg_long
+    WHERE col = outcome
+       OR col = coalesce(offset_col, '')
+       OR col IN (SELECT colname FROM __reg_featcols)
+    GROUP BY rid
+    HAVING count(*) = (SELECT req FROM __reg_reqn)
 ),
 __reg_clong AS MATERIALIZED (
     SELECT l.rid, l.col, l.v
@@ -165,7 +175,7 @@ __reg_stats AS MATERIALIZED (
            CASE WHEN min(v) = max(v) THEN min(v) ELSE avg(v) END AS mu,
            CASE WHEN min(v) = max(v) THEN 1.0     ELSE stddev_pop(v) END AS sigma
     FROM __reg_clong
-    WHERE col != outcome
+    WHERE col != outcome AND col != coalesce(offset_col, '')
     GROUP BY col
 ),
 __reg_feats AS MATERIALIZED (
@@ -195,34 +205,49 @@ __reg_ystats AS (
 -- The whole training set packed into one row: a list of {y, xs} structs where
 -- xs = [1.0 (intercept), standardized features in name order]. __reg_clong is
 -- already restricted to complete rows.
+-- Each row carries y (transformed), xs (standardized features), and o, the
+-- internal offset. An offset is a known per-row term in the linear predictor
+-- eta = o + xs.beta; it is not fit and not penalized. For the log-link
+-- families it passes through unchanged (dividing y by its mean only shifts the
+-- intercept); for linear the outcome is z-scored, so the offset is divided by
+-- sd_y to live on the same scale. o = 0 when no offset column is given.
 __reg_packed AS MATERIALIZED (
-    SELECT list(struct_pack(y := y, xs := xs)) AS rows, count(*)::DOUBLE AS n
+    SELECT list(struct_pack(y := y, xs := xs, o := o)) AS rows, count(*)::DOUBLE AS n
     FROM (
         SELECT x.rid,
                (any_value(yv.v) - any_value(ys.mu_y)) / any_value(ys.sd_y) AS y,
-               [1.0::DOUBLE] || list((x.v - s.mu) / s.sigma ORDER BY x.col) AS xs
+               [1.0::DOUBLE] || list((x.v - s.mu) / s.sigma ORDER BY x.col) AS xs,
+               coalesce(any_value(ov.v), 0.0)
+                 / (CASE WHEN family = 'linear' THEN any_value(ys.sd_y) ELSE 1.0 END) AS o
         FROM __reg_clong x
         JOIN __reg_stats s  ON s.col = x.col
         JOIN __reg_clong yv ON yv.rid = x.rid AND yv.col = outcome
+        LEFT JOIN __reg_clong ov ON ov.rid = x.rid AND ov.col = coalesce(offset_col, '')
         CROSS JOIN __reg_ystats ys
-        WHERE x.col != outcome
+        WHERE x.col != outcome AND x.col != coalesce(offset_col, '')
         GROUP BY x.rid
     )
 ),
 __reg_cfg AS (
     SELECT CASE
-             WHEN (SELECT count(*) FROM __reg_cols WHERE colname != outcome) = 0
+             WHEN offset_col IS NOT NULL
+                    AND offset_col NOT IN (SELECT colname FROM __reg_cols)
+               THEN error(caller || ': offset column "' || offset_col || '" not found')
+             WHEN (SELECT count(*) FROM __reg_cols
+                   WHERE colname != outcome AND colname != coalesce(offset_col, '')) = 0
                THEN error(caller || ': no feature columns besides the outcome')
              -- A feature column with no non-NULL values anywhere never reaches
              -- __reg_featcols; silently fitting without it would surprise, so
              -- reject it (as R's glm() and scikit-learn do). Checked on an
              -- all-rows basis so it fires independently of complete-row count.
              WHEN (SELECT count(*) FROM __reg_featcols)
-                    != (SELECT count(*) FROM __reg_cols WHERE colname != outcome)
+                    != (SELECT count(*) FROM __reg_cols
+                        WHERE colname != outcome AND colname != coalesce(offset_col, ''))
                THEN error(caller || ': feature column(s) entirely NULL: '
                           || (SELECT string_agg('"' || colname || '"', ', ')
                               FROM __reg_cols
                               WHERE colname != outcome
+                                AND colname != coalesce(offset_col, '')
                                 AND colname NOT IN (SELECT colname FROM __reg_featcols))
                           || '; drop them (e.g. SELECT * EXCLUDE (...)) or fill them')
              WHEN p.n = 0 THEN error(caller || ': no complete (non-NULL) rows to train on')
@@ -286,17 +311,20 @@ __reg_gd AS (
             FROM (
                 SELECT it, betas, rows, n, step, look,
                        -- residual per training row: the per-row gradient in z.
-                       -- logistic/linear/poisson: y - yhat(xs . look);
-                       -- gamma (log link): y/mu - 1 with mu = exp(xs . look).
+                       -- The linear predictor is the offset plus xs . look;
+                       -- the offset is fixed, so it enters the fitted value but
+                       -- not the gradient wrt beta (which stays xs * r).
+                       -- logistic/linear/poisson: y - yhat(eta);
+                       -- gamma (log link): y/mu - 1 with mu = exp(eta).
                        list_transform(rows, lambda rw: struct_pack(
                            xs := rw.xs,
                            r  := CASE WHEN family = 'logistic'
-                                      THEN rw.y - 1.0 / (1.0 + exp(-list_dot_product(rw.xs, look)))
+                                      THEN rw.y - 1.0 / (1.0 + exp(-(list_dot_product(rw.xs, look) + rw.o)))
                                       WHEN family = 'poisson'
-                                      THEN rw.y - exp(least(list_dot_product(rw.xs, look), 700.0))
+                                      THEN rw.y - exp(least(list_dot_product(rw.xs, look) + rw.o, 700.0))
                                       WHEN family = 'gamma'
-                                      THEN rw.y / exp(greatest(least(list_dot_product(rw.xs, look), 700.0), -700.0)) - 1.0
-                                      ELSE rw.y - list_dot_product(rw.xs, look)
+                                      THEN rw.y / exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)) - 1.0
+                                      ELSE rw.y - (list_dot_product(rw.xs, look) + rw.o)
                                  END)) AS res
                 FROM (
                     SELECT g.it, g.betas, p.rows, p.n, c.step,
@@ -339,9 +367,10 @@ ORDER BY (feature = '(Intercept)') DESC, feature;
 
 
 -- Shared scorer: returns the input rows plus the linear score
--- __reg_score__ = intercept + sum(coefficient * feature value), NULL for rows
--- where a model feature is missing or NULL.
-CREATE OR REPLACE MACRO __reg_score(model, tbl, caller) AS TABLE
+-- __reg_score__ = offset + intercept + sum(coefficient * feature value), NULL
+-- for rows where a model feature (or the offset, when requested) is missing or
+-- NULL. offset_col is a column name or NULL.
+CREATE OR REPLACE MACRO __reg_score(model, tbl, caller, offset_col) AS TABLE
 WITH
 __reg_numbered AS MATERIALIZED (
     SELECT row_number() OVER () AS __reg_rid__, *
@@ -398,53 +427,61 @@ __reg_scores AS (
     CROSS JOIN __reg_meta m
     WHERE c.feature != '(Intercept)'
     GROUP BY l.rid, m.b0, m.k
+),
+-- Per-row offset (only when offset_col is given). NULL offsets were dropped by
+-- the UNPIVOT, so a requested-but-missing offset nulls the score below.
+__reg_offset AS (
+    SELECT rid, v AS o FROM __reg_long WHERE col = offset_col
 )
 SELECT n.*,
-       coalesce(s.z, CASE WHEN m.k = 0 THEN m.b0 END) AS __reg_score__
+       CASE WHEN offset_col IS NOT NULL AND o.o IS NULL THEN NULL
+            ELSE coalesce(s.z, CASE WHEN m.k = 0 THEN m.b0 END) + coalesce(o.o, 0.0)
+       END AS __reg_score__
 FROM __reg_numbered n
 CROSS JOIN __reg_meta m
-LEFT JOIN __reg_scores s ON s.rid = n.__reg_rid__;
+LEFT JOIN __reg_scores s ON s.rid = n.__reg_rid__
+LEFT JOIN __reg_offset o ON o.rid = n.__reg_rid__;
 
 
 -- ---------------------------------------------------------------------------
 -- Public wrappers
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE MACRO logit_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'logistic', 'logit_fit', max_iter, learning_rate, tol, l2);
+CREATE OR REPLACE MACRO logit_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL) AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'logistic', 'logit_fit', max_iter, learning_rate, tol, l2, offset_col);
 
-CREATE OR REPLACE MACRO linreg_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'linear', 'linreg_fit', max_iter, learning_rate, tol, l2);
+CREATE OR REPLACE MACRO linreg_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL) AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'linear', 'linreg_fit', max_iter, learning_rate, tol, l2, offset_col);
 
-CREATE OR REPLACE MACRO logit_predict(model, tbl, threshold := 0.5) AS TABLE
+CREATE OR REPLACE MACRO logit_predict(model, tbl, threshold := 0.5, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
        1.0 / (1.0 + exp(-__reg_score__)) AS prob,
        1.0 / (1.0 + exp(-__reg_score__)) >= threshold AS pred
-FROM __reg_score(model, tbl, 'logit_predict')
+FROM __reg_score(model, tbl, 'logit_predict', offset_col)
 ORDER BY __reg_rid__;
 
-CREATE OR REPLACE MACRO linreg_predict(model, tbl) AS TABLE
+CREATE OR REPLACE MACRO linreg_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
        __reg_score__ AS prediction
-FROM __reg_score(model, tbl, 'linreg_predict')
+FROM __reg_score(model, tbl, 'linreg_predict', offset_col)
 ORDER BY __reg_rid__;
 
-CREATE OR REPLACE MACRO poisson_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'poisson', 'poisson_fit', max_iter, learning_rate, tol, l2);
+CREATE OR REPLACE MACRO poisson_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL) AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'poisson', 'poisson_fit', max_iter, learning_rate, tol, l2, offset_col);
 
-CREATE OR REPLACE MACRO poisson_predict(model, tbl) AS TABLE
+CREATE OR REPLACE MACRO poisson_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
        exp(__reg_score__) AS prediction
-FROM __reg_score(model, tbl, 'poisson_predict')
+FROM __reg_score(model, tbl, 'poisson_predict', offset_col)
 ORDER BY __reg_rid__;
 
-CREATE OR REPLACE MACRO gamma_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'gamma', 'gamma_fit', max_iter, learning_rate, tol, l2);
+CREATE OR REPLACE MACRO gamma_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL) AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'gamma', 'gamma_fit', max_iter, learning_rate, tol, l2, offset_col);
 
-CREATE OR REPLACE MACRO gamma_predict(model, tbl) AS TABLE
+CREATE OR REPLACE MACRO gamma_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
        exp(__reg_score__) AS prediction
-FROM __reg_score(model, tbl, 'gamma_predict')
+FROM __reg_score(model, tbl, 'gamma_predict', offset_col)
 ORDER BY __reg_rid__;
 
 
@@ -461,7 +498,7 @@ ORDER BY __reg_rid__;
 -- (intercept included); log-likelihoods, deviances, R^2 and AUC follow the
 -- standard statsmodels/scikit-learn definitions.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE MACRO __reg_eval(model, tbl, outcome, family, caller) AS TABLE
+CREATE OR REPLACE MACRO __reg_eval(model, tbl, outcome, family, caller, offset_col) AS TABLE
 WITH
 __reg_numbered AS MATERIALIZED (
     SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)
@@ -477,11 +514,18 @@ __reg_meta AS (
            (SELECT count(*) FROM __reg_coefs WHERE feature != '(Intercept)')                  AS kfeat,
            (SELECT count(*) FROM __reg_coefs)                                                  AS kparams
 ),
--- Linear predictor z = b0 + sum(coef * feature); NULL if a model feature is
--- missing or NULL for the row.
+__reg_offset AS (SELECT rid, v AS o FROM __reg_long WHERE col = offset_col),
+-- Linear predictor z = offset + b0 + sum(coef * feature); NULL if a model
+-- feature (or a requested offset) is missing or NULL for the row.
 __reg_z AS (
-    SELECT l.rid, CASE WHEN count(*) = m.kfeat THEN m.b0 + sum(c.coefficient * l.v) END AS z
-    FROM __reg_coefs c JOIN __reg_long l ON l.col = c.feature CROSS JOIN __reg_meta m
+    SELECT l.rid,
+           CASE WHEN count(*) = m.kfeat
+                     AND (offset_col IS NULL OR any_value(o.o) IS NOT NULL)
+                THEN m.b0 + sum(c.coefficient * l.v) + coalesce(any_value(o.o), 0.0) END AS z
+    FROM __reg_coefs c
+    JOIN __reg_long l ON l.col = c.feature
+    CROSS JOIN __reg_meta m
+    LEFT JOIN __reg_offset o ON o.rid = l.rid
     WHERE c.feature != '(Intercept)'
     GROUP BY l.rid, m.b0, m.kfeat
 ),
@@ -566,18 +610,18 @@ FROM __reg_agg a, __reg_null nu, __reg_auc au, __reg_meta m, __reg_evalcheck ck
 WHERE ck.ok;
 
 
-CREATE OR REPLACE MACRO linreg_evaluate(model, tbl, outcome) AS TABLE
+CREATE OR REPLACE MACRO linreg_evaluate(model, tbl, outcome, offset_col := NULL) AS TABLE
 SELECT n, rmse, mae, r2, adj_r2, loglik, aic, bic
-FROM __reg_eval(model, tbl, outcome, 'linear', 'linreg_evaluate');
+FROM __reg_eval(model, tbl, outcome, 'linear', 'linreg_evaluate', offset_col);
 
-CREATE OR REPLACE MACRO logit_evaluate(model, tbl, outcome) AS TABLE
+CREATE OR REPLACE MACRO logit_evaluate(model, tbl, outcome, offset_col := NULL) AS TABLE
 SELECT n, accuracy, auc, log_loss, loglik, deviance, null_deviance, pseudo_r2, aic, bic
-FROM __reg_eval(model, tbl, outcome, 'logistic', 'logit_evaluate');
+FROM __reg_eval(model, tbl, outcome, 'logistic', 'logit_evaluate', offset_col);
 
-CREATE OR REPLACE MACRO poisson_evaluate(model, tbl, outcome) AS TABLE
+CREATE OR REPLACE MACRO poisson_evaluate(model, tbl, outcome, offset_col := NULL) AS TABLE
 SELECT n, rmse, mae, loglik, deviance, null_deviance, pseudo_r2, aic, bic
-FROM __reg_eval(model, tbl, outcome, 'poisson', 'poisson_evaluate');
+FROM __reg_eval(model, tbl, outcome, 'poisson', 'poisson_evaluate', offset_col);
 
-CREATE OR REPLACE MACRO gamma_evaluate(model, tbl, outcome) AS TABLE
+CREATE OR REPLACE MACRO gamma_evaluate(model, tbl, outcome, offset_col := NULL) AS TABLE
 SELECT n, rmse, mae, deviance, null_deviance, pseudo_r2, dispersion
-FROM __reg_eval(model, tbl, outcome, 'gamma', 'gamma_evaluate');
+FROM __reg_eval(model, tbl, outcome, 'gamma', 'gamma_evaluate', offset_col);

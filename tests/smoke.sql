@@ -95,4 +95,15 @@ SELECT CASE
     ELSE error('SMOKE FAIL: logit_evaluate metrics out of range')
   END;
 
+-- Offset/exposure: fit and predict with a log-exposure offset; predictions
+-- stay positive and finite through the offset path.
+CREATE TABLE expo AS SELECT i AS x1, ln(1.0 + (i % 5)) AS logexp, (i % 4) AS y FROM range(300) t(i);
+CREATE TABLE expo_m AS SELECT * FROM poisson_fit('expo', 'y', offset_col := 'logexp');
+SELECT CASE
+    WHEN (SELECT bool_and(prediction > 0 AND NOT isinf(prediction))
+          FROM poisson_predict('expo_m', 'expo', offset_col := 'logexp'))
+    THEN 'PASS  poisson with offset predicts positive means'
+    ELSE error('SMOKE FAIL: poisson offset prediction not positive/finite')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;

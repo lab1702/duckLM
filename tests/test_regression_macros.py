@@ -80,13 +80,13 @@ def predict(con, macro, coefs, data, **kw):
     ).df()
 
 
-def evaluate(con, macro, coefs, data, outcome="y"):
+def evaluate(con, macro, coefs, data, outcome="y", **kw):
     """Run a *_evaluate macro and return its single metrics row as a Series."""
     model = pd.DataFrame({"feature": list(coefs), "coefficient": list(coefs.values())})
     _load(con, "modeltbl", model)
     _load(con, "scoredata", data)
     return con.execute(
-        f"SELECT * FROM {macro}('modeltbl', 'scoredata', '{outcome}')"
+        f"SELECT * FROM {macro}('modeltbl', 'scoredata', '{outcome}'{_params(kw)})"
     ).df().iloc[0]
 
 
@@ -447,6 +447,71 @@ class TestEvaluate:
         with pytest.raises(DuckDBError) as e:
             evaluate(con, "linreg_evaluate", coefs, frame(X, y), outcome="not_a_column")
         assert "no rows" in str(e.value)
+
+
+# --------------------------------------------------------------------------- #
+# Offset / exposure
+# --------------------------------------------------------------------------- #
+class TestOffset:
+    def _poisson_exposure(self, seed, n=1500):
+        rng = np.random.default_rng(seed)
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        expo = rng.uniform(0.5, 5, n)
+        logo = np.log(expo)
+        y = rng.poisson(expo * np.exp(-0.4 + 0.7 * x1 - 0.3 * x2)).astype(float)
+        return pd.DataFrame({"x1": x1, "x2": x2, "logexp": logo, "y": y}), x1, x2, logo, y
+
+    def test_poisson_offset_matches_glm(self, con):
+        # unpenalized Poisson with log-exposure offset == statsmodels-style GLM;
+        # cross-checked here against sklearn PoissonRegressor on the residualised
+        # target is awkward, so verify the score-equation optimality instead:
+        # sum((y - exposure*exp(xb)) * x_j) ~ 0.
+        df, x1, x2, logo, y = self._poisson_exposure(61)
+        coefs = fit(con, "poisson_fit", df, offset_col="'logexp'")
+        z = coefs["(Intercept)"] + coefs["x1"] * x1 + coefs["x2"] * x2 + logo
+        resid = y - np.exp(z)
+        n = len(y)
+        for col, xv in [("intercept", np.ones(n)), ("x1", x1), ("x2", x2)]:
+            assert abs((resid * xv).sum()) / n < 1e-6, col
+
+    def test_offset_changes_fit(self, con):
+        df, *_ = self._poisson_exposure(62)
+        with_off = fit(con, "poisson_fit", df, offset_col="'logexp'")
+        # dropping exposure entirely forces the intercept to absorb mean exposure
+        ignored = fit(con, "poisson_fit", df.drop(columns="logexp"))
+        assert abs(with_off["(Intercept)"] - ignored["(Intercept)"]) > 0.5
+
+    def test_predict_with_offset(self, con):
+        df, x1, x2, logo, y = self._poisson_exposure(63)
+        coefs = fit(con, "poisson_fit", df, offset_col="'logexp'")
+        out = predict(con, "poisson_predict", coefs, df, offset_col="'logexp'")
+        z = coefs["(Intercept)"] + coefs["x1"] * x1 + coefs["x2"] * x2 + logo
+        assert out["prediction"].to_numpy() == pytest.approx(np.exp(z), rel=1e-9)
+
+    def test_null_offset_row_gives_null_prediction(self, con):
+        df, *_ = self._poisson_exposure(64)
+        coefs = fit(con, "poisson_fit", df, offset_col="'logexp'")
+        data = df.drop(columns="y").copy()
+        data.loc[[0, 7], "logexp"] = np.nan
+        out = predict(con, "poisson_predict", coefs, data, offset_col="'logexp'")
+        assert out["prediction"].isna().to_numpy().nonzero()[0].tolist() == [0, 7]
+
+    def test_evaluate_with_offset(self, con):
+        df, x1, x2, logo, y = self._poisson_exposure(65)
+        coefs = fit(con, "poisson_fit", df, offset_col="'logexp'")
+        mu = predict(con, "poisson_predict", coefs, df, offset_col="'logexp'")["prediction"].to_numpy()
+        m = evaluate(con, "poisson_evaluate", coefs, df, offset_col="'logexp'")
+        from sklearn.metrics import mean_poisson_deviance
+        assert m["deviance"] == pytest.approx(len(y) * mean_poisson_deviance(y, mu), rel=1e-8)
+
+    def test_missing_offset_column_errors(self, con):
+        df, *_ = self._poisson_exposure(66)
+        _load(con, "traindata", df)
+        with pytest.raises(DuckDBError) as e:
+            con.execute(
+                "SELECT * FROM poisson_fit('traindata', 'y', offset_col := 'nope')"
+            ).fetchall()
+        assert "offset column" in str(e.value) and "nope" in str(e.value)
 
 
 # --------------------------------------------------------------------------- #

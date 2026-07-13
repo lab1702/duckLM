@@ -3,10 +3,10 @@
 Twelve table macros for DuckDB **1.5+**, no extensions required: **fit**,
 **predict**, and **evaluate** for binary logistic regression, ordinary
 least-squares linear regression, Poisson regression, and Gamma regression
-(both log link), each with optional ridge (L2) regularization. Everything runs
-inside DuckDB — training is Nesterov-accelerated gradient descent implemented
-with a recursive CTE and list lambdas, sharing a single optimizer core across
-all four model families.
+(both log link), each with optional ridge (L2) regularization and an optional
+offset/exposure term. Everything runs inside DuckDB — training is
+Nesterov-accelerated gradient descent implemented with a recursive CTE and list
+lambdas, sharing a single optimizer core across all four model families.
 
 ## Setup
 
@@ -52,11 +52,26 @@ SELECT * FROM rev_model;
 | `learning_rate` | `NULL` | step size on the standardized scale; `NULL` auto-picks a convergent default (`4/(d+1+4·l2)` logistic, `1/(d+1+l2)` otherwise; Poisson/Gamma steps are additionally damped each iteration by the largest curvature weight, since theirs is unbounded) |
 | `tol` | `1e-10` | stop early when the gradient step is smaller than this |
 | `l2` | `0.0` | ridge penalty `(l2/2)·Σβ²` added to the mean loss of the internally standardized problem, intercept unpenalized |
+| `offset_col` | `NULL` | name of a column holding a per-row **offset** added to the linear predictor `η = offset + xβ` with a fixed coefficient of 1 (not fit, not penalized) |
 
 Coefficients are on the **original feature scale** (features — and for
 linear/Poisson/Gamma regression the outcome — are rescaled internally only
 for optimizer conditioning), so unpenalized results match R's `glm()`/`lm()`,
 statsmodels, or unpenalized scikit-learn up to convergence tolerance.
+
+**Offset / exposure.** An offset is a known per-row term in the linear
+predictor — most often `log(exposure)` for a Poisson/Gamma rate model (claims
+per policy-year, events per person-time). Pass the column name via
+`offset_col`, and pass the same `offset_col` to the matching `*_predict` /
+`*_evaluate` so scoring includes it. Matches R's `offset=` /
+statsmodels' GLM `offset=`.
+
+```sql
+-- claims modelled per unit of exposure: E[claims] = exposure · exp(xβ)
+CREATE TABLE m AS
+SELECT * FROM poisson_fit('policies', 'n_claims', offset_col := 'log_exposure');
+SELECT * FROM poisson_predict('m', 'new_policies', offset_col := 'log_exposure');
+```
 
 **Ridge semantics.** Like glmnet, the penalty applies to *standardized*
 coefficients, so a given `l2` has comparable strength regardless of feature
