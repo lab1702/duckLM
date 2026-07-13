@@ -116,4 +116,15 @@ SELECT CASE
     ELSE error('SMOKE FAIL: weighted linreg wrong with constant weights')
   END;
 
+-- Tweedie (power 1.5): fits zero-inflated positive data (compound
+-- Poisson-Gamma) and predicts strictly positive, finite means.
+CREATE TABLE tw AS SELECT i AS x1, CASE WHEN i % 3 = 0 THEN 0.0 ELSE 1.0 + (i % 5) END AS y FROM range(300) t(i);
+CREATE TABLE tw_m AS SELECT * FROM tweedie_fit('tw', 'y', power := 1.5);
+SELECT CASE
+    WHEN (SELECT bool_and(prediction > 0 AND NOT isinf(prediction)) FROM tweedie_predict('tw_m', 'tw'))
+     AND (SELECT pseudo_r2 FROM tweedie_evaluate('tw_m', 'tw', 'y', power := 1.5)) IS NOT NULL
+    THEN 'PASS  tweedie fits zero-inflated data, predicts positive means'
+    ELSE error('SMOKE FAIL: tweedie prediction not positive/finite')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;

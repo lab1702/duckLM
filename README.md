@@ -1,12 +1,13 @@
-# duckLM — logistic, linear, Poisson & Gamma regression in pure DuckDB SQL
+# duckLM — logistic, linear, Poisson, Gamma & Tweedie regression in pure DuckDB SQL
 
-Twelve table macros for DuckDB **1.5+**, no extensions required: **fit**,
-**predict**, and **evaluate** for binary logistic regression, ordinary
-least-squares linear regression, Poisson regression, and Gamma regression
-(both log link), each with optional ridge (L2) regularization, an offset/
-exposure term, and sample weights. Everything runs inside DuckDB — training is
-Nesterov-accelerated gradient descent implemented with a recursive CTE and list
-lambdas, sharing a single optimizer core across all four model families.
+Table macros for DuckDB **1.5+**, no extensions required: **fit**, **predict**,
+and **evaluate** for binary logistic regression, ordinary least-squares linear
+regression, Poisson regression, Gamma regression, and Tweedie regression (all
+but linear use a log link), each with optional ridge (L2) regularization, an
+offset/exposure term, and sample weights. Everything runs inside DuckDB —
+training is Nesterov-accelerated gradient descent implemented with a recursive
+CTE and list lambdas, sharing a single optimizer core across all model
+families.
 
 ## Setup
 
@@ -30,6 +31,11 @@ SELECT * FROM poisson_fit('policies', 'n_claims');
 
 CREATE TABLE severity_model AS
 SELECT * FROM gamma_fit('claims', 'claim_amount');
+
+-- Tweedie for zero-inflated positive data (insurance pure premium):
+-- power=1.5 is the compound Poisson-Gamma; p=1 is Poisson, p=2 is Gamma
+CREATE TABLE pure_premium AS
+SELECT * FROM tweedie_fit('policies', 'loss_cost', power := 1.5);
 
 -- optional ridge regularization on any family
 CREATE TABLE churn_model_reg AS
@@ -85,6 +91,16 @@ CREATE TABLE m AS
 SELECT * FROM linreg_fit('survey', 'income', weights_col := 'sampling_weight');
 ```
 
+**Tweedie.** `tweedie_fit(tbl, outcome, power := 1.5, ...)` takes a variance
+power *p* that unifies the log-link families: *p*=1 is Poisson, *p*=2 is Gamma,
+and **1<*p*<2** is the compound Poisson-Gamma that models data with **exact
+zeros and positive continuous values together** — the classic insurance
+pure-premium / loss-cost use case. `tweedie_predict` returns `exp(score)`;
+`tweedie_evaluate(model, tbl, outcome, power := 1.5)` returns Tweedie deviance,
+deviance-based pseudo-R², and Pearson dispersion. Outcomes must be ≥ 0 for
+1≤*p*<2 (strictly positive for *p*≥2). Matches
+`TweedieRegressor(power=p, alpha=0, link='log')`.
+
 **Ridge semantics.** Like glmnet, the penalty applies to *standardized*
 coefficients, so a given `l2` has comparable strength regardless of feature
 or outcome scale, and the intercept is never penalized. Exact scikit-learn
@@ -113,6 +129,9 @@ SELECT * FROM poisson_predict('claims_model', 'new_policies');
 
 -- gamma: adds prediction DOUBLE = exp(score), the expected value
 SELECT * FROM gamma_predict('severity_model', 'open_claims');
+
+-- tweedie: adds prediction DOUBLE = exp(score), the expected value
+SELECT * FROM tweedie_predict('pure_premium', 'renewals');
 ```
 
 ## Evaluating: `logit_evaluate` / `linreg_evaluate` / `poisson_evaluate` / `gamma_evaluate`
@@ -138,6 +157,7 @@ SELECT * FROM logit_evaluate('churn_model', 'training_data', 'churned');
 | `logit_evaluate` | `n, accuracy, auc, log_loss, loglik, deviance, null_deviance, pseudo_r2, aic, bic` |
 | `poisson_evaluate` | `n, rmse, mae, loglik, deviance, null_deviance, pseudo_r2, aic, bic` |
 | `gamma_evaluate` | `n, rmse, mae, deviance, null_deviance, pseudo_r2, dispersion` |
+| `tweedie_evaluate` | `n, rmse, mae, deviance, null_deviance, pseudo_r2, dispersion` |
 
 `pseudo_r2` is McFadden's (logistic) or deviance-based (Poisson/Gamma); `aic`
 and `bic` use *k* = number of model coefficients (intercept included). Gamma's
@@ -179,7 +199,7 @@ deviance-based pseudo-R², and the Pearson `dispersion` instead.
 - The training set is materialized as an in-memory list during optimization —
   comfortable up to a few hundred thousand rows × dozens of features.
 - `__reg_fit`, `__reg_score`, and `__reg_eval` are internal helpers; call the
-  twelve public macros instead.
+  fifteen public macros instead.
 
 ## Testing
 
@@ -196,7 +216,7 @@ duckdb < tests/smoke.sql
 
 ## Files
 
-- [regression_macros.sql](regression_macros.sql) — all twelve macros + shared core
+- [regression_macros.sql](regression_macros.sql) — all fifteen macros + shared core
 - [tests/](tests) — pytest suite (vs scikit-learn) and a pure-SQL smoke test
 - [LICENSE](LICENSE) — MIT
 

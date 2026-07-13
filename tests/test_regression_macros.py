@@ -23,6 +23,7 @@ from sklearn.linear_model import (
     PoissonRegressor,
     Ridge,
 )
+from sklearn.linear_model import TweedieRegressor
 from sklearn.metrics import (
     accuracy_score,
     d2_tweedie_score,
@@ -31,6 +32,7 @@ from sklearn.metrics import (
     mean_gamma_deviance,
     mean_poisson_deviance,
     mean_squared_error,
+    mean_tweedie_deviance,
     r2_score,
     roc_auc_score,
 )
@@ -512,6 +514,86 @@ class TestOffset:
                 "SELECT * FROM poisson_fit('traindata', 'y', offset_col := 'nope')"
             ).fetchall()
         assert "offset column" in str(e.value) and "nope" in str(e.value)
+
+
+# --------------------------------------------------------------------------- #
+# Tweedie regression
+# --------------------------------------------------------------------------- #
+class TestTweedie:
+    def _compound(self, seed, n=3000, zero_frac=0.3):
+        """Compound Poisson-Gamma: a fraction of exact zeros plus positive."""
+        rng = np.random.default_rng(seed)
+        X = np.column_stack([rng.normal(0, 1, n), rng.normal(0, 1, n)])
+        mu = np.exp(0.5 + 0.6 * X[:, 0] - 0.3 * X[:, 1])
+        y = np.where(rng.random(n) < zero_frac, 0.0, rng.gamma(2.0, mu / 2.0))
+        return pd.DataFrame(X, columns=["x1", "x2"]).assign(y=y), X, y
+
+    @pytest.mark.parametrize("power", [1.3, 1.5, 1.7])
+    def test_tweedie_matches_sklearn(self, con, power):
+        df, X, y = self._compound(81 + int(power * 10))
+        coefs = fit(con, "tweedie_fit", df, power=power)
+        ref = TweedieRegressor(power=power, alpha=0, link="log",
+                               max_iter=100000, tol=1e-10).fit(X, y)
+        assert coefs["(Intercept)"] == pytest.approx(ref.intercept_, abs=1e-4, rel=1e-4)
+        assert np.array([coefs["x1"], coefs["x2"]]) == pytest.approx(ref.coef_, abs=1e-4, rel=1e-4)
+
+    def test_tweedie_p1_equals_poisson(self, con):
+        rng = np.random.default_rng(85)
+        X = np.column_stack([rng.normal(0, 1, 2000), rng.normal(0, 1, 2000)])
+        y = rng.poisson(np.exp(0.5 + 0.5 * X[:, 0] - 0.2 * X[:, 1])).astype(float)
+        df = pd.DataFrame(X, columns=["x1", "x2"]).assign(y=y)
+        tw = fit(con, "tweedie_fit", df, power=1.0)
+        po = fit(con, "poisson_fit", df)
+        for k in po:
+            assert tw[k] == pytest.approx(po[k], abs=1e-6)
+
+    def test_tweedie_p2_equals_gamma(self, con):
+        rng = np.random.default_rng(86)
+        X = np.column_stack([rng.normal(0, 1, 2000), rng.normal(0, 1, 2000)])
+        y = rng.gamma(2.0, np.exp(0.5 + 0.4 * X[:, 0]) / 2.0)
+        df = pd.DataFrame(X, columns=["x1", "x2"]).assign(y=y)
+        tw = fit(con, "tweedie_fit", df, power=2.0)
+        ga = fit(con, "gamma_fit", df)
+        for k in ga:
+            assert tw[k] == pytest.approx(ga[k], abs=1e-6)
+
+    def test_tweedie_handles_zeros(self, con):
+        df, X, y = self._compound(87, zero_frac=0.45)
+        assert (y == 0).mean() > 0.3  # genuinely zero-inflated
+        coefs = fit(con, "tweedie_fit", df, power=1.5)
+        assert all(np.isfinite(v) for v in coefs.values())
+
+    def test_tweedie_predict_is_exp_score(self, con):
+        df, X, y = self._compound(88)
+        coefs = fit(con, "tweedie_fit", df, power=1.5)
+        out = predict(con, "tweedie_predict", coefs, df)
+        z = coefs["(Intercept)"] + X @ [coefs["x1"], coefs["x2"]]
+        assert out["prediction"].to_numpy() == pytest.approx(np.exp(z), rel=1e-9)
+
+    @pytest.mark.parametrize("power", [1.3, 1.6])
+    def test_tweedie_evaluate_matches_sklearn(self, con, power):
+        df, X, y = self._compound(89 + int(power * 10))
+        coefs = fit(con, "tweedie_fit", df, power=power)
+        mu = predict(con, "tweedie_predict", coefs, df)["prediction"].to_numpy()
+        m = evaluate(con, "tweedie_evaluate", coefs, df, power=power)
+        n = len(y)
+        assert m["deviance"] == pytest.approx(n * mean_tweedie_deviance(y, mu, power=power), rel=1e-7)
+        assert m["pseudo_r2"] == pytest.approx(d2_tweedie_score(y, mu, power=power), rel=1e-7)
+
+    def test_tweedie_power_below_one_errors(self, con):
+        df, X, y = self._compound(91)
+        _load(con, "traindata", df)
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM tweedie_fit('traindata', 'y', power := 0.5)").fetchall()
+        assert "power must be >= 1" in str(e.value)
+
+    def test_tweedie_negative_outcome_errors(self, con):
+        df, X, y = self._compound(92)
+        df.loc[0, "y"] = -1.0
+        _load(con, "traindata", df)
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM tweedie_fit('traindata', 'y', power := 1.5)").fetchall()
+        assert "non-negative" in str(e.value)
 
 
 # --------------------------------------------------------------------------- #
