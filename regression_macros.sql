@@ -26,9 +26,12 @@
 --   multinom_predict(model, tbl)    -> input rows + pred + probs MAP
 --   multinom_evaluate(model, tbl, outcome) -> (n, accuracy, log_loss)
 --
--- Model selection (all k folds fit simultaneously in one recursive CTE):
---   cv_l2(tbl, outcome, family, l2_grid, k := 5) -> (l2, cv_deviance)
---       k-fold CV over a ridge grid; pick the l2 with the smallest cv_deviance.
+-- Cross-validation (all k folds fit simultaneously in one recursive CTE),
+-- returns (param, cv_deviance); pick the smallest cv_deviance:
+--   cv_l2(tbl, outcome, family, l2_grid, k := 5)   ridge, over linear/logistic/poisson/gamma
+--   cv_l1(tbl, outcome, family, l1_grid, k := 5)   lasso, same families
+--   cv_power(tbl, outcome, power_grid, k := 5)     Tweedie variance power
+--   cv_alpha(tbl, outcome, alpha_grid, k := 5)     negative binomial dispersion
 --
 -- Helper (returns SQL text, run it as a second step):
 --   dummy_encode_sql(tbl, outcome) -> VARCHAR: a SELECT that R-style dummy
@@ -1084,30 +1087,37 @@ FROM __reg_mrm;
 
 
 -- ---------------------------------------------------------------------------
--- Cross-validated ridge selection (pure SQL, all folds fit at once)
+-- Cross-validation for hyperparameter selection (pure SQL, all folds at once)
 --
--- cv_l2(tbl, outcome, family, l2_grid, k := 5) runs k-fold cross-validation
--- over a grid of ridge (l2) penalties for one family (linear / logistic /
--- poisson / gamma) and returns (l2, cv_deviance) -- the mean held-out deviance
--- (squared error for linear) per l2. Pick the l2 with the smallest cv_deviance.
+-- All k folds x |grid| models are fit SIMULTANEOUSLY in one recursive CTE (the
+-- coefficient state is a list of k*|grid| vectors); each fold-model's gradient
+-- sums only over rows outside its held-out fold, then held-out rows are scored.
+-- Standardization is global (cv.glmnet's default); folds are (row# - 1) % k
+-- (deterministic -- shuffle first if rows are ordered by the outcome). Returns
+-- one row per grid value with the mean held-out deviance (squared error for
+-- linear); pick the smallest cv_deviance. Cost scales with
+-- k * |grid| * features * rows * iterations -- keep the grid modest.
 --
--- All k folds x |grid| models are fit SIMULTANEOUSLY in one recursive CTE: the
--- coefficient state is a list of (k*|grid|) vectors, and each fold-model's
--- gradient sums only over the rows outside its held-out fold. Standardization
--- is global (over all rows), matching cv.glmnet's default. Folds are assigned
--- deterministically as (row_number - 1) % k, so results are reproducible;
--- shuffle the table first if its rows are ordered by the outcome. Cost scales
--- with k * |grid| * features * rows * iterations -- keep the grid modest.
+--   cv_l2(tbl, outcome, family, l2_grid, k := 5)  -> (l2, cv_deviance)
+--       ridge grid; family in linear/logistic/poisson/gamma
+--   cv_l1(tbl, outcome, family, l1_grid, k := 5)  -> (l1, cv_deviance)
+--       lasso grid; same families
+--   cv_power(tbl, outcome, power_grid, k := 5)     -> (power, cv_deviance)
+--       Tweedie variance power grid
+--   cv_alpha(tbl, outcome, alpha_grid, k := 5)     -> (alpha, cv_deviance)
+--       negative binomial dispersion grid
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE MACRO cv_l2(tbl, outcome, family, l2_grid, k := 5, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
+CREATE OR REPLACE MACRO __reg_cv(tbl, outcome, family, grid, sweep, k, max_iter, learning_rate, tol) AS TABLE
 WITH RECURSIVE
 __reg_cv_chk AS (
   SELECT CASE
-    WHEN family NOT IN ('linear','logistic','poisson','gamma')
-      THEN error('cv_l2: family must be one of linear, logistic, poisson, gamma')
-    WHEN k < 2 THEN error('cv_l2: k must be >= 2')
-    WHEN len(l2_grid) < 1 THEN error('cv_l2: l2_grid must be non-empty')
-    WHEN list_aggregate(l2_grid, 'min') < 0 THEN error('cv_l2: l2 values must be >= 0')
+    WHEN family NOT IN ('linear','logistic','poisson','gamma','tweedie','nbinom')
+      THEN error('cv: unsupported family ' || family)
+    WHEN k < 2 THEN error('cv: k must be >= 2')
+    WHEN len(grid) < 1 THEN error('cv: grid must be non-empty')
+    WHEN sweep IN ('l2','l1') AND list_aggregate(grid,'min') < 0 THEN error('cv: penalty values must be >= 0')
+    WHEN sweep = 'power' AND list_aggregate(grid,'min') < 1 THEN error('cv: tweedie power must be >= 1')
+    WHEN sweep = 'alpha' AND list_aggregate(grid,'min') <= 0 THEN error('cv: nbinom alpha must be > 0')
     ELSE true END AS ok
 ),
 __reg_cv_num AS MATERIALIZED (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
@@ -1130,22 +1140,27 @@ __reg_cv_feats AS MATERIALIZED (SELECT count(*)::INT AS d FROM __reg_cv_stats),
 __reg_cv_ys AS (
   SELECT CASE WHEN family='linear' THEN avg(y) ELSE 0.0 END AS mu_y,
          CASE WHEN family='logistic' THEN 1.0
-              WHEN family IN ('poisson','gamma') THEN (CASE WHEN avg(y)<1e-300 THEN 1.0 ELSE avg(y) END)
+              WHEN family IN ('poisson','gamma','tweedie','nbinom') THEN (CASE WHEN avg(y)<1e-300 THEN 1.0 ELSE avg(y) END)
               WHEN coalesce(stddev_pop(y),0)<1e-300 THEN 1.0 ELSE stddev_pop(y) END AS sd_y
   FROM __reg_cv_yraw
 ),
 __reg_cv_n AS (SELECT count(*)::DOUBLE AS n FROM __reg_cv_yraw),
 __reg_cv_foldsz AS (SELECT fold AS f, count(*)::DOUBLE AS sz FROM __reg_cv_yraw GROUP BY fold),
--- model arrays: model m = (g-1)*k + f + 1, over grid g and held-out fold f
+-- per-model hyperparameters: model m = (g-1)*k + f + 1
 __reg_cv_marr AS (
-  SELECT list(l2 ORDER BY m) AS ml2, list(f ORDER BY m) AS mfold,
-         list(ntrain ORDER BY m) AS mntrain, count(*)::INT AS M
-  FROM (SELECT (g-1)*k + f + 1 AS m, f, l2_grid[g] AS l2,
-               (SELECT n FROM __reg_cv_n) - coalesce((SELECT sz FROM __reg_cv_foldsz z WHERE z.f = t.f), 0) AS ntrain
-        FROM range(1, len(l2_grid)+1) tg(g), range(0, k) t(f))
+  SELECT list(l2 ORDER BY m) AS ml2, list(l1 ORDER BY m) AS ml1,
+         list(pw ORDER BY m) AS mpow, list(alpi ORDER BY m) AS malp_int,
+         list(f ORDER BY m) AS mfold, list(ntrain ORDER BY m) AS mntrain, count(*)::INT AS M
+  FROM (
+    SELECT (g-1)*k + f + 1 AS m, f,
+           CASE WHEN sweep='l2' THEN grid[g] ELSE 0.0 END AS l2,
+           CASE WHEN sweep='l1' THEN grid[g] ELSE 0.0 END AS l1,
+           CASE WHEN sweep='power' THEN grid[g] ELSE 1.5 END AS pw,
+           (CASE WHEN sweep='alpha' THEN grid[g] ELSE 1.0 END) * (SELECT sd_y FROM __reg_cv_ys) AS alpi,
+           (SELECT n FROM __reg_cv_n) - coalesce((SELECT sz FROM __reg_cv_foldsz z WHERE z.f=t.f),0) AS ntrain
+    FROM range(1,len(grid)+1) tg(g), range(0,k) t(f)
+  )
 ),
--- one row per observation: standardized features xs, transformed outcome yt,
--- original outcome y, and fold
 __reg_cv_rows AS MATERIALIZED (
   SELECT x.rid, any_value(yr.fold) AS fold, any_value(yr.y) AS y,
          (any_value(yr.y) - any_value(ys.mu_y)) / any_value(ys.sd_y) AS yt,
@@ -1153,13 +1168,11 @@ __reg_cv_rows AS MATERIALIZED (
   FROM __reg_cv_flong x JOIN __reg_cv_stats s ON s.col=x.col JOIN __reg_cv_yraw yr ON yr.rid=x.rid
   CROSS JOIN __reg_cv_ys ys GROUP BY x.rid
 ),
-__reg_cv_packed AS MATERIALIZED (
-  SELECT list(struct_pack(xs := xs, yt := yt, fold := fold)) AS rows FROM __reg_cv_rows
-),
+__reg_cv_packed AS MATERIALIZED (SELECT list(struct_pack(xs := xs, yt := yt, fold := fold)) AS rows FROM __reg_cv_rows),
 __reg_cv_cfg AS (
   SELECT coalesce(learning_rate,
-           CASE WHEN family='logistic' THEN 4.0/(f.d+1+4.0*list_aggregate(l2_grid,'max'))
-                ELSE 1.0/(f.d+1+list_aggregate(l2_grid,'max')) END) AS step,
+           CASE WHEN family='logistic' THEN 4.0/(f.d+1+4.0*list_aggregate(ma.ml2,'max'))
+                ELSE 1.0/(f.d+1+list_aggregate(ma.ml2,'max')) END) AS step,
          f.d + 1 AS D1, ma.M AS M
   FROM __reg_cv_feats f, __reg_cv_marr ma, __reg_cv_chk chk WHERE chk.ok
 ),
@@ -1175,58 +1188,83 @@ __reg_cv_gd AS (
              list_aggregate(list_transform(bm, lambda v, j: abs(v - look[m][j])), 'max')), 'max')
   FROM (
     SELECT it, B, look,
-           list_transform(look, lambda bm, m: list_transform(bm, lambda lmj, j:
-               lmj + (step/damp) * (
-                 list_sum(list_transform(res, lambda ob:
-                     CASE WHEN mfold[m] != ob.fold THEN ob.xs[j] * ob.r[m] ELSE 0.0 END)) / mntrain[m]
-                 - CASE WHEN j = 1 THEN 0.0 ELSE ml2[m] * lmj END))) AS newB
+           -- L1 prox on the L2-inclusive gradient step, per model per coef
+           list_transform(zstep, lambda zm, m: list_transform(zm, lambda zmj, j:
+               CASE WHEN j = 1 THEN zmj
+                    ELSE sign(zmj) * greatest(abs(zmj) - (step/damp)*ml1[m], 0.0) END)) AS newB
     FROM (
-      SELECT it, B, look, step, mfold, ml2, mntrain, res,
-             CASE WHEN family IN ('poisson','gamma')
-                  THEN greatest(1.0, list_aggregate(list_transform(res,
-                         lambda ob: list_aggregate(ob.hw, 'max')), 'max'))
-                  ELSE 1.0 END AS damp
+      SELECT it, B, look, step, damp, ml1,
+             list_transform(look, lambda bm, m: list_transform(bm, lambda lmj, j:
+                 lmj + (step/damp) * (
+                   list_sum(list_transform(res, lambda ob:
+                       CASE WHEN mfold[m] != ob.fold THEN ob.xs[j] * ob.r[m] ELSE 0.0 END)) / mntrain[m]
+                   - CASE WHEN j = 1 THEN 0.0 ELSE ml2[m] * lmj END))) AS zstep
       FROM (
-        SELECT it, B, look, step, mfold, ml2, mntrain,
-               list_transform(rows, lambda rw: struct_pack(
-                 xs := rw.xs, fold := rw.fold,
-                 r := list_transform(look, lambda bm:
-                        CASE WHEN family='logistic' THEN rw.yt - 1.0/(1.0+exp(-list_dot_product(rw.xs,bm)))
-                             WHEN family='poisson'  THEN rw.yt - exp(least(list_dot_product(rw.xs,bm),700.0))
-                             WHEN family='gamma'    THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)) - 1.0
-                             ELSE rw.yt - list_dot_product(rw.xs,bm) END),
-                 hw := list_transform(look, lambda bm:
-                        CASE WHEN family='poisson' THEN exp(least(list_dot_product(rw.xs,bm),700.0))
-                             WHEN family='gamma'   THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0))
-                             ELSE 0.0 END))) AS res
+        SELECT it, B, look, step, mfold, ml2, ml1, mntrain, res,
+               CASE WHEN family IN ('poisson','gamma','tweedie','nbinom')
+                    THEN greatest(1.0, list_aggregate(list_transform(res,
+                           lambda ob: list_aggregate(ob.hw, 'max')), 'max'))
+                    ELSE 1.0 END AS damp
         FROM (
-          SELECT g.it, g.B, p.rows, c.step, ma.mfold, ma.ml2, ma.mntrain,
-                 list_transform(g.B, lambda bm, m: list_transform(bm, lambda v, j:
-                     v + (g.it::DOUBLE/(g.it+3)) * (v - g.prev[m][j]))) AS look
-          FROM __reg_cv_gd g, __reg_cv_packed p, __reg_cv_cfg c, __reg_cv_marr ma
-          WHERE g.it < max_iter AND g.move >= tol
+          SELECT it, B, look, step, mfold, ml2, ml1, mntrain, mpow, malp_int,
+                 list_transform(rows, lambda rw: struct_pack(
+                   xs := rw.xs, fold := rw.fold,
+                   r := list_transform(look, lambda bm, m:
+                     (CASE WHEN family='logistic' THEN rw.yt - 1.0/(1.0+exp(-list_dot_product(rw.xs,bm)))
+                           WHEN family='poisson'  THEN rw.yt - exp(least(list_dot_product(rw.xs,bm),700.0))
+                           WHEN family='gamma'    THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)) - 1.0
+                           WHEN family='tweedie'  THEN (rw.yt - exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)))
+                                                       * pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)), 1.0 - mpow[m])
+                           WHEN family='nbinom'   THEN (rw.yt - exp(least(list_dot_product(rw.xs,bm),700.0)))
+                                                       / (1.0 + malp_int[m] * exp(least(list_dot_product(rw.xs,bm),700.0)))
+                           ELSE rw.yt - list_dot_product(rw.xs,bm) END)),
+                   hw := list_transform(look, lambda bm, m:
+                     (CASE WHEN family='poisson' THEN exp(least(list_dot_product(rw.xs,bm),700.0))
+                           WHEN family='gamma'   THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0))
+                           WHEN family='tweedie' THEN (2.0-mpow[m])*pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),2.0-mpow[m])
+                                                     + (mpow[m]-1.0)*rw.yt*pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),1.0-mpow[m])
+                           WHEN family='nbinom'  THEN exp(least(list_dot_product(rw.xs,bm),700.0))*(1.0+malp_int[m]*rw.yt)
+                                                     / pow(1.0+malp_int[m]*exp(least(list_dot_product(rw.xs,bm),700.0)),2.0)
+                           ELSE 0.0 END)))) AS res
+          FROM (
+            SELECT g.it, g.B, p.rows, c.step, ma.mfold, ma.ml2, ma.ml1, ma.mntrain, ma.mpow, ma.malp_int,
+                   list_transform(g.B, lambda bm, m: list_transform(bm, lambda v, j:
+                       v + (g.it::DOUBLE/(g.it+3)) * (v - g.prev[m][j]))) AS look
+            FROM __reg_cv_gd g, __reg_cv_packed p, __reg_cv_cfg c, __reg_cv_marr ma
+            WHERE g.it < max_iter AND g.move >= tol
+          )
         )
       )
     )
   )
 ),
 __reg_cv_sol AS (SELECT B FROM __reg_cv_gd ORDER BY it DESC LIMIT 1),
--- held-out scoring: each row scored by the model that held out its fold,
--- for every grid point; deviance on the original scale.
 __reg_cv_score AS (
   SELECT gg.g AS g, r.y AS y,
          list_dot_product(r.xs, s.B[(gg.g - 1) * k + r.fold + 1]) AS eta,
-         ys.mu_y AS mu_y, ys.sd_y AS sd_y
-  FROM __reg_cv_sol s, __reg_cv_rows r, __reg_cv_ys ys, range(1, len(l2_grid)+1) gg(g)
+         ys.mu_y AS mu_y, ys.sd_y AS sd_y,
+         CASE WHEN sweep='power' THEN grid[gg.g] ELSE 1.5 END AS pw,
+         CASE WHEN sweep='alpha' THEN grid[gg.g] ELSE 1.0 END AS al
+  FROM __reg_cv_sol s, __reg_cv_rows r, __reg_cv_ys ys, range(1, len(grid)+1) gg(g)
 )
-SELECT l2_grid[g] AS l2,
+SELECT grid[g] AS param,
        sum(CASE family
              WHEN 'linear'   THEN pow(y - (mu_y + sd_y * eta), 2)
-             WHEN 'logistic' THEN -2.0 * (y * ln(greatest(1.0/(1.0+exp(-eta)), 1e-15))
-                                          + (1-y) * ln(greatest(1.0 - 1.0/(1.0+exp(-eta)), 1e-15)))
+             WHEN 'logistic' THEN -2.0 * (y * ln(greatest(1.0/(1.0+exp(-eta)),1e-15)) + (1-y)*ln(greatest(1.0-1.0/(1.0+exp(-eta)),1e-15)))
              WHEN 'poisson'  THEN 2.0 * ((CASE WHEN y>0 THEN y*ln(y/(sd_y*exp(eta))) ELSE 0.0 END) - (y - sd_y*exp(eta)))
              WHEN 'gamma'    THEN 2.0 * (-ln(y/(sd_y*exp(eta))) + (y - sd_y*exp(eta))/(sd_y*exp(eta)))
+             WHEN 'tweedie'  THEN 2.0 * (pow(greatest(y,0.0),2.0-pw)/((1.0-pw)*(2.0-pw)) - y*pow(sd_y*exp(eta),1.0-pw)/(1.0-pw) + pow(sd_y*exp(eta),2.0-pw)/(2.0-pw))
+             WHEN 'nbinom'   THEN 2.0 * ((CASE WHEN y>0 THEN y*ln(y/(sd_y*exp(eta))) ELSE 0.0 END) - (y + 1.0/al)*ln((y + 1.0/al)/(sd_y*exp(eta) + 1.0/al)))
            END) / (SELECT n FROM __reg_cv_n) AS cv_deviance
 FROM __reg_cv_score
-GROUP BY g
+GROUP BY g, grid[g]
 ORDER BY g;
+CREATE OR REPLACE MACRO cv_l1(tbl, outcome, family, l1_grid, k := 5, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
+SELECT param AS l1, cv_deviance FROM __reg_cv(tbl, outcome, family, l1_grid, 'l1', k, max_iter, learning_rate, tol);
+CREATE OR REPLACE MACRO cv_power(tbl, outcome, power_grid, k := 5, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
+SELECT param AS power, cv_deviance FROM __reg_cv(tbl, outcome, 'tweedie', power_grid, 'power', k, max_iter, learning_rate, tol);
+CREATE OR REPLACE MACRO cv_alpha(tbl, outcome, alpha_grid, k := 5, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
+SELECT param AS alpha, cv_deviance FROM __reg_cv(tbl, outcome, 'nbinom', alpha_grid, 'alpha', k, max_iter, learning_rate, tol);
+
+CREATE OR REPLACE MACRO cv_l2(tbl, outcome, family, l2_grid, k := 5, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
+SELECT param AS l2, cv_deviance FROM __reg_cv(tbl, outcome, family, l2_grid, 'l2', k, max_iter, learning_rate, tol);

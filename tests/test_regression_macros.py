@@ -1200,6 +1200,70 @@ class TestCrossValidation:
         for l2 in grid:
             assert got[float(l2)] == pytest.approx(ref[l2], rel=1e-5, abs=1e-6), (fam, l2)
 
+    def test_cv_l1_matches_reference(self, con):
+        from sklearn.linear_model import Lasso, LogisticRegression
+        grid = [0.0, 0.01, 0.05]
+        for fam in ["linear", "logistic"]:
+            X, y = self._data(fam, 444 + len(fam))
+            n = len(y); fold = np.arange(n) % 5; Xs = (X - X.mean(0)) / X.std(0)
+            my, sy = y.mean(), y.std()
+            ref = {}
+            for l1 in grid:
+                tot = 0.0
+                for f in range(5):
+                    tr, te = fold != f, fold == f; ntr = tr.sum()
+                    if fam == "linear":
+                        m = Lasso(alpha=l1 if l1 > 0 else 1e-12, max_iter=200000, tol=1e-12).fit(Xs[tr], ((y - my) / sy)[tr])
+                        pr = m.predict(Xs[te]) * sy + my; tot += ((y[te] - pr) ** 2).sum()
+                    else:
+                        m = LogisticRegression(penalty="l1", solver="saga",
+                                               C=1 / (ntr * l1) if l1 > 0 else 1e12, max_iter=500000, tol=1e-9).fit(Xs[tr], y[tr])
+                        p = np.clip(m.predict_proba(Xs[te])[:, 1], 1e-15, 1 - 1e-15)
+                        tot += (-2 * (y[te] * np.log(p) + (1 - y[te]) * np.log(1 - p))).sum()
+                ref[l1] = tot / n
+            df = pd.DataFrame(X, columns=["x1", "x2"]).assign(y=y); _load(con, "cvtrain", df)
+            gridsql = "[" + ", ".join(str(g) for g in grid) + "]::DOUBLE[]"
+            got = {float(a): float(v) for a, v in con.execute(
+                f"SELECT l1, cv_deviance FROM cv_l1('cvtrain','y','{fam}', {gridsql})").fetchall()}
+            for l1 in grid:
+                assert got[float(l1)] == pytest.approx(ref[l1], rel=1e-4, abs=1e-5), (fam, l1)
+
+    def test_cv_power_matches_reference(self, con):
+        from sklearn.linear_model import TweedieRegressor
+        rng = np.random.default_rng(551); n = 1500
+        X = np.column_stack([rng.normal(0, 1, n), rng.normal(0, 1, n)])
+        Xs = (X - X.mean(0)) / X.std(0)
+        y = np.where(rng.random(n) < 0.3, 0.0, rng.gamma(2.0, np.exp(0.4 + 0.9 * Xs[:, 0] - 0.6 * Xs[:, 1]) / 2.0))
+        grid = [1.3, 1.5, 1.7]; fold = np.arange(n) % 5; yb = y.mean()
+        ref = {}
+        for p in grid:
+            tot = 0.0
+            for f in range(5):
+                tr, te = fold != f, fold == f
+                m = TweedieRegressor(power=p, alpha=0, link="log", max_iter=100000, tol=1e-10).fit(Xs[tr], (y / yb)[tr])
+                mu = m.predict(Xs[te]) * yb; yt = y[te]
+                tot += (2 * (np.power(np.maximum(yt, 0), 2 - p) / ((1 - p) * (2 - p))
+                             - yt * np.power(mu, 1 - p) / (1 - p) + np.power(mu, 2 - p) / (2 - p))).sum()
+            ref[p] = tot / n
+        df = pd.DataFrame(X, columns=["x1", "x2"]).assign(y=y); _load(con, "cvtrain", df)
+        got = {float(a): float(v) for a, v in con.execute(
+            "SELECT power, cv_deviance FROM cv_power('cvtrain','y', [1.3,1.5,1.7]::DOUBLE[])").fetchall()}
+        for p in grid:
+            assert got[p] == pytest.approx(ref[p], rel=1e-5), p
+
+    def test_cv_alpha_runs_and_selects(self, con):
+        # NB dispersion CV: overdispersed data prefers a larger alpha than a tiny one
+        rng = np.random.default_rng(552); n = 2000
+        X = np.column_stack([rng.normal(0, 1, n), rng.normal(0, 1, n)])
+        Xs = (X - X.mean(0)) / X.std(0)
+        y = rng.poisson(rng.gamma(1 / 0.6, np.exp(0.4 + 0.9 * Xs[:, 0]) * 0.6)).astype(float)
+        df = pd.DataFrame(X, columns=["x1", "x2"]).assign(y=y); _load(con, "cvtrain", df)
+        rows = con.execute("SELECT alpha, cv_deviance FROM cv_alpha('cvtrain','y', [0.05,0.3,0.6,1.5]::DOUBLE[]) ORDER BY alpha").fetchall()
+        got = {float(a): float(v) for a, v in rows}
+        assert len(got) == 4 and all(np.isfinite(v) for v in got.values())
+        # the tiny-alpha (near-Poisson) deviance should be worse than a moderate one
+        assert min(got, key=got.get) >= 0.3
+
     def test_cv_selects_lower_l2_on_clean_signal(self, con):
         # strong clean linear signal -> heavy shrinkage hurts, so argmin is small l2
         X, y = self._data("linear", 222)
@@ -1212,7 +1276,7 @@ class TestCrossValidation:
         df = pd.DataFrame(X, columns=["x1", "x2"]).assign(y=y)
         _load(con, "cvtrain", df)
         for sql, msg in [
-            ("cv_l2('cvtrain','y','frobnicate', [0.1])", "family must be one of"),
+            ("cv_l2('cvtrain','y','frobnicate', [0.1])", "unsupported family"),
             ("cv_l2('cvtrain','y','linear', [0.1], k := 1)", "k must be >= 2"),
             ("cv_l2('cvtrain','y','linear', []::DOUBLE[])", "non-empty"),
             ("cv_l2('cvtrain','y','linear', [-1.0])", "must be >= 0"),

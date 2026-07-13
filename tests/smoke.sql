@@ -182,4 +182,17 @@ SELECT CASE
     ELSE error('SMOKE FAIL: cv_l2 output invalid')
   END;
 
+-- CV over other hyperparameters: cv_power (Tweedie) and cv_alpha (neg-binom)
+-- each return one finite deviance per grid value.
+CREATE TABLE cvtw AS SELECT i AS x1, CASE WHEN i % 3 = 0 THEN 0.0 ELSE 1.0 + (i % 5) END AS y FROM range(300) t(i);
+CREATE TABLE cvnb AS SELECT i AS x1, (i % 7) * (1 + (i % 3)) AS y FROM range(300) t(i);
+SELECT CASE
+    WHEN (SELECT count(*) FROM cv_power('cvtw', 'y', [1.3, 1.5, 1.7])) = 3
+     AND (SELECT bool_and(cv_deviance > 0 AND NOT isinf(cv_deviance)) FROM cv_power('cvtw', 'y', [1.3, 1.5, 1.7]))
+     AND (SELECT count(*) FROM cv_alpha('cvnb', 'y', [0.2, 0.5, 1.0])) = 3
+     AND (SELECT count(*) FROM cv_l1('cvtw', 'y', 'poisson', [0.0, 0.1])) = 2
+    THEN 'PASS  cv_power / cv_alpha / cv_l1 score their grids'
+    ELSE error('SMOKE FAIL: cv_power/cv_alpha/cv_l1 output invalid')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;

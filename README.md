@@ -224,24 +224,33 @@ takes optional `l2` / `l1` (ridge / lasso / elastic-net, penalizing each class's
 standardized coefficients, intercepts excluded); offset and weights aren't
 available for multinomial.
 
-## Choosing the ridge penalty: `cv_l2`
+## Tuning hyperparameters: `cv_l2` / `cv_l1` / `cv_power` / `cv_alpha`
 
-`cv_l2(tbl, outcome, family, l2_grid, k := 5)` runs **k-fold cross-validation**
-over a grid of `l2` values and returns `(l2, cv_deviance)` — the mean held-out
-deviance (squared error for linear) per penalty. Pick the row with the smallest
-`cv_deviance`. Families: `linear`, `logistic`, `poisson`, `gamma`.
+**k-fold cross-validation** over a grid, returning one row per grid value with
+the mean held-out deviance (squared error for linear). Pick the smallest
+`cv_deviance`.
+
+| macro | tunes | families |
+|---|---|---|
+| `cv_l2(tbl, outcome, family, l2_grid, k := 5)` | ridge `l2` | linear/logistic/poisson/gamma |
+| `cv_l1(tbl, outcome, family, l1_grid, k := 5)` | lasso `l1` | linear/logistic/poisson/gamma |
+| `cv_power(tbl, outcome, power_grid, k := 5)` | Tweedie `power` | (tweedie) |
+| `cv_alpha(tbl, outcome, alpha_grid, k := 5)` | neg-binom `alpha` | (nbinom) |
 
 ```sql
 SELECT * FROM cv_l2('training_data', 'churned', 'logistic', [0.0, 0.01, 0.1, 1.0])
 ORDER BY cv_deviance LIMIT 1;   -- the best l2
+
+SELECT * FROM cv_power('claims', 'loss_cost', [1.2, 1.4, 1.6, 1.8]) ORDER BY cv_deviance LIMIT 1;
 ```
 
 It's genuinely pure SQL: all `k × |grid|` models are fit **simultaneously in one
 recursive CTE** (each fold-model's gradient sums only over its non-held-out
-rows), then the held-out rows are scored. Standardization is global (matching
-`cv.glmnet`), and folds are assigned deterministically as `(row# − 1) % k` —
-shuffle the table first if its rows are ordered by the outcome. Cost scales with
-`k · |grid| · features · rows · iterations`, so keep the grid modest.
+rows, with its own hyperparameter), then the held-out rows are scored.
+Standardization is global (matching `cv.glmnet`), and folds are assigned
+deterministically as `(row# − 1) % k` — shuffle the table first if its rows are
+ordered by the outcome. Cost scales with `k · |grid| · features · rows ·
+iterations`, so keep the grid modest.
 
 ## Categorical features: `dummy_encode_sql`
 
