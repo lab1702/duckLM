@@ -1135,6 +1135,94 @@ class TestDummyEncode:
 
 
 # --------------------------------------------------------------------------- #
+# Cross-validated ridge selection (cv_l2)
+# --------------------------------------------------------------------------- #
+class TestCrossValidation:
+    def _data(self, fam, seed, n=900):
+        rng = np.random.default_rng(seed)
+        X = np.column_stack([rng.normal(0, 1, n), rng.normal(0, 1, n)])
+        Xs = (X - X.mean(0)) / X.std(0)
+        z = 0.4 + 0.9 * Xs[:, 0] - 0.6 * Xs[:, 1]
+        if fam == "linear":
+            y = 3 + 2 * X[:, 0] - X[:, 1] + rng.normal(0, 2, n)
+        elif fam == "logistic":
+            y = rng.binomial(1, 1 / (1 + np.exp(-z))).astype(float)
+        elif fam == "poisson":
+            y = rng.poisson(np.exp(z)).astype(float)
+        else:
+            y = rng.gamma(2.0, np.exp(z) / 2.0)
+        return X, y
+
+    def _cv_reference(self, fam, X, y, grid, k):
+        from sklearn.linear_model import Ridge, LogisticRegression, PoissonRegressor, GammaRegressor
+        n = len(y); fold = np.arange(n) % k
+        Xs = (X - X.mean(0)) / X.std(0); my, sy, yb = y.mean(), y.std(), y.mean()
+        out = {}
+        for l2 in grid:
+            tot = 0.0
+            for f in range(k):
+                tr, te = fold != f, fold == f; ntr = tr.sum()
+                if fam == "linear":
+                    m = Ridge(alpha=ntr * l2).fit(Xs[tr], ((y - my) / sy)[tr])
+                    pr = m.predict(Xs[te]) * sy + my
+                    tot += ((y[te] - pr) ** 2).sum()
+                elif fam == "logistic":
+                    m = LogisticRegression(C=1 / (ntr * l2) if l2 > 0 else 1e12,
+                                           max_iter=20000, tol=1e-11).fit(Xs[tr], y[tr])
+                    p = np.clip(m.predict_proba(Xs[te])[:, 1], 1e-15, 1 - 1e-15)
+                    tot += (-2 * (y[te] * np.log(p) + (1 - y[te]) * np.log(1 - p))).sum()
+                elif fam == "poisson":
+                    m = PoissonRegressor(alpha=l2, max_iter=20000, tol=1e-11).fit(Xs[tr], (y / yb)[tr])
+                    mu = m.predict(Xs[te]) * yb
+                    tot += (2 * (np.where(y[te] > 0, y[te] * np.log(y[te] / mu), 0.0) - (y[te] - mu))).sum()
+                else:
+                    m = GammaRegressor(alpha=l2, max_iter=20000, tol=1e-11).fit(Xs[tr], (y / yb)[tr])
+                    mu = m.predict(Xs[te]) * yb
+                    tot += (2 * (-np.log(y[te] / mu) + (y[te] - mu) / mu)).sum()
+            out[l2] = tot / n
+        return out
+
+    def _cv_macro(self, con, fam, X, y, grid, k=5):
+        df = pd.DataFrame(X, columns=["x1", "x2"]).assign(y=y)
+        _load(con, "cvtrain", df)
+        gridsql = "[" + ", ".join(str(g) for g in grid) + "]::DOUBLE[]"
+        rows = con.execute(
+            f"SELECT l2, cv_deviance FROM cv_l2('cvtrain','y','{fam}', {gridsql}, k := {k})"
+        ).fetchall()
+        return {float(l2): float(dev) for l2, dev in rows}
+
+    @pytest.mark.parametrize("fam", ["linear", "logistic", "poisson", "gamma"])
+    def test_cv_matches_per_fold_reference(self, con, fam):
+        grid = [0.0, 0.1, 1.0]
+        X, y = self._data(fam, 111 + hash(fam) % 100)
+        got = self._cv_macro(con, fam, X, y, grid)
+        ref = self._cv_reference(fam, X, y, grid, k=5)
+        for l2 in grid:
+            assert got[float(l2)] == pytest.approx(ref[l2], rel=1e-5, abs=1e-6), (fam, l2)
+
+    def test_cv_selects_lower_l2_on_clean_signal(self, con):
+        # strong clean linear signal -> heavy shrinkage hurts, so argmin is small l2
+        X, y = self._data("linear", 222)
+        got = self._cv_macro(con, "linear", X, y, [0.0, 0.5, 5.0, 50.0])
+        best = min(got, key=got.get)
+        assert best <= 0.5
+
+    def test_cv_validation_errors(self, con):
+        X, y = self._data("linear", 333, n=100)
+        df = pd.DataFrame(X, columns=["x1", "x2"]).assign(y=y)
+        _load(con, "cvtrain", df)
+        for sql, msg in [
+            ("cv_l2('cvtrain','y','frobnicate', [0.1])", "family must be one of"),
+            ("cv_l2('cvtrain','y','linear', [0.1], k := 1)", "k must be >= 2"),
+            ("cv_l2('cvtrain','y','linear', []::DOUBLE[])", "non-empty"),
+            ("cv_l2('cvtrain','y','linear', [-1.0])", "must be >= 0"),
+        ]:
+            with pytest.raises(DuckDBError) as e:
+                con.execute(f"SELECT * FROM {sql}").fetchall()
+            assert msg in str(e.value)
+
+
+# --------------------------------------------------------------------------- #
 # Error handling & reserved names
 # --------------------------------------------------------------------------- #
 class TestErrors:

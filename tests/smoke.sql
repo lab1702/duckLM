@@ -171,4 +171,15 @@ SELECT CASE
     ELSE error('SMOKE FAIL: negative binomial output invalid')
   END;
 
+-- Cross-validation: cv_l2 returns one row per grid value; over-regularizing a
+-- clean linear signal (large l2) yields a worse held-out deviance than l2=0.
+CREATE TABLE cvt AS SELECT i AS x1, (i % 11) AS x2, 2.0 + 3 * i - 0.5 * (i % 11) + (i % 5) AS y FROM range(400) t(i);
+SELECT CASE
+    WHEN (SELECT count(*) FROM cv_l2('cvt', 'y', 'linear', [0.0, 0.1, 1.0, 100.0], k := 5)) = 4
+     AND (SELECT cv_deviance FROM cv_l2('cvt', 'y', 'linear', [100.0], k := 5))
+       > (SELECT cv_deviance FROM cv_l2('cvt', 'y', 'linear', [0.0], k := 5))
+    THEN 'PASS  cv_l2 scores the ridge grid; over-shrinkage worsens held-out fit'
+    ELSE error('SMOKE FAIL: cv_l2 output invalid')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;

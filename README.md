@@ -224,6 +224,25 @@ takes optional `l2` / `l1` (ridge / lasso / elastic-net, penalizing each class's
 standardized coefficients, intercepts excluded); offset and weights aren't
 available for multinomial.
 
+## Choosing the ridge penalty: `cv_l2`
+
+`cv_l2(tbl, outcome, family, l2_grid, k := 5)` runs **k-fold cross-validation**
+over a grid of `l2` values and returns `(l2, cv_deviance)` — the mean held-out
+deviance (squared error for linear) per penalty. Pick the row with the smallest
+`cv_deviance`. Families: `linear`, `logistic`, `poisson`, `gamma`.
+
+```sql
+SELECT * FROM cv_l2('training_data', 'churned', 'logistic', [0.0, 0.01, 0.1, 1.0])
+ORDER BY cv_deviance LIMIT 1;   -- the best l2
+```
+
+It's genuinely pure SQL: all `k × |grid|` models are fit **simultaneously in one
+recursive CTE** (each fold-model's gradient sums only over its non-held-out
+rows), then the held-out rows are scored. Standardization is global (matching
+`cv.glmnet`), and folds are assigned deterministically as `(row# − 1) % k` —
+shuffle the table first if its rows are ordered by the outcome. Cost scales with
+`k · |grid| · features · rows · iterations`, so keep the grid modest.
+
 ## Categorical features: `dummy_encode_sql`
 
 The fit macros treat every column as numeric (booleans become 1/0). To use a
