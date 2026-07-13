@@ -1135,6 +1135,50 @@ class TestDummyEncode:
 
 
 # --------------------------------------------------------------------------- #
+# Negative binomial dispersion estimation (nbinom_dispersion)
+# --------------------------------------------------------------------------- #
+class TestNBDispersion:
+    def _nb_data(self, seed, alpha=0.6, n=3000):
+        rng = np.random.default_rng(seed)
+        X = np.column_stack([rng.normal(0, 1, n), rng.normal(0, 1, n)])
+        mu = np.exp(0.5 + 0.7 * X[:, 0] - 0.4 * X[:, 1])
+        y = rng.poisson(rng.gamma(1 / alpha, mu * alpha)).astype(float)
+        return pd.DataFrame({"x1": X[:, 0], "x2": X[:, 1], "y": y})
+
+    def test_profile_loglik_matches_fit_evaluate(self, con):
+        # nbinom_dispersion's profile loglik at alpha == the loglik of
+        # nbinom_fit(alpha) evaluated on the same data (same global fit)
+        df = self._nb_data(61)
+        _load(con, "dtab", df)
+        for a in [0.4, 0.6, 1.0]:
+            coefs = fit(con, "nbinom_fit", df, alpha=a)
+            ll_eval = evaluate(con, "nbinom_evaluate", coefs, df, alpha=a)["loglik"]
+            ll_disp = con.execute(
+                f"SELECT loglik FROM nbinom_dispersion('dtab','y', [{a}]::DOUBLE[])"
+            ).fetchone()[0]
+            assert ll_disp == pytest.approx(ll_eval, rel=1e-6), a
+
+    def test_argmax_recovers_dispersion(self, con):
+        df = self._nb_data(62, alpha=0.6)
+        _load(con, "dtab", df)
+        rows = con.execute(
+            "SELECT alpha, loglik FROM nbinom_dispersion('dtab','y', "
+            "[0.3, 0.45, 0.6, 0.75, 0.9, 1.2]::DOUBLE[]) ORDER BY loglik DESC LIMIT 1"
+        ).fetchone()
+        assert rows[0] == pytest.approx(0.6, abs=0.15)  # grid argmax near the truth
+
+    def test_dispersion_errors(self, con):
+        df = self._nb_data(63, n=200)
+        _load(con, "dtab", df)
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM nbinom_dispersion('dtab','y', [-1.0]::DOUBLE[])").fetchall()
+        assert "must be > 0" in str(e.value)
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM nbinom_dispersion('dtab','y', []::DOUBLE[])").fetchall()
+        assert "non-empty" in str(e.value)
+
+
+# --------------------------------------------------------------------------- #
 # Cross-validated ridge selection (cv_l2)
 # --------------------------------------------------------------------------- #
 class TestCrossValidation:

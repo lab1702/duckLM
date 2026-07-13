@@ -195,4 +195,14 @@ SELECT CASE
     ELSE error('SMOKE FAIL: cv_power/cv_alpha/cv_l1 output invalid')
   END;
 
+-- NB dispersion estimation: nbinom_dispersion returns a finite profile
+-- log-likelihood per alpha, and the grid argmax is a valid dispersion value.
+SELECT CASE
+    WHEN (SELECT count(*) FROM nbinom_dispersion('cvnb', 'y', [0.2, 0.5, 1.0, 2.0])) = 4
+     AND (SELECT alpha FROM nbinom_dispersion('cvnb', 'y', [0.2, 0.5, 1.0, 2.0])
+          ORDER BY loglik DESC LIMIT 1) > 0
+    THEN 'PASS  nbinom_dispersion returns a profile-likelihood curve'
+    ELSE error('SMOKE FAIL: nbinom_dispersion output invalid')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;

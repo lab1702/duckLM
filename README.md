@@ -90,10 +90,16 @@ SELECT * FROM poisson_predict('m', 'new_policies', offset_col := 'log_exposure')
 
 **Negative binomial.** `nbinom_fit(tbl, outcome, alpha := 1.0, ...)` models
 overdispersed counts (variance = μ + α·μ², so variance > mean). `alpha` is the
-**fixed dispersion** (a hyperparameter — grid-search it or tune with CV; it's
-not estimated here); α→0 recovers Poisson. Matches statsmodels
+**fixed dispersion**; α→0 recovers Poisson. Matches statsmodels
 `GLM(..., family=NegativeBinomial(alpha=α))`. Composes with offset, weights,
-and ridge/lasso.
+and ridge/lasso. To **estimate** α, `nbinom_dispersion(tbl, outcome, alpha_grid)`
+returns the profile log-likelihood per α — the argmax is the (grid-resolution)
+MLE dispersion; feed it back into `nbinom_fit`:
+
+```sql
+SELECT alpha FROM nbinom_dispersion('patients', 'n_visits', [0.1, 0.25, 0.5, 1.0, 2.0])
+ORDER BY loglik DESC LIMIT 1;   -- the estimated dispersion
+```
 
 **Sample weights.** `weights_col` names a column of non-negative per-row
 weights; the loss and the internal standardization are weighted by them.

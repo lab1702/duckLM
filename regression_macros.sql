@@ -33,6 +33,10 @@
 --   cv_power(tbl, outcome, power_grid, k := 5)     Tweedie variance power
 --   cv_alpha(tbl, outcome, alpha_grid, k := 5)     negative binomial dispersion
 --
+-- Dispersion estimation:
+--   nbinom_dispersion(tbl, outcome, alpha_grid) -> (alpha, loglik)
+--       NB2 profile log-likelihood per alpha; argmax is the MLE dispersion.
+--
 -- Helper (returns SQL text, run it as a second step):
 --   dummy_encode_sql(tbl, outcome) -> VARCHAR: a SELECT that R-style dummy
 --       encodes every VARCHAR column except the outcome (see its own comment).
@@ -1268,3 +1272,115 @@ SELECT param AS alpha, cv_deviance FROM __reg_cv(tbl, outcome, 'nbinom', alpha_g
 
 CREATE OR REPLACE MACRO cv_l2(tbl, outcome, family, l2_grid, k := 5, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
 SELECT param AS l2, cv_deviance FROM __reg_cv(tbl, outcome, family, l2_grid, 'l2', k, max_iter, learning_rate, tol);
+
+
+-- ---------------------------------------------------------------------------
+-- Negative binomial dispersion estimation (profile likelihood, pure SQL)
+--
+-- nbinom_dispersion(tbl, outcome, alpha_grid) fits the NB2 mean model for each
+-- alpha in the grid SIMULTANEOUSLY (one model per alpha, all on the full data,
+-- in a single recursive CTE) and returns (alpha, loglik) -- the profile
+-- log-likelihood. The alpha with the largest loglik is the (grid-resolution)
+-- maximum-likelihood dispersion estimate; feed it back into nbinom_fit. Refine
+-- with a finer grid around the peak for a sharper estimate. loglik matches
+-- statsmodels' fixed-alpha GLM NegativeBinomial.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE MACRO nbinom_dispersion(tbl, outcome, alpha_grid, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
+WITH RECURSIVE
+__reg_nbd_chk AS (
+  SELECT CASE
+    WHEN len(alpha_grid) < 1 THEN error('nbinom_dispersion: alpha_grid must be non-empty')
+    WHEN list_aggregate(alpha_grid,'min') <= 0 THEN error('nbinom_dispersion: alpha values must be > 0')
+    ELSE true END AS ok
+),
+__reg_nbd_num AS MATERIALIZED (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
+__reg_nbd_flong AS MATERIALIZED (
+  SELECT rid, name AS col, value AS v
+  FROM (UNPIVOT (SELECT rid, CAST(COLUMNS(c -> c != outcome AND c != 'rid') AS DOUBLE) FROM __reg_nbd_num)
+        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE value)
+),
+__reg_nbd_yraw AS MATERIALIZED (
+  SELECT rid, val AS y
+  FROM (UNPIVOT (SELECT rid, CAST(COLUMNS(c -> c != 'rid') AS DOUBLE) FROM __reg_nbd_num)
+        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE val) WHERE name = outcome
+),
+__reg_nbd_ycheck AS (
+  SELECT CASE WHEN min(y) < 0 THEN error('nbinom_dispersion: outcome must be non-negative') ELSE true END AS ok
+  FROM __reg_nbd_yraw
+),
+__reg_nbd_stats AS MATERIALIZED (
+  SELECT col, CASE WHEN min(v)=max(v) THEN min(v) ELSE avg(v) END AS mu,
+         CASE WHEN min(v)=max(v) THEN 1.0 ELSE stddev_pop(v) END AS sigma
+  FROM __reg_nbd_flong GROUP BY col
+),
+__reg_nbd_feats AS MATERIALIZED (SELECT count(*)::INT AS d FROM __reg_nbd_stats),
+__reg_nbd_ys AS (SELECT CASE WHEN avg(y)<1e-300 THEN 1.0 ELSE avg(y) END AS sd_y FROM __reg_nbd_yraw),
+__reg_nbd_n AS (SELECT count(*)::DOUBLE AS n FROM __reg_nbd_yraw),
+-- one model per grid alpha (no folds); alpha_int = alpha * mean(y)
+__reg_nbd_marr AS (
+  SELECT list(alpi ORDER BY g) AS malp_int, count(*)::INT AS M
+  FROM (SELECT g, alpha_grid[g] * (SELECT sd_y FROM __reg_nbd_ys) AS alpi FROM range(1,len(alpha_grid)+1) t(g))
+),
+__reg_nbd_rows AS MATERIALIZED (
+  SELECT x.rid, any_value(yr.y) AS y, any_value(yr.y) / any_value(ys.sd_y) AS yt,
+         [1.0::DOUBLE] || list((x.v - s.mu)/s.sigma ORDER BY x.col) AS xs
+  FROM __reg_nbd_flong x JOIN __reg_nbd_stats s ON s.col=x.col JOIN __reg_nbd_yraw yr ON yr.rid=x.rid
+  CROSS JOIN __reg_nbd_ys ys GROUP BY x.rid
+),
+__reg_nbd_packed AS MATERIALIZED (SELECT list(struct_pack(xs := xs, yt := yt)) AS rows, count(*)::DOUBLE AS n FROM __reg_nbd_rows),
+__reg_nbd_cfg AS (
+  SELECT coalesce(learning_rate, 1.0/(f.d+1)) AS step, f.d+1 AS D1, ma.M AS M
+  FROM __reg_nbd_feats f, __reg_nbd_marr ma, __reg_nbd_chk c1, __reg_nbd_ycheck c2 WHERE c1.ok AND c2.ok
+),
+__reg_nbd_gd AS (
+  SELECT 0 AS it,
+         list_transform(range(c.M), lambda m: list_transform(range(c.D1), lambda j: 0.0::DOUBLE)) AS B,
+         list_transform(range(c.M), lambda m: list_transform(range(c.D1), lambda j: 0.0::DOUBLE)) AS prev,
+         1e308::DOUBLE AS move
+  FROM __reg_nbd_cfg c
+  UNION ALL
+  SELECT it+1, newB, B,
+         list_aggregate(list_transform(newB, lambda bm, m:
+             list_aggregate(list_transform(bm, lambda v, j: abs(v - look[m][j])), 'max')), 'max')
+  FROM (
+    SELECT it, B, look,
+           list_transform(look, lambda bm, m: list_transform(bm, lambda lmj, j:
+               lmj + (step/damp) * (list_sum(list_transform(res, lambda ob: ob.xs[j] * ob.r[m])) / n))) AS newB
+    FROM (
+      SELECT it, B, look, step, n, res,
+             greatest(1.0, list_aggregate(list_transform(res, lambda ob: list_aggregate(ob.hw,'max')), 'max')) AS damp
+      FROM (
+        SELECT it, B, look, step, n, malp_int,
+               list_transform(rows, lambda rw: struct_pack(
+                 r := list_transform(look, lambda bm, m:
+                        (rw.yt - exp(least(list_dot_product(rw.xs,bm),700.0)))
+                        / (1.0 + malp_int[m]*exp(least(list_dot_product(rw.xs,bm),700.0)))),
+                 hw := list_transform(look, lambda bm, m:
+                        exp(least(list_dot_product(rw.xs,bm),700.0))*(1.0+malp_int[m]*rw.yt)
+                        / pow(1.0+malp_int[m]*exp(least(list_dot_product(rw.xs,bm),700.0)),2.0)),
+                 xs := rw.xs)) AS res
+        FROM (
+          SELECT g.it, g.B, p.rows, p.n, c.step, ma.malp_int,
+                 list_transform(g.B, lambda bm, m: list_transform(bm, lambda v, j:
+                     v + (g.it::DOUBLE/(g.it+3)) * (v - g.prev[m][j]))) AS look
+          FROM __reg_nbd_gd g, __reg_nbd_packed p, __reg_nbd_cfg c, __reg_nbd_marr ma
+          WHERE g.it < max_iter AND g.move >= tol
+        )
+      )
+    )
+  )
+),
+__reg_nbd_sol AS (SELECT B FROM __reg_nbd_gd ORDER BY it DESC LIMIT 1),
+-- profile NB2 log-likelihood per grid alpha (r = 1/alpha), mu = mean(y)*exp(eta)
+__reg_nbd_ll AS (
+  SELECT gg.g AS g, r.y AS y, alpha_grid[gg.g] AS alpha,
+         ys.sd_y * exp(list_dot_product(r.xs, s.B[gg.g])) AS mu
+  FROM __reg_nbd_sol s, __reg_nbd_rows r, __reg_nbd_ys ys, range(1,len(alpha_grid)+1) gg(g)
+)
+SELECT alpha,
+       sum(lgamma(y + 1.0/alpha) - lgamma(1.0/alpha) - lgamma(y + 1)
+           + (1.0/alpha) * ln((1.0/alpha)/(1.0/alpha + mu))
+           + y * ln(mu/(1.0/alpha + mu))) AS loglik
+FROM __reg_nbd_ll
+GROUP BY alpha
+ORDER BY alpha;
