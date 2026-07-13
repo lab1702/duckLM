@@ -1,7 +1,7 @@
 -- ============================================================================
--- Logistic, linear, Poisson, Gamma & Tweedie regression as pure DuckDB
--- (>= 1.5) SQL macros, with optional ridge/lasso/elastic-net regularization,
--- an offset/exposure term, and sample weights.
+-- Logistic, linear, Poisson, Gamma, Tweedie & multinomial (softmax) regression
+-- as pure DuckDB (>= 1.5) SQL macros. The single-outcome families take optional
+-- ridge/lasso/elastic-net regularization, an offset/exposure term, and weights.
 --
 -- Public macros (15): fit / predict / evaluate for each family.
 --   {logit,linreg,poisson,gamma}_fit(tbl, outcome, ...)
@@ -17,6 +17,11 @@
 --
 -- Fit macros accept: max_iter, learning_rate, tol, l2, l1, offset_col,
 -- weights_col (tweedie_fit also power); see "Fit parameters" below.
+--
+-- Multiclass (softmax; baseline-category parameterization):
+--   multinom_fit(tbl, outcome, ...) -> (class, feature, coefficient)
+--   multinom_predict(model, tbl)    -> input rows + pred + probs MAP
+--   multinom_evaluate(model, tbl, outcome) -> (n, accuracy, log_loss)
 --
 -- Helper (returns SQL text, run it as a second step):
 --   dummy_encode_sql(tbl, outcome) -> VARCHAR: a SELECT that R-style dummy
@@ -815,3 +820,191 @@ CREATE OR REPLACE MACRO dummy_encode_sql(tbl, outcome) AS (
               ELSE 'SELECT * EXCLUDE (' || (SELECT excl FROM __reg_enc_ex) || ')'
                    || coalesce(', ' || (SELECT dummies FROM __reg_enc_dum), '') || ' FROM ' || tbl END
 );
+
+
+-- ---------------------------------------------------------------------------
+-- Multinomial (softmax) logistic regression
+--
+-- multinom_fit(tbl, outcome, ...) fits a K-class softmax model in the
+-- identifiable baseline-category parameterization: one coefficient vector per
+-- class relative to a reference class (the alphabetical-minimum label, held at
+-- 0), matching R's nnet::multinom and statsmodels MNLogit. The outcome is a
+-- class-label column (any type); all other columns are numeric/boolean
+-- features (dummy-encode categoricals first, e.g. with dummy_encode_sql).
+--
+--   multinom_fit -> table (class VARCHAR, feature VARCHAR, coefficient DOUBLE)
+--       with an '(Intercept)' row per class; the reference class has all-zero
+--       coefficients so scoring is a self-contained softmax over every class.
+--   multinom_predict(model, tbl) -> input rows + pred VARCHAR (argmax class)
+--       + probs MAP(VARCHAR, DOUBLE) (full class distribution; probs['label']).
+--   multinom_evaluate(model, tbl, outcome) -> (n, accuracy, log_loss).
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE MACRO multinom_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10) AS TABLE
+WITH RECURSIVE
+__reg_mnum AS MATERIALIZED (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
+__reg_mflong AS MATERIALIZED (
+  SELECT rid, name AS col, value AS v
+  FROM (UNPIVOT (SELECT rid, CAST(COLUMNS(c -> c != outcome AND c != 'rid') AS DOUBLE) FROM __reg_mnum)
+        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE value)
+),
+__reg_mylab AS MATERIALIZED (
+  SELECT rid, val AS lab
+  FROM (UNPIVOT (SELECT rid, CAST(COLUMNS(c -> c != 'rid') AS VARCHAR) FROM __reg_mnum)
+        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE val)
+  WHERE name = outcome
+),
+__reg_mnonref AS (
+  SELECT list(lab ORDER BY lab) AS nrf
+  FROM (SELECT DISTINCT lab FROM __reg_mylab WHERE lab <> (SELECT min(lab) FROM __reg_mylab))
+),
+__reg_mstats AS MATERIALIZED (
+  SELECT col,
+         CASE WHEN min(v) = max(v) THEN min(v) ELSE avg(v) END AS mu,
+         CASE WHEN min(v) = max(v) THEN 1.0 ELSE stddev_pop(v) END AS sigma
+  FROM __reg_mflong GROUP BY col
+),
+__reg_mfeats AS MATERIALIZED (
+  SELECT list(col ORDER BY col) AS names, list(mu ORDER BY col) AS mus,
+         list(sigma ORDER BY col) AS sigmas, count(*)::INT AS d
+  FROM __reg_mstats
+),
+__reg_mchk AS (
+  SELECT CASE
+    WHEN (SELECT count(*) FROM (SELECT DISTINCT lab FROM __reg_mylab)) < 2
+      THEN error('multinom_fit: outcome column "' || outcome || '" must have at least 2 distinct classes')
+    WHEN (SELECT d FROM __reg_mfeats) = 0
+      THEN error('multinom_fit: no feature columns besides the outcome')
+    ELSE true END AS ok
+),
+__reg_mpacked AS MATERIALIZED (
+  SELECT list(struct_pack(xs := xs, yv := yv)) AS rows, count(*)::DOUBLE AS n,
+         any_value(len(yv)) AS K1, any_value(len(xs)) AS D1
+  FROM (
+    SELECT x.rid,
+           [1.0::DOUBLE] || list((x.v - s.mu) / s.sigma ORDER BY x.col) AS xs,
+           list_transform(any_value(nr.nrf),
+             lambda cl: CASE WHEN any_value(yl.lab) = cl THEN 1.0 ELSE 0.0 END) AS yv
+    FROM __reg_mflong x
+    JOIN __reg_mstats s ON s.col = x.col
+    JOIN __reg_mylab yl ON yl.rid = x.rid
+    CROSS JOIN __reg_mnonref nr
+    GROUP BY x.rid
+  )
+),
+__reg_mcfg AS (
+  SELECT coalesce(learning_rate, 2.0 / D1) AS step
+  FROM __reg_mpacked, __reg_mchk WHERE ok
+),
+__reg_mgd AS (
+  SELECT 0 AS it,
+         list_transform(range(K1), lambda k: list_transform(range(D1), lambda j: 0.0::DOUBLE)) AS B,
+         list_transform(range(K1), lambda k: list_transform(range(D1), lambda j: 0.0::DOUBLE)) AS prev,
+         1e308::DOUBLE AS move
+  FROM __reg_mpacked
+  UNION ALL
+  SELECT it + 1, newB, B,
+         list_aggregate(list_transform(newB, lambda bk, k:
+             list_aggregate(list_transform(bk, lambda v, j: abs(v - look[k][j])), 'max')), 'max')
+  FROM (
+    SELECT it, B, look,
+           list_transform(look, lambda bk, k: list_transform(bk, lambda lkj, j:
+               lkj + step * (list_sum(list_transform(res, lambda ob: ob.r[k] * ob.xs[j])) / n))) AS newB
+    FROM (
+      SELECT it, B, n, step, look,
+             list_transform(rows, lambda rw: struct_pack(
+                 xs := rw.xs,
+                 r := list_transform(rw.yv, lambda yvk, k:
+                        yvk - exp(least(list_dot_product(rw.xs, look[k]), 700.0))
+                              / (1.0 + list_sum(list_transform(look,
+                                    lambda bj: exp(least(list_dot_product(rw.xs, bj), 700.0)))))))) AS res
+      FROM (
+        SELECT g.it, g.B, p.rows, p.n, c.step,
+               list_transform(g.B, lambda bk, k:
+                   list_transform(bk, lambda v, j: v + (g.it::DOUBLE / (g.it + 3)) * (v - g.prev[k][j]))) AS look
+        FROM __reg_mgd g, __reg_mpacked p, __reg_mcfg c
+        WHERE g.it < max_iter AND g.move >= tol
+      )
+    )
+  )
+),
+__reg_msol AS (SELECT B FROM __reg_mgd ORDER BY it DESC LIMIT 1)
+SELECT class, feature, coefficient FROM (
+  SELECT nr.nrf[k] AS class, '(Intercept)' AS feature,
+         s.B[k][1] - coalesce(list_sum(list_transform(f.names,
+             lambda nm, j: s.B[k][j + 1] * f.mus[j] / f.sigmas[j])), 0.0) AS coefficient
+  FROM __reg_msol s, __reg_mfeats f, __reg_mnonref nr, range(1, len(nr.nrf) + 1) AS gk(k)
+  UNION ALL
+  SELECT nr.nrf[k], f.names[j], s.B[k][j + 1] / f.sigmas[j]
+  FROM __reg_msol s, __reg_mfeats f, __reg_mnonref nr,
+       range(1, len(nr.nrf) + 1) AS gk(k), range(1, f.d + 1) AS gj(j)
+  UNION ALL
+  SELECT (SELECT min(lab) FROM __reg_mylab), feat, 0.0
+  FROM (SELECT '(Intercept)' AS feat UNION ALL SELECT unnest(names) FROM __reg_mfeats)
+)
+ORDER BY class, (feature = '(Intercept)') DESC, feature;
+
+-- Shared softmax scorer used by multinom_predict / multinom_evaluate: returns
+-- (rid, class, p) with p the class probability (NULL if a feature is missing).
+CREATE OR REPLACE MACRO __reg_msoftmax(model, tbl) AS TABLE
+WITH
+__reg_mnum AS (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+__reg_mlong AS (
+  SELECT __reg_rid__ AS rid, name AS col, value AS v
+  FROM (UNPIVOT (SELECT __reg_rid__, TRY_CAST(COLUMNS(* EXCLUDE (__reg_rid__)) AS DOUBLE) FROM __reg_mnum)
+        ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
+),
+__reg_mcoefs AS (SELECT class, feature, coefficient FROM query_table(model)),
+__reg_mnf AS (SELECT count(*) AS nf FROM __reg_mcoefs
+             WHERE feature != '(Intercept)' AND class = (SELECT min(class) FROM __reg_mcoefs)),
+__reg_meta AS (
+  SELECT n.__reg_rid__ AS rid, c.class,
+    sum(CASE WHEN c.feature = '(Intercept)' THEN c.coefficient ELSE c.coefficient * l.v END) AS e,
+    count(*) FILTER (WHERE c.feature != '(Intercept)' AND l.v IS NOT NULL) AS nm
+  FROM __reg_mnum n CROSS JOIN __reg_mcoefs c
+  LEFT JOIN __reg_mlong l ON l.rid = n.__reg_rid__ AND l.col = c.feature
+  GROUP BY n.__reg_rid__, c.class
+),
+__reg_meta2 AS (SELECT rid, class, e, nm, max(e) OVER (PARTITION BY rid) AS maxe FROM __reg_meta)
+SELECT rid, class,
+       CASE WHEN nm = (SELECT nf FROM __reg_mnf)
+            THEN exp(e - maxe) / sum(exp(e - maxe)) OVER (PARTITION BY rid) END AS p
+FROM __reg_meta2;
+
+CREATE OR REPLACE MACRO multinom_predict(model, tbl) AS TABLE
+WITH __reg_mnum AS (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+__reg_mncheck AS (
+  SELECT CASE WHEN coalesce(bool_or(lower(colname) IN ('pred', 'probs')), false)
+              THEN error('multinom_predict: the input table already has a "pred" or "probs" column; rename or drop it first (e.g. SELECT * EXCLUDE (pred, probs))')
+              ELSE true END AS ok
+  FROM (SELECT * FROM (SELECT 1 AS __reg_one)
+        LEFT JOIN (SELECT CAST(COLUMNS(*) AS VARCHAR) FROM query_table(tbl) LIMIT 1) ON true)
+       UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
+),
+__reg_magg AS (
+  SELECT rid, arg_max(class, p) AS pred, map(list(class ORDER BY class), list(p ORDER BY class)) AS probs
+  FROM __reg_msoftmax(model, tbl) GROUP BY rid
+)
+SELECT n.* EXCLUDE (__reg_rid__), a.pred AS pred, a.probs AS probs
+FROM __reg_mnum n LEFT JOIN __reg_magg a ON a.rid = n.__reg_rid__
+WHERE (SELECT ok FROM __reg_mncheck)
+ORDER BY n.__reg_rid__;
+
+CREATE OR REPLACE MACRO multinom_evaluate(model, tbl, outcome) AS TABLE
+WITH
+__reg_mnum AS (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+__reg_mtrue AS (
+  SELECT rid, val AS lab
+  FROM (UNPIVOT (SELECT __reg_rid__ AS rid, CAST(COLUMNS(c -> c != '__reg_rid__') AS VARCHAR) FROM __reg_mnum)
+        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE val)
+  WHERE name = outcome
+),
+__reg_mrm AS (
+  SELECT s.rid, max(CASE WHEN s.class = t.lab THEN s.p END) AS p_true,
+         arg_max(s.class, s.p) AS pred, any_value(t.lab) AS truelab
+  FROM __reg_msoftmax(model, tbl) s JOIN __reg_mtrue t ON t.rid = s.rid
+  WHERE s.p IS NOT NULL GROUP BY s.rid
+)
+SELECT count(*)::BIGINT AS n,
+       avg(CASE WHEN pred = truelab THEN 1.0 ELSE 0.0 END) AS accuracy,
+       -avg(ln(greatest(p_true, 1e-15))) AS log_loss
+FROM __reg_mrm;

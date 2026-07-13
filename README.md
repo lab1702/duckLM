@@ -1,11 +1,11 @@
-# duckLM — logistic, linear, Poisson, Gamma & Tweedie regression in pure DuckDB SQL
+# duckLM — GLM regression (logistic, linear, Poisson, Gamma, Tweedie, multinomial) in pure DuckDB SQL
 
 Table macros for DuckDB **1.5+**, no extensions required: **fit**, **predict**,
 and **evaluate** for binary logistic regression, ordinary least-squares linear
-regression, Poisson regression, Gamma regression, and Tweedie regression (all
-but linear use a log link), each with optional ridge/lasso/elastic-net
-regularization, an offset/exposure term, and sample weights. Everything runs
-inside DuckDB —
+regression, Poisson regression, Gamma regression, Tweedie regression (all but
+linear use a log link), and **multinomial (softmax)** classification. The
+single-outcome families take optional ridge/lasso/elastic-net regularization,
+an offset/exposure term, and sample weights. Everything runs inside DuckDB —
 training is Nesterov-accelerated gradient descent implemented with a recursive
 CTE and list lambdas, sharing a single optimizer core across all model
 families.
@@ -178,6 +178,32 @@ SELECT * FROM logit_evaluate('churn_model', 'training_data', 'churned');
 and `bic` use *k* = number of model coefficients (intercept included). Gamma's
 log-likelihood/AIC depend on the dispersion parameter, so it reports deviance,
 deviance-based pseudo-R², and the Pearson `dispersion` instead.
+
+## Multiclass: `multinom_fit` / `multinom_predict` / `multinom_evaluate`
+
+Multinomial (softmax) logistic regression for a categorical outcome with any
+number of classes. It uses the identifiable **baseline-category**
+parameterization — one coefficient set per class relative to a reference (the
+alphabetical-minimum label, held at 0) — matching R's `nnet::multinom` and
+statsmodels `MNLogit`.
+
+```sql
+CREATE TABLE species_model AS
+SELECT * FROM multinom_fit('iris', 'species');
+-- (class VARCHAR, feature VARCHAR, coefficient DOUBLE); the reference class
+-- has all-zero coefficients, so scoring is a self-contained softmax.
+
+SELECT * FROM multinom_predict('species_model', 'new_flowers');
+-- adds pred VARCHAR (argmax class) and probs MAP(VARCHAR, DOUBLE);
+-- get a class probability with probs['setosa']
+
+SELECT * FROM multinom_evaluate('species_model', 'iris', 'species');
+-- (n, accuracy, log_loss)
+```
+
+The outcome is the class-label column (any type); every other column is a
+numeric/boolean feature — dummy-encode categoricals first (below). Regularization,
+offset, and weights aren't available for multinomial yet.
 
 ## Categorical features: `dummy_encode_sql`
 

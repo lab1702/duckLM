@@ -857,6 +857,102 @@ class TestEdgeCases:
 
 
 # --------------------------------------------------------------------------- #
+# Multinomial (softmax) logistic regression
+# --------------------------------------------------------------------------- #
+class TestMultinomial:
+    def _softmax_data(self, seed, n=3000):
+        rng = np.random.default_rng(seed)
+        X = np.column_stack([rng.normal(0, 1, n), rng.normal(0, 1, n)])
+        eta = np.column_stack([np.zeros(n),
+                               0.5 + 1.2 * X[:, 0] - 0.8 * X[:, 1],
+                               -0.3 - 0.6 * X[:, 0] + 1.0 * X[:, 1]])
+        P = np.exp(eta); P /= P.sum(1, keepdims=True)
+        y = np.array([rng.choice(3, p=P[i]) for i in range(n)])
+        return pd.DataFrame({"x1": X[:, 0], "x2": X[:, 1], "y": y}), X, y
+
+    def test_predict_proba_matches_sklearn(self, con):
+        # softmax probabilities are parameterization-invariant, so the fit is
+        # validated against sklearn's multinomial predict_proba end-to-end.
+        df, X, y = self._softmax_data(301)
+        _load(con, "mtrain", df)
+        con.execute("CREATE OR REPLACE TABLE mmodel AS SELECT * FROM multinom_fit('mtrain','y')")
+        got = con.execute(
+            "SELECT probs['0'] p0, probs['1'] p1, probs['2'] p2 "
+            "FROM multinom_predict('mmodel','mtrain')"
+        ).df().to_numpy()
+        ref = LogisticRegression(C=1e10, max_iter=20000, tol=1e-11).fit(X, y).predict_proba(X)
+        assert np.abs(got - ref).max() < 1e-4
+        assert np.abs(got.sum(1) - 1).max() < 1e-9  # rows normalize
+
+    def test_reference_class_is_zero_and_k_classes(self, con):
+        df, X, y = self._softmax_data(302)
+        _load(con, "mtrain", df)
+        model = con.execute("SELECT class, feature, coefficient FROM multinom_fit('mtrain','y')").fetchall()
+        classes = sorted(set(c for c, _, _ in model))
+        assert classes == ["0", "1", "2"]                       # all K classes present
+        ref = {(c, f): v for c, f, v in model if c == "0"}
+        assert all(v == 0.0 for v in ref.values())              # reference class == 0
+
+    def test_binary_multinom_equals_logit(self, con):
+        # K=2 softmax (reference class 0) == binary logistic modelling P(y=1)
+        rng = np.random.default_rng(303)
+        X = np.column_stack([rng.normal(0, 1, 2500), rng.normal(0, 1, 2500)])
+        y = rng.binomial(1, 1 / (1 + np.exp(-(0.4 + 1.1 * X[:, 0] - 0.7 * X[:, 1]))))
+        df = pd.DataFrame({"x1": X[:, 0], "x2": X[:, 1], "y": y})
+        _load(con, "mtrain", df)
+        mnl = dict(con.execute(
+            "SELECT feature, coefficient FROM multinom_fit('mtrain','y') WHERE class = '1'"
+        ).fetchall())
+        logit = fit(con, "logit_fit", df)
+        for k in logit:
+            assert mnl[k] == pytest.approx(logit[k], abs=1e-4)
+
+    def test_evaluate_matches_sklearn(self, con):
+        df, X, y = self._softmax_data(304)
+        _load(con, "mtrain", df)
+        con.execute("CREATE OR REPLACE TABLE mmodel AS SELECT * FROM multinom_fit('mtrain','y')")
+        m = con.execute("SELECT * FROM multinom_evaluate('mmodel','mtrain','y')").df().iloc[0]
+        P = con.execute("SELECT probs['0'] p0, probs['1'] p1, probs['2'] p2 "
+                        "FROM multinom_predict('mmodel','mtrain')").df().to_numpy()
+        pred = con.execute("SELECT pred FROM multinom_predict('mmodel','mtrain')").df()["pred"].astype(int)
+        assert m["n"] == len(y)
+        assert m["log_loss"] == pytest.approx(log_loss(y, P), rel=1e-9)
+        assert m["accuracy"] == pytest.approx(accuracy_score(y, pred))
+
+    def test_string_class_labels(self, con):
+        rng = np.random.default_rng(305)
+        n = 1500
+        X = np.column_stack([rng.normal(0, 1, n), rng.normal(0, 1, n)])
+        lab = np.array(["low", "mid", "high"])[
+            np.array([rng.choice(3, p=p) for p in
+                      np.exp(np.column_stack([np.zeros(n), X[:, 0], X[:, 1]]))
+                      / np.exp(np.column_stack([np.zeros(n), X[:, 0], X[:, 1]])).sum(1, keepdims=True)])]
+        df = pd.DataFrame({"x1": X[:, 0], "x2": X[:, 1], "grp": lab})
+        _load(con, "mtrain", df)
+        con.execute("CREATE OR REPLACE TABLE mmodel AS SELECT * FROM multinom_fit('mtrain','grp')")
+        classes = con.execute("SELECT DISTINCT class FROM mmodel ORDER BY 1").df()["class"].tolist()
+        assert classes == ["high", "low", "mid"]                # reference 'high' (min)
+        preds = con.execute("SELECT DISTINCT pred FROM multinom_predict('mmodel','mtrain')").df()["pred"]
+        assert set(preds) <= {"low", "mid", "high"}
+
+    def test_single_class_errors(self, con):
+        df = pd.DataFrame({"x1": [0.1, 0.2, 0.3], "y": [1, 1, 1]})
+        _load(con, "mtrain", df)
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM multinom_fit('mtrain','y')").fetchall()
+        assert "at least 2 distinct classes" in str(e.value)
+
+    def test_pred_column_collision_errors(self, con):
+        df, X, y = self._softmax_data(306, n=200)
+        _load(con, "mtrain", df)
+        con.execute("CREATE OR REPLACE TABLE mmodel AS SELECT * FROM multinom_fit('mtrain','y', max_iter := 500)")
+        con.execute("CREATE OR REPLACE TABLE mbad AS SELECT x1, x2, y, 1 AS pred FROM mtrain")
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM multinom_predict('mmodel','mbad')").fetchall()
+        assert "pred" in str(e.value)
+
+
+# --------------------------------------------------------------------------- #
 # Categorical encoding helper (dummy_encode_sql)
 # --------------------------------------------------------------------------- #
 class TestDummyEncode:

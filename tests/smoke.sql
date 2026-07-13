@@ -146,4 +146,17 @@ SELECT CASE
     ELSE error('SMOKE FAIL: dummy_encode_sql output = ' || dummy_encode_sql('cats', 'y'))
   END;
 
+-- Multinomial (softmax): 3-class fit; reference class has zero coefficients,
+-- predicted probabilities are in [0,1] and sum to 1 per row.
+CREATE TABLE mc AS SELECT i AS x1, (i % 3) AS y FROM range(150) t(i);
+CREATE TABLE mc_m AS SELECT * FROM multinom_fit('mc', 'y');
+SELECT CASE
+    WHEN (SELECT count(DISTINCT class) FROM mc_m) = 3
+     AND (SELECT bool_and(coefficient = 0) FROM mc_m WHERE class = '0')  -- reference class
+     AND (SELECT bool_and(abs(list_sum(map_values(probs)) - 1.0) < 1e-9)
+          FROM multinom_predict('mc_m', 'mc'))
+    THEN 'PASS  multinomial fits 3 classes, probs normalize per row'
+    ELSE error('SMOKE FAIL: multinomial output invalid')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;
