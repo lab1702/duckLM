@@ -223,4 +223,28 @@ SELECT CASE
     ELSE error('SMOKE FAIL: grid refinement output invalid')
   END;
 
+-- Inference: the norm/t utilities hit known quantiles; *_summary returns one
+-- finite (SE, statistic, p, CI) row per coefficient with the CI bracketing the
+-- estimate; fixed-dispersion families use the z critical value ~1.95996 while
+-- estimated-dispersion families use a wider Student-t critical value.
+CREATE TABLE infm_p AS SELECT * FROM poisson_fit('cvnb', 'y');
+CREATE TABLE infm_l AS SELECT * FROM linreg_fit('cvt', 'y');
+SELECT CASE
+    WHEN abs(norm_ppf(0.975) - 1.959963984540054) < 1e-9
+     AND abs(norm_cdf(1.959963984540054) - 0.975) < 1e-9
+     AND abs(t_ppf(0.975, 1.0) - 12.706204736174699) < 1e-6
+     AND abs(t_cdf(0.0, 5.0) - 0.5) < 1e-12
+     -- poisson_summary (fixed dispersion): finite, CI brackets estimate, z crit ~1.96
+     AND (SELECT count(*) FROM poisson_summary('infm_p', 'cvnb', 'y')) = 2
+     AND (SELECT bool_and(std_error > 0 AND p_value BETWEEN 0.0 AND 1.0
+                          AND conf_low < coefficient AND coefficient < conf_high
+                          AND abs((conf_high - coefficient)/std_error - 1.959963984540054) < 1e-6)
+          FROM poisson_summary('infm_p', 'cvnb', 'y'))
+     -- linreg_summary (estimated dispersion): Student-t critical value wider than z
+     AND (SELECT bool_and((conf_high - coefficient)/std_error > 1.9599640)
+          FROM linreg_summary('infm_l', 'cvt', 'y'))
+    THEN 'PASS  norm/t quantiles match; *_summary gives valid SE/stat/p/CI; t wider than z'
+    ELSE error('SMOKE FAIL: inference output invalid')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;

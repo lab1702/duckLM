@@ -1437,6 +1437,195 @@ class TestGridRefinement:
 
 
 # --------------------------------------------------------------------------- #
+# Inference: SE / statistic / p-value / CI (*_summary) and the norm/t utilities
+# --------------------------------------------------------------------------- #
+class TestInference:
+    EST = {"linear", "gamma", "tweedie"}  # estimated dispersion -> Student-t
+    # family -> (fit macro, summary macro, extra param string, alpha, power)
+    SPEC = {
+        "logistic": ("logit_fit", "logit_summary", "", None, None),
+        "linear": ("linreg_fit", "linreg_summary", "", None, None),
+        "poisson": ("poisson_fit", "poisson_summary", "", None, None),
+        "gamma": ("gamma_fit", "gamma_summary", "", None, None),
+        "tweedie": ("tweedie_fit", "tweedie_summary", ", power := 1.5", None, 1.5),
+        "nbinom": ("nbinom_fit", "nbinom_summary", ", alpha := 0.5", 0.5, None),
+    }
+
+    def _data(self, family, seed, n=600):
+        rng = np.random.default_rng(seed)
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        eta = 0.5 + 0.7 * x1 - 0.4 * x2
+        if family == "logistic":
+            y = rng.binomial(1, 1 / (1 + np.exp(-eta))).astype(float)
+        elif family == "linear":
+            y = 2 + 1.5 * x1 - 0.8 * x2 + rng.normal(0, 1.5, n)
+        elif family == "poisson":
+            y = rng.poisson(np.exp(eta)).astype(float)
+        elif family == "gamma":
+            y = rng.gamma(2.0, np.exp(eta) / 2.0)
+        elif family == "tweedie":
+            y = np.where(rng.random(n) < 0.3, 0.0, rng.gamma(2.0, np.exp(eta) / 2.0))
+        else:  # nbinom
+            y = rng.poisson(rng.gamma(1 / 0.5, np.exp(eta) * 0.5)).astype(float)
+        return x1, x2, y
+
+    def _ref(self, X, y, beta, family, alpha=None, power=None, offset=None, ci=0.95):
+        """Independent numpy/scipy SE/stat/p/CI at the given beta (z or t per family)."""
+        from scipy import stats as st
+        n, d = X.shape
+        eta = X @ beta + (0.0 if offset is None else offset)
+        if family == "logistic":
+            mu = 1 / (1 + np.exp(-eta)); w = mu * (1 - mu); V = w
+        elif family == "linear":
+            mu = eta; w = np.ones(n); V = np.ones(n)
+        else:
+            mu = np.exp(eta)
+            if family == "poisson": w = mu; V = mu
+            elif family == "gamma": w = np.ones(n); V = mu ** 2
+            elif family == "tweedie": w = mu ** (2 - power); V = mu ** power
+            else: w = mu / (1 + alpha * mu); V = mu + alpha * mu ** 2
+        Finv = np.linalg.inv(X.T @ (w[:, None] * X)); dfr = n - d
+        scale = np.sum((y - mu) ** 2 / V) / dfr if family in self.EST else 1.0
+        se = np.sqrt(np.diag(scale * Finv)); stat = beta / se
+        if family in self.EST:
+            p = 2 * st.t.sf(np.abs(stat), dfr); q = st.t.ppf(1 - (1 - ci) / 2, dfr)
+        else:
+            p = 2 * st.norm.sf(np.abs(stat)); q = st.norm.ppf(1 - (1 - ci) / 2)
+        return se, stat, p, beta - q * se, beta + q * se
+
+    def _summary(self, con, family, cols, sumextra=""):
+        fm, sm, xp, _, _ = self.SPEC[family]
+        _load(con, "inftrain", pd.DataFrame(cols))
+        con.execute(f"CREATE OR REPLACE TABLE infmodel AS SELECT * FROM {fm}('inftrain','y'{xp})")
+        s = con.execute(f"SELECT * FROM {sm}('infmodel','inftrain','y'{xp}{sumextra})").df()
+        return s.set_index("feature").loc[["(Intercept)", "x1", "x2"]]
+
+    @pytest.mark.parametrize("family", list(SPEC))
+    def test_summary_matches_reference(self, con, family):
+        x1, x2, y = self._data(family, 700 + len(family))
+        s = self._summary(con, family, {"x1": x1, "x2": x2, "y": y})
+        X = np.column_stack([np.ones(len(y)), x1, x2])
+        _, _, _, alpha, power = self.SPEC[family]
+        se, stat, p, lo, hi = self._ref(X, y, s["coefficient"].values, family, alpha=alpha, power=power)
+        assert s["std_error"].values == pytest.approx(se, rel=1e-6, abs=1e-9), family
+        assert s["statistic"].values == pytest.approx(stat, rel=1e-6, abs=1e-9), family
+        assert s["p_value"].values == pytest.approx(p, rel=1e-5, abs=1e-12), family
+        assert s["conf_low"].values == pytest.approx(lo, rel=1e-6, abs=1e-9), family
+        assert s["conf_high"].values == pytest.approx(hi, rel=1e-6, abs=1e-9), family
+
+    def test_coefficient_column_matches_fit(self, con):
+        x1, x2, y = self._data("poisson", 71)
+        _load(con, "inftrain", pd.DataFrame({"x1": x1, "x2": x2, "y": y}))
+        con.execute("CREATE OR REPLACE TABLE infmodel AS SELECT * FROM poisson_fit('inftrain','y')")
+        fitc = dict(con.execute("SELECT feature, coefficient FROM infmodel").fetchall())
+        summ = con.execute("SELECT feature, coefficient FROM poisson_summary('infmodel','inftrain','y')").fetchall()
+        for f, c in summ:
+            assert c == pytest.approx(fitc[f], rel=1e-12)
+
+    def test_normal_and_t_utilities(self, con):
+        from scipy import stats as st
+        for z in [-3.5, -1.0, 0.0, 0.4, 1.96, 2.8, 5.0]:
+            got = con.execute("SELECT norm_cdf(?)", [z]).fetchone()[0]
+            assert got == pytest.approx(st.norm.cdf(z), abs=1e-12)
+        for p in [1e-6, 0.01, 0.25, 0.5, 0.975, 0.999]:
+            got = con.execute("SELECT norm_ppf(?)", [p]).fetchone()[0]
+            assert got == pytest.approx(st.norm.ppf(p), rel=1e-9, abs=1e-9)
+        for df in [1.0, 3.0, 8.0, 30.0, 120.0]:
+            for tv in [-4.0, -1.0, 0.7, 2.5]:
+                got = con.execute("SELECT t_cdf(?, ?)", [tv, df]).fetchone()[0]
+                assert got == pytest.approx(st.t.cdf(tv, df), abs=1e-10), (tv, df)
+            for pv in [0.9, 0.975, 0.995]:
+                got = con.execute("SELECT t_ppf(?, ?)", [pv, df]).fetchone()[0]
+                assert got == pytest.approx(st.t.ppf(pv, df), rel=1e-8, abs=1e-8), (pv, df)
+
+    def test_offset_matches_reference(self, con):
+        rng = np.random.default_rng(88); n = 500
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        off = rng.normal(0, 0.5, n)
+        y = rng.poisson(np.exp(0.4 + 0.6 * x1 - 0.3 * x2 + off)).astype(float)
+        _load(con, "inftrain", pd.DataFrame({"x1": x1, "x2": x2, "expo": off, "y": y}))
+        con.execute("CREATE OR REPLACE TABLE infmodel AS SELECT * FROM poisson_fit('inftrain','y', offset_col := 'expo')")
+        s = con.execute("SELECT * FROM poisson_summary('infmodel','inftrain','y', offset_col := 'expo')").df().set_index("feature").loc[["(Intercept)", "x1", "x2"]]
+        X = np.column_stack([np.ones(n), x1, x2])
+        se, _, p, lo, hi = self._ref(X, y, s["coefficient"].values, "poisson", offset=off)
+        assert s["std_error"].values == pytest.approx(se, rel=1e-6, abs=1e-9)
+        assert s["conf_low"].values == pytest.approx(lo, rel=1e-6, abs=1e-9)
+
+    def test_weights_matches_reference(self, con):
+        rng = np.random.default_rng(89); n = 500
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        wt = rng.uniform(0.5, 2.0, n)
+        y = rng.gamma(2.0, np.exp(0.5 + 0.6 * x1 - 0.3 * x2) / 2.0)
+        _load(con, "inftrain", pd.DataFrame({"x1": x1, "x2": x2, "wt": wt, "y": y}))
+        con.execute("CREATE OR REPLACE TABLE infmodel AS SELECT * FROM gamma_fit('inftrain','y', weights_col := 'wt')")
+        s = con.execute("SELECT * FROM gamma_summary('infmodel','inftrain','y', weights_col := 'wt')").df().set_index("feature").loc[["(Intercept)", "x1", "x2"]]
+        # weighted reference (var_weights convention: df = n - d, Pearson weighted)
+        beta = s["coefficient"].values; X = np.column_stack([np.ones(n), x1, x2])
+        from scipy import stats as st
+        mu = np.exp(X @ beta); Finv = np.linalg.inv(X.T @ (wt[:, None] * X))
+        phi = np.sum(wt * ((y - mu) / mu) ** 2) / (n - 3); se = np.sqrt(np.diag(phi * Finv))
+        q = st.t.ppf(0.975, n - 3)
+        assert s["std_error"].values == pytest.approx(se, rel=1e-6, abs=1e-9)
+        assert s["conf_high"].values == pytest.approx(beta + q * se, rel=1e-6, abs=1e-9)
+
+    def test_conf_level(self, con):
+        x1, x2, y = self._data("poisson", 73)
+        s95 = self._summary(con, "poisson", {"x1": x1, "x2": x2, "y": y})
+        s99 = self._summary(con, "poisson", {"x1": x1, "x2": x2, "y": y}, sumextra=", conf_level := 0.99")
+        assert ((s99["conf_high"] - s99["conf_low"]) > (s95["conf_high"] - s95["conf_low"])).all()
+        X = np.column_stack([np.ones(len(y)), x1, x2])
+        _, _, _, lo, hi = self._ref(X, y, s99["coefficient"].values, "poisson", ci=0.99)
+        assert s99["conf_low"].values == pytest.approx(lo, rel=1e-6, abs=1e-9)
+
+    def test_z_vs_t_convention(self, con):
+        # fixed-dispersion families use z (crit ~ 1.95996 at 95%); estimated use a
+        # wider Student-t critical value with n-d df
+        from scipy import stats as st
+        xp, xg, yy = self._data("poisson", 51)
+        sp = self._summary(con, "poisson", {"x1": xp, "x2": xg, "y": yy})
+        crit_p = (sp["conf_high"] - sp["coefficient"]) / sp["std_error"]
+        assert crit_p.values == pytest.approx(st.norm.ppf(0.975), rel=1e-6)
+        xl1, xl2, yl = self._data("linear", 52)
+        sl = self._summary(con, "linear", {"x1": xl1, "x2": xl2, "y": yl})
+        crit_l = (sl["conf_high"] - sl["coefficient"]) / sl["std_error"]
+        assert crit_l.values == pytest.approx(st.t.ppf(0.975, len(yl) - 3), rel=1e-6)
+        assert (crit_l > st.norm.ppf(0.975)).all()  # t is wider than z
+
+    def test_singular_returns_null(self, con):
+        # a duplicated (perfectly collinear) feature makes X'WX singular ->
+        # NULL SE/stat/p/CI, one row per coefficient, no error
+        x1, x2, y = self._data("poisson", 61)
+        _load(con, "inftrain", pd.DataFrame({"x1": x1, "x2": x2, "x1copy": x1, "y": y}))
+        con.execute("CREATE OR REPLACE TABLE infmodel AS SELECT * FROM poisson_fit('inftrain','y')")
+        s = con.execute("SELECT * FROM poisson_summary('infmodel','inftrain','y')").df()
+        assert len(s) == 4  # intercept + 3 features
+        assert s["std_error"].isna().all()
+        assert s["p_value"].isna().all() and s["conf_low"].isna().all()
+        assert s["coefficient"].notna().all()  # coefficients still reported
+
+    def test_degenerate_designs_null_not_crash(self, con):
+        # n == d (saturated, residual df 0) for an estimated-dispersion family must
+        # return NULL (dispersion undefined), NOT crash on lgamma(0) in the t path
+        con.execute("CREATE OR REPLACE TABLE sat AS SELECT * FROM "
+                    "(VALUES (0.3,1.0,2.1),(1.1,-0.5,3.4),(-0.7,2.0,1.2)) v(x1,x2,y)")
+        con.execute("CREATE OR REPLACE TABLE msat AS SELECT * FROM linreg_fit('sat','y')")
+        s = con.execute("SELECT * FROM linreg_summary('msat','sat','y')").df()
+        assert len(s) == 3 and s["std_error"].isna().all() and s["coefficient"].notna().all()
+        # a constant feature is detected regardless of its value (diagonal scaling)
+        x1, x2, y = self._data("poisson", 41)
+        _load(con, "cf", pd.DataFrame({"x1": x1, "x2": x2, "c": np.full(len(y), 3.7), "y": y}))
+        con.execute("CREATE OR REPLACE TABLE mcf AS SELECT * FROM poisson_fit('cf','y')")
+        s = con.execute("SELECT * FROM poisson_summary('mcf','cf','y')").df()
+        assert len(s) == 4 and s["std_error"].isna().all() and s["coefficient"].notna().all()
+
+    def test_t_ppf_df1_is_exact_cauchy(self, con):
+        from scipy import stats as st
+        for p in [0.9, 0.975, 0.999, 0.99999]:  # df=1 uses the exact tan(pi(p-0.5))
+            got = con.execute("SELECT t_ppf(?, 1.0)", [p]).fetchone()[0]
+            assert got == pytest.approx(st.t.ppf(p, 1), rel=1e-9), p
+
+
+# --------------------------------------------------------------------------- #
 # Error handling & reserved names
 # --------------------------------------------------------------------------- #
 class TestErrors:

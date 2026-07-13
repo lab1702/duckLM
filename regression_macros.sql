@@ -1456,3 +1456,273 @@ SELECT alpha, loglik
 FROM nbinom_dispersion(tbl, outcome,
        (SELECT __reg_refine_grid(alpha_grid, b, n_refine) FROM __rr_best),
        max_iter, learning_rate, tol);
+
+
+-- ===========================================================================
+-- Inference: standard errors, z/t statistics, p-values, confidence intervals
+--   Cov(beta) = phi * (X'WX)^{-1}, with the expected-information (Fisher) IRLS
+--   working weight per family; z (fixed dispersion) or Student-t with n-d df
+--   (estimated dispersion) for p-values / CIs. All in pure SQL:
+--     * norm_cdf / norm_ppf  -- West/Hart + Acklam+Halley (double precision)
+--     * t_cdf   / t_ppf      -- regularized incomplete beta (Lentz CF) + Newton
+--     * Gauss-Jordan matrix inversion with partial pivoting (inlined)
+-- ===========================================================================
+
+-- ---- Standard normal CDF and quantile (closed form, ~1e-15) ----------------
+CREATE OR REPLACE MACRO __reg_norm_q(a) AS (          -- upper tail P(Z>a), a>=0
+  CASE
+    WHEN a > 37.0 THEN 0.0
+    WHEN a < 7.071067811865475244 THEN
+      exp(-a*a/2.0)
+      * ((((((0.0352624965998911*a+0.700383064443688)*a+6.37396220353165)*a
+            +33.912866078383)*a+112.079291497871)*a+221.213596169931)*a+220.206867912376)
+      / (((((((0.0883883476483184*a+1.75566716318264)*a+16.064177579207)*a
+            +86.7807322029461)*a+296.564248779674)*a+637.333633378831)*a
+            +793.826512519948)*a+440.413735824752)
+    ELSE exp(-a*a/2.0) / (a+1.0/(a+2.0/(a+3.0/(a+4.0/(a+0.65))))) / 2.506628274631
+  END
+);
+CREATE OR REPLACE MACRO norm_cdf(z) AS (
+  CASE WHEN z >= 0.0 THEN 1.0 - __reg_norm_q(z::DOUBLE) ELSE __reg_norm_q((-z)::DOUBLE) END
+);
+CREATE OR REPLACE MACRO __reg_acklam_tail(q) AS (
+  (((((-7.784894002430293e-03*q-3.223964580411365e-01)*q-2.400758277161838e+00)*q
+      -2.549732539343734e+00)*q+4.374664141464968e+00)*q+2.938163982698783e+00)
+  / ((((7.784695709041462e-03*q+3.224671290700398e-01)*q+2.445134137142996e+00)*q
+      +3.754408661907416e+00)*q+1.0)
+);
+CREATE OR REPLACE MACRO __reg_acklam_central(q) AS (
+  (((((-3.969683028665376e+01*(q*q)+2.209460984245205e+02)*(q*q)-2.759285104469687e+02)*(q*q)
+      +1.383577518672690e+02)*(q*q)-3.066479806614716e+01)*(q*q)+2.506628277459239e+00)*q
+  / (((((-5.447609879822406e+01*(q*q)+1.615858368580409e+02)*(q*q)-1.556989798598866e+02)*(q*q)
+      +6.680131188771972e+01)*(q*q)-1.328068155288572e+01)*(q*q)+1.0)
+);
+CREATE OR REPLACE MACRO __reg_norm_ppf_raw(p) AS (
+  CASE WHEN p < 0.02425  THEN  __reg_acklam_tail(sqrt(-2.0*ln(p)))
+       WHEN p <= 0.97575 THEN  __reg_acklam_central(p-0.5)
+       ELSE                   -__reg_acklam_tail(sqrt(-2.0*ln(1.0-p))) END
+);
+CREATE OR REPLACE MACRO __reg_norm_ppf_halley(x0, p) AS (
+  x0 - ((norm_cdf(x0)-p)*2.506628274631*exp(x0*x0/2.0))
+       / (1.0 + x0*((norm_cdf(x0)-p)*2.506628274631*exp(x0*x0/2.0))/2.0)
+);
+CREATE OR REPLACE MACRO norm_ppf(p) AS ( __reg_norm_ppf_halley(__reg_norm_ppf_raw(p::DOUBLE), p::DOUBLE) );
+
+-- ---- Student-t CDF and quantile via regularized incomplete beta ------------
+CREATE OR REPLACE MACRO __reg_fpmin(z) AS (CASE WHEN abs(z) < 1e-30 THEN 1e-30 ELSE z END);
+CREATE OR REPLACE MACRO __reg_bcf_aa(a, b, x, j) AS (   -- j-th continued-fraction coefficient
+  CASE WHEN j % 2 = 1
+       THEN  ((j+1)//2)::DOUBLE * (b - ((j+1)//2)::DOUBLE) * x
+             / ((a - 1.0 + 2.0*((j+1)//2)::DOUBLE) * (a + 2.0*((j+1)//2)::DOUBLE))
+       ELSE -(a + ((j+1)//2)::DOUBLE) * (a + b + ((j+1)//2)::DOUBLE) * x
+             / ((a + 2.0*((j+1)//2)::DOUBLE) * (a + 1.0 + 2.0*((j+1)//2)::DOUBLE))
+  END
+);
+CREATE OR REPLACE MACRO __reg_betacf(a, b, x) AS (      -- modified-Lentz CF (400 terms)
+  list_reduce(
+    [ struct_pack(c := 1.0::DOUBLE,
+                  d := 1.0 / __reg_fpmin(1.0 - (a+b)*x/(a+1.0)),
+                  h := 1.0 / __reg_fpmin(1.0 - (a+b)*x/(a+1.0)), j := 0) ]
+    || list_transform(range(1, 401),
+         lambda i: struct_pack(c := 0.0::DOUBLE, d := 0.0::DOUBLE, h := 0.0::DOUBLE, j := i)),
+    (acc, e) -> struct_pack(
+       c := __reg_fpmin(1.0 + __reg_bcf_aa(a,b,x,e.j) / acc.c),
+       d := 1.0 / __reg_fpmin(1.0 + __reg_bcf_aa(a,b,x,e.j) * acc.d),
+       h := acc.h * (1.0 / __reg_fpmin(1.0 + __reg_bcf_aa(a,b,x,e.j) * acc.d))
+                  * __reg_fpmin(1.0 + __reg_bcf_aa(a,b,x,e.j) / acc.c),
+       j := e.j)
+  ).h
+);
+CREATE OR REPLACE MACRO __reg_betai(a, b, x) AS (       -- regularized incomplete beta I_x(a,b)
+  CASE WHEN x <= 0.0 THEN 0.0
+       WHEN x >= 1.0 THEN 1.0
+       WHEN x < (a+1.0)/(a+b+2.0)
+         THEN exp(lgamma(a+b)-lgamma(a)-lgamma(b)+a*ln(x)+b*ln(1.0-x)) * __reg_betacf(a,b,x)/a
+       ELSE 1.0 - exp(lgamma(a+b)-lgamma(a)-lgamma(b)+a*ln(x)+b*ln(1.0-x)) * __reg_betacf(b,a,1.0-x)/b
+  END
+);
+CREATE OR REPLACE MACRO __reg_t_sf(t, df) AS (          -- P(T>t), cancellation-free tail
+  CASE WHEN t >= 0.0 THEN 0.5 * __reg_betai(df/2.0, 0.5, df/(df + t*t))
+       ELSE 1.0 - 0.5 * __reg_betai(df/2.0, 0.5, df/(df + t*t)) END
+);
+CREATE OR REPLACE MACRO t_cdf(t, df) AS ( 1.0 - __reg_t_sf(t::DOUBLE, df::DOUBLE) );
+CREATE OR REPLACE MACRO __reg_t_pdf(t, df) AS (
+  exp(lgamma((df+1.0)/2.0) - lgamma(df/2.0) - 0.5*ln(df * 3.141592653589793::DOUBLE))
+  * pow(1.0 + t*t/df, -(df+1.0)/2.0)
+);
+CREATE OR REPLACE MACRO __reg_t_ppf(p, df) AS (        -- Newton from the normal quantile
+  CASE WHEN df = 1.0 THEN tan(3.141592653589793 * (p - 0.5))    -- Cauchy: exact
+       ELSE list_reduce(
+              [ norm_ppf(p) ] || list_transform(range(1, 13), lambda i: 0.0::DOUBLE),
+              (t, e) -> t - ((1.0 - __reg_t_sf(t, df)) - p) / __reg_t_pdf(t, df))
+  END
+);
+CREATE OR REPLACE MACRO t_ppf(p, df) AS ( __reg_t_ppf(p::DOUBLE, df::DOUBLE) );
+
+-- ---- Shared coefficient-inference core -------------------------------------
+CREATE OR REPLACE MACRO __reg_summary(model, tbl, outcome, family, caller,
+                                      conf_level, offset_col, weights_col, power, alpha) AS TABLE
+WITH RECURSIVE
+mdl AS (SELECT feature, coefficient FROM query_table(model)),
+beta AS (
+  SELECT ([ coalesce((SELECT coefficient FROM mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
+          || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS bvec,
+         ([ '(Intercept)' ]
+          || list(feature ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS names,
+         (count(*) FILTER (WHERE feature != '(Intercept)'))::INT AS k
+  FROM mdl
+),
+num AS (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
+alllong AS (
+  SELECT rid, name AS col, value AS v
+  FROM (UNPIVOT (SELECT rid, TRY_CAST(COLUMNS(* EXCLUDE (rid)) AS DOUBLE) FROM num)
+        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE value)
+),
+yv AS (SELECT rid, v AS y  FROM alllong WHERE col = outcome),
+ov AS (SELECT rid, v AS o  FROM alllong WHERE col = offset_col),
+wv AS (SELECT rid, v AS wt FROM alllong WHERE col = weights_col),
+feat AS (
+  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY l.col) AS xs, count(*)::INT AS nf
+  FROM alllong l JOIN mdl m ON m.feature = l.col AND m.feature != '(Intercept)'
+  GROUP BY l.rid
+),
+rows0 AS (
+  SELECT f.rid, f.xs, y.y,
+         CASE WHEN offset_col IS NULL THEN 0.0 ELSE o.o END AS off,
+         CASE WHEN weights_col IS NULL THEN 1.0 ELSE coalesce(w.wt, 1.0) END AS wt
+  FROM feat f
+  JOIN yv y ON y.rid = f.rid
+  LEFT JOIN ov o ON o.rid = f.rid
+  LEFT JOIN wv w ON w.rid = f.rid
+  CROSS JOIN beta
+  WHERE f.nf = beta.k AND y.y IS NOT NULL
+    AND (offset_col IS NULL OR o.o IS NOT NULL)
+),
+rww AS (
+  SELECT r.rid, r.xs, r.y, r.wt, mu,
+         r.wt * (CASE family
+                   WHEN 'logistic' THEN mu*(1.0-mu)  WHEN 'linear' THEN 1.0
+                   WHEN 'poisson'  THEN mu           WHEN 'gamma'  THEN 1.0
+                   WHEN 'tweedie'  THEN pow(mu, 2.0-power)
+                   WHEN 'nbinom'   THEN mu/(1.0+alpha*mu) END) AS w,
+         r.wt * (CASE family
+                   WHEN 'logistic' THEN (r.y-mu)*(r.y-mu)/(mu*(1.0-mu))
+                   WHEN 'linear'   THEN (r.y-mu)*(r.y-mu)
+                   WHEN 'poisson'  THEN (r.y-mu)*(r.y-mu)/mu
+                   WHEN 'gamma'    THEN (r.y-mu)*(r.y-mu)/(mu*mu)
+                   WHEN 'tweedie'  THEN (r.y-mu)*(r.y-mu)/pow(mu, power)
+                   WHEN 'nbinom'   THEN (r.y-mu)*(r.y-mu)/(mu*(1.0+alpha*mu)) END) AS pearson
+  FROM (
+    -- eta clamped to [-700, 700] (as the fit does) so mu = exp(eta) never overflows
+    SELECT rid, xs, y, wt,
+           CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0, least(eta, 700.0))))
+                       WHEN 'linear'   THEN eta
+                       ELSE exp(greatest(-700.0, least(eta, 700.0))) END AS mu
+    FROM (SELECT rid, xs, y, wt, off + list_dot_product(xs, (SELECT bvec FROM beta)) AS eta FROM rows0)
+  ) r
+),
+dims AS (SELECT count(*)::INT AS n, (SELECT k FROM beta)+1 AS d FROM rww),
+idx AS (SELECT unnest(range(1, (SELECT d FROM dims)+1)) AS i),
+pairs AS (SELECT a.i AS a, b.i AS b FROM idx a, idx b),
+xwx AS (
+  SELECT list(rowlist ORDER BY a) AS A FROM (
+    SELECT a, list(val ORDER BY b) AS rowlist FROM (
+      SELECT p.a AS a, p.b AS b, sum(rww.w * rww.xs[p.a] * rww.xs[p.b]) AS val
+      FROM rww, pairs p GROUP BY p.a, p.b
+    ) GROUP BY a
+  )
+),
+-- Scale X'WX to unit diagonal (correlation form) before inversion: makes the
+-- singular-pivot test scale-invariant and squares less conditioning error.
+-- dsc[j] = sqrt(diag_j); Cov = phi * D^-1 R^-1 D^-1, so SE_j = sqrt(phi*Rinv_jj)/dsc_j.
+scal AS (
+  SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc
+  FROM xwx
+),
+rscaled AS (
+  SELECT dsc, list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dsc[i]*dsc[j]))) AS R
+  FROM scal
+),
+gj(k, d, sing, M) AS (
+  SELECT 0, len(R), false,
+         list_transform(R, lambda row, i:
+             list_concat(list_transform(row, lambda v, j: v::DOUBLE),
+                         list_transform(row, lambda v, j: CASE WHEN j = i THEN 1.0 ELSE 0.0 END)))
+  FROM rscaled
+  UNION ALL
+  SELECT col, d, sing OR abs(piv) < 1e-12,
+         CASE WHEN abs(piv) < 1e-12 THEN Mswap
+              ELSE list_transform(Mswap, lambda row, i:
+                       CASE WHEN i = col THEN normpivot
+                            ELSE list_transform(row, lambda v, j: v - row[col]*normpivot[j]) END) END
+  FROM (
+    SELECT col, d, sing, Mswap, Mswap[col][col] AS piv,
+           list_transform(Mswap[col], lambda v, j: v / Mswap[col][col]) AS normpivot
+    FROM (
+      SELECT col, d, sing,
+             list_transform(M, lambda row, i:
+                 CASE WHEN i = col THEN M[p] WHEN i = p THEN M[col] ELSE row END) AS Mswap
+      FROM (
+        SELECT col, d, sing, M, list_position(pcol, list_aggregate(pcol, 'max')) AS p
+        FROM (
+          SELECT k, k+1 AS col, d, sing, M,
+                 list_transform(M, lambda row, i:
+                     CASE WHEN i >= k+1 THEN abs(row[k+1]) ELSE -1e308 END) AS pcol
+          FROM gj WHERE k < d
+        )
+      )
+    )
+  )
+),
+covinv AS (
+  SELECT CASE WHEN sing THEN NULL
+              ELSE list_transform(M, lambda row, i: list_slice(row, d+1, 2*d)) END AS Rinv
+  FROM gj WHERE k = d
+),
+disp AS (
+  SELECT CASE WHEN family IN ('linear','gamma','tweedie')
+              THEN (SELECT sum(pearson) FROM rww) / nullif((SELECT n-d FROM dims), 0)
+              ELSE 1.0 END AS phi,
+         family IN ('linear','gamma','tweedie') AS est,
+         (SELECT (n-d)::DOUBLE FROM dims) AS df
+),
+final AS (
+  SELECT b.names AS names, b.bvec AS bvec, c.Rinv AS Rinv, s.dsc AS dsc,
+         dp.phi AS phi, dp.est AS est, dp.df AS df,
+         CASE WHEN dp.est AND dp.df > 0.0 THEN t_ppf(1.0-(1.0-conf_level)/2.0, dp.df)
+              WHEN dp.est THEN NULL
+              ELSE norm_ppf(1.0-(1.0-conf_level)/2.0) END AS crit
+  FROM beta b CROSS JOIN covinv c CROSS JOIN scal s CROSS JOIN disp dp
+),
+-- per-coefficient variance with guards: NULL (not a crash / garbage) when the
+-- covariance is singular (Rinv NULL), non-finite, or non-positive
+percoef AS (
+  SELECT gs.i AS i, names[gs.i] AS feature, bvec[gs.i] AS coefficient, est, df, crit,
+         CASE WHEN Rinv IS NOT NULL
+               AND isfinite(phi * Rinv[gs.i][gs.i])
+               AND phi * Rinv[gs.i][gs.i] > 0.0
+              THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] ELSE NULL END AS std_error
+  FROM final, unnest(range(1, len(bvec)+1)) AS gs(i)
+)
+SELECT feature, coefficient, std_error,
+       coefficient / std_error AS statistic,
+       CASE WHEN std_error IS NULL THEN NULL
+            WHEN est AND df > 0.0 THEN 2.0 * __reg_t_sf(abs(coefficient / std_error), df)
+            WHEN est THEN NULL
+            ELSE 2.0 * norm_cdf(-abs(coefficient / std_error)) END AS p_value,
+       coefficient - crit * std_error AS conf_low,
+       coefficient + crit * std_error AS conf_high
+FROM percoef ORDER BY i;
+
+CREATE OR REPLACE MACRO logit_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_summary(model, tbl, outcome, 'logistic', 'logit_summary', conf_level, offset_col, weights_col, NULL, NULL);
+CREATE OR REPLACE MACRO linreg_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_summary(model, tbl, outcome, 'linear', 'linreg_summary', conf_level, offset_col, weights_col, NULL, NULL);
+CREATE OR REPLACE MACRO poisson_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_summary(model, tbl, outcome, 'poisson', 'poisson_summary', conf_level, offset_col, weights_col, NULL, NULL);
+CREATE OR REPLACE MACRO gamma_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_summary(model, tbl, outcome, 'gamma', 'gamma_summary', conf_level, offset_col, weights_col, NULL, NULL);
+CREATE OR REPLACE MACRO tweedie_summary(model, tbl, outcome, power := 1.5, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_summary(model, tbl, outcome, 'tweedie', 'tweedie_summary', conf_level, offset_col, weights_col, power, NULL);
+CREATE OR REPLACE MACRO nbinom_summary(model, tbl, outcome, alpha := 1.0, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_summary(model, tbl, outcome, 'nbinom', 'nbinom_summary', conf_level, offset_col, weights_col, NULL, alpha);

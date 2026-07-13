@@ -1,15 +1,18 @@
 # duckLM — GLM regression (logistic, linear, Poisson, Gamma, Tweedie, negative binomial, multinomial) in pure DuckDB SQL
 
 Table macros for DuckDB **1.5+**, no extensions required: **fit**, **predict**,
-and **evaluate** for binary logistic regression, ordinary least-squares linear
+**evaluate**, and **summary** (standard errors, p-values, confidence intervals)
+for binary logistic regression, ordinary least-squares linear
 regression, Poisson regression, Gamma regression, Tweedie regression, negative
 binomial regression (all but linear use a log link), and **multinomial
 (softmax)** classification. The
 single-outcome families take optional ridge/lasso/elastic-net regularization,
-an offset/exposure term, and sample weights. Everything runs inside DuckDB —
-training is Nesterov-accelerated gradient descent implemented with a recursive
-CTE and list lambdas, sharing a single optimizer core across all model
-families.
+an offset/exposure term, and sample weights, plus cross-validation and Wald
+inference. Everything runs inside DuckDB — training is Nesterov-accelerated
+gradient descent implemented with a recursive CTE and list lambdas, sharing a
+single optimizer core across all model families; even the coefficient
+covariance (matrix inversion) and the normal/Student-t distributions are
+computed in pure SQL.
 
 ## Setup
 
@@ -205,6 +208,57 @@ and `bic` use *k* = number of model coefficients (intercept included). Gamma's
 log-likelihood/AIC depend on the dispersion parameter, so it reports deviance,
 deviance-based pseudo-R², and the Pearson `dispersion` instead.
 
+## Inference: `logit_summary` / `linreg_summary` / `poisson_summary` / `gamma_summary` / `tweedie_summary` / `nbinom_summary`
+
+A **coefficient table** with standard errors, test statistics, p-values and
+confidence intervals — the equivalent of R's `summary(glm(...))` or statsmodels
+`.summary()`, in pure SQL. Pass a fitted model and its training data (same shape
+as `*_evaluate`):
+
+```sql
+CREATE TABLE model AS SELECT * FROM poisson_fit('visits', 'n');
+SELECT * FROM poisson_summary('model', 'visits', 'n');
+```
+
+| feature | coefficient | std_error | statistic | p_value | conf_low | conf_high |
+|---|---|---|---|---|---|---|
+| (Intercept) | 0.5190 | 0.0429 | 12.09 | 3e-33 | 0.4348 | 0.6031 |
+| x1 | 0.7843 | 0.0338 | 23.17 | 0 | 0.7180 | 0.8507 |
+| … | | | | | | |
+
+The covariance matrix is `Cov(β̂) = φ · (XᵀWX)⁻¹`, with `W` the per-family
+expected-information (Fisher) IRLS weights evaluated at the fitted coefficients
+— so the standard errors are **identical to statsmodels** to machine precision.
+It composes with `offset_col` and `weights_col` (analytic/`var_weights`
+convention), and `conf_level` sets the interval (default `0.95`):
+
+```sql
+SELECT feature, coefficient, conf_low, conf_high
+FROM gamma_summary('model', 'claims', 'cost', weights_col := 'exposure', conf_level := 0.99);
+```
+
+The **reference distribution** follows R's `glm`/`lm` convention: the `statistic`
+is a **z**-score with a normal p-value/CI when the dispersion is fixed
+(`logit`/`poisson`/`nbinom`), and a **t**-score with `n − d` degrees of freedom
+when the dispersion is estimated (`linreg`/`gamma`/`tweedie`, Pearson φ). Both
+the normal and Student-t CDFs/quantiles are computed in pure SQL and exposed as
+reusable helpers — `norm_cdf(z)`, `norm_ppf(p)`, `t_cdf(t, df)`, `t_ppf(p, df)`
+— matching SciPy to ~1e-12 across the practical range (`t_ppf` is exact for
+`df = 1`; extreme-tail quantiles at very low `df` are approximate):
+
+```sql
+SELECT norm_ppf(0.975) AS z95, t_ppf(0.975, 30) AS t95;   -- 1.959964, 2.042272
+```
+
+Notes and limits: p-values/CIs assume an **unpenalized (maximum-likelihood)
+fit** — they are *not* valid for `l1`/`l2`-penalized models (the SE ignores the
+penalty). Collinear, constant, or severely ill-conditioned features make `XᵀWX`
+singular/indefinite, so every `std_error`/`statistic`/`p_value`/CI is returned
+as **NULL** rather than a fabricated value (the `coefficient` column is still
+reported); the same happens for the estimated-dispersion families when residual
+df `n − d ≤ 0`. Degenerate inputs return NULL, never an error. Multinomial
+standard errors are not yet provided.
+
 ## Multiclass: `multinom_fit` / `multinom_predict` / `multinom_evaluate`
 
 Multinomial (softmax) logistic regression for a categorical outcome with any
@@ -360,8 +414,8 @@ that row is dropped by the fit (as R drops `NA`). `tbl` must be a table/view
   string — score with the same column spellings you trained with.
 - The training set is materialized as an in-memory list during optimization —
   comfortable up to a few hundred thousand rows × dozens of features.
-- `__reg_fit`, `__reg_score`, and `__reg_eval` are internal helpers; call the
-  fifteen public macros instead.
+- `__reg_*` macros (e.g. `__reg_fit`, `__reg_score`, `__reg_eval`,
+  `__reg_summary`) are internal helpers; call the public macros instead.
 
 ## Testing
 
@@ -378,8 +432,9 @@ duckdb < tests/smoke.sql
 
 ## Files
 
-- [regression_macros.sql](regression_macros.sql) — all fifteen model macros +
-  the `dummy_encode_sql` helper + shared core
+- [regression_macros.sql](regression_macros.sql) — every model macro (fit /
+  predict / evaluate / summary, cross-validation, `dummy_encode_sql`, the
+  `norm_*` / `t_*` distribution helpers) + shared core
 - [tests/](tests) — pytest suite (vs scikit-learn) and a pure-SQL smoke test
 - [LICENSE](LICENSE) — MIT
 
