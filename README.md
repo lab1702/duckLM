@@ -179,6 +179,39 @@ and `bic` use *k* = number of model coefficients (intercept included). Gamma's
 log-likelihood/AIC depend on the dispersion parameter, so it reports deviance,
 deviance-based pseudo-R², and the Pearson `dispersion` instead.
 
+## Categorical features: `dummy_encode_sql`
+
+The fit macros treat every column as numeric (booleans become 1/0). To use a
+**categorical/`VARCHAR`** column you dummy-encode it first — and
+`dummy_encode_sql(tbl, outcome)` writes that SQL for you. It one-hot encodes
+every VARCHAR column except the outcome with **R-style treatment contrasts**
+(k−1 indicators per factor, dropping the first level as the reference); numeric
+and boolean columns pass through untouched. The result reproduces
+`lm(y ~ ... + C(factor))` to ~1e-8.
+
+Because a macro can't return a data-dependent set of columns, it returns the
+`SELECT` as text — run it as a second step (trivial from any driver):
+
+```python
+sql = con.sql("SELECT dummy_encode_sql('sales', 'revenue')").fetchone()[0]
+con.sql(f"CREATE TABLE encoded AS {sql}")
+con.sql("SELECT * FROM linreg_fit('encoded', 'revenue')")
+```
+
+```sql
+-- e.g. dummy_encode_sql('sales', 'revenue') returns:
+SELECT * EXCLUDE (region),
+       (region = 'North')::INT AS "region_North",
+       (region = 'South')::INT AS "region_South",
+       (region = 'West')::INT  AS "region_West"     -- 'East' is the reference
+FROM sales
+```
+
+Interactions and transforms are still plain columns you add yourself
+(`ln(x) AS log_x`, `a * b AS a_x_b`, …). A NULL category yields NULL dummies, so
+that row is dropped by the fit (as R drops `NA`). `tbl` must be a table/view
+(resolvable in `duckdb_columns`).
+
 ## Contract / fine print
 
 - Feature columns must be castable to `DOUBLE` (numeric or boolean). Booleans
@@ -231,7 +264,8 @@ duckdb < tests/smoke.sql
 
 ## Files
 
-- [regression_macros.sql](regression_macros.sql) — all fifteen macros + shared core
+- [regression_macros.sql](regression_macros.sql) — all fifteen model macros +
+  the `dummy_encode_sql` helper + shared core
 - [tests/](tests) — pytest suite (vs scikit-learn) and a pure-SQL smoke test
 - [LICENSE](LICENSE) — MIT
 

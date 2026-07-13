@@ -857,6 +857,65 @@ class TestEdgeCases:
 
 
 # --------------------------------------------------------------------------- #
+# Categorical encoding helper (dummy_encode_sql)
+# --------------------------------------------------------------------------- #
+class TestDummyEncode:
+    def _generate_and_fit(self, con, df, outcome="y"):
+        _load(con, "rawdata", df)
+        sql = con.execute("SELECT dummy_encode_sql('rawdata', %r)" % outcome).fetchone()[0]
+        con.execute(f"CREATE OR REPLACE TABLE encdata AS {sql}")
+        rows = con.execute(
+            f"SELECT feature, coefficient FROM linreg_fit('encdata', '{outcome}')"
+        ).fetchall()
+        return {f: c for f, c in rows}, sql
+
+    def test_matches_manual_drop_first_onehot(self, con):
+        # R's C(factor) == pandas get_dummies(drop_first=True) on sorted levels;
+        # verify the generated encoding reproduces sklearn on that design.
+        rng = np.random.default_rng(201)
+        n = 4000
+        num = rng.normal(0, 1, n)
+        promo = rng.random(n) < 0.4
+        region = rng.choice(["North", "South", "East", "West"], n)
+        eff = {"North": 0.6, "South": 1.7, "East": 0.0, "West": 0.9}
+        y = 1 + 2 * num - 1.5 * promo + np.array([eff[r] for r in region]) + rng.normal(0, 1, n)
+        df = pd.DataFrame({"y": y, "num": num, "promo": promo, "region": region})
+        coefs, _ = self._generate_and_fit(con, df)
+        # reference design: drop the alphabetically-first level (East)
+        dummies = pd.get_dummies(df["region"], prefix="region").drop(columns="region_East")
+        X = np.column_stack([num, promo.astype(float), dummies.to_numpy().astype(float)])
+        ref = LinearRegression().fit(X, y)
+        names = ["num", "promo"] + list(dummies.columns)
+        assert coefs["(Intercept)"] == pytest.approx(ref.intercept_, abs=1e-4)
+        for name, c in zip(names, ref.coef_):
+            assert coefs[name] == pytest.approx(c, abs=1e-4), name
+
+    def test_reference_is_first_level_and_kminus1_dummies(self, con):
+        df = pd.DataFrame({"y": [1.0, 2, 3, 4], "g": ["b", "a", "c", "a"]})
+        _load(con, "rawdata", df)
+        sql = con.execute("SELECT dummy_encode_sql('rawdata', 'y')").fetchone()[0]
+        # 3 levels -> 2 dummies; reference 'a' (min) omitted
+        assert '"g_b"' in sql and '"g_c"' in sql and '"g_a"' not in sql
+        assert "EXCLUDE (g)" in sql
+
+    def test_no_categoricals_passthrough(self, con):
+        df = pd.DataFrame({"y": [1.0, 2, 3], "x": [0.1, 0.2, 0.3], "flag": [True, False, True]})
+        _load(con, "rawdata", df)
+        sql = con.execute("SELECT dummy_encode_sql('rawdata', 'y')").fetchone()[0]
+        assert sql.strip() == "SELECT * FROM rawdata"  # boolean/numeric untouched
+
+    def test_null_category_yields_null_dummy(self, con):
+        df = pd.DataFrame({"y": [1.0, 2, 3, 4], "g": ["a", "b", None, "b"]})
+        _load(con, "rawdata", df)
+        sql = con.execute("SELECT dummy_encode_sql('rawdata', 'y')").fetchone()[0]
+        con.execute(f"CREATE OR REPLACE TABLE encdata AS {sql}")
+        # the NULL-category row gets a NULL dummy (so the fit will drop it, as R
+        # drops NA rows); the other three are non-NULL
+        non_null = con.execute("SELECT count(g_b) FROM encdata").fetchone()[0]
+        assert non_null == 3
+
+
+# --------------------------------------------------------------------------- #
 # Error handling & reserved names
 # --------------------------------------------------------------------------- #
 class TestErrors:

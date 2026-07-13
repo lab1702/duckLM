@@ -137,4 +137,13 @@ SELECT CASE
     ELSE error('SMOKE FAIL: L1 did not select features as expected')
   END;
 
+-- dummy_encode_sql: generates SQL that drops the categorical column and adds
+-- k-1 indicator columns (reference = first level). Two levels -> one dummy.
+CREATE TABLE cats AS SELECT i AS x, (CASE WHEN i % 2 = 0 THEN 'a' ELSE 'b' END) AS g, 1.0 * i AS y FROM range(50) t(i);
+SELECT CASE
+    WHEN dummy_encode_sql('cats', 'y') = 'SELECT * EXCLUDE (g), (g = ''b'')::INT AS "g_b" FROM cats'
+    THEN 'PASS  dummy_encode_sql generates R-style k-1 dummy encoding'
+    ELSE error('SMOKE FAIL: dummy_encode_sql output = ' || dummy_encode_sql('cats', 'y'))
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;

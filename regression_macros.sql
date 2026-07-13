@@ -15,8 +15,12 @@
 --   tweedie_evaluate(model, tbl, outcome, power := 1.5, offset_col := NULL)
 --       -> one-row table of goodness-of-fit metrics
 --
--- Fit macros accept: max_iter, learning_rate, tol, l2, offset_col, weights_col
--- (tweedie_fit also power); see "Fit parameters" below.
+-- Fit macros accept: max_iter, learning_rate, tol, l2, l1, offset_col,
+-- weights_col (tweedie_fit also power); see "Fit parameters" below.
+--
+-- Helper (returns SQL text, run it as a second step):
+--   dummy_encode_sql(tbl, outcome) -> VARCHAR: a SELECT that R-style dummy
+--       encodes every VARCHAR column except the outcome (see its own comment).
 --
 -- Internal helpers (do not call directly, subject to change):
 --   __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2,
@@ -760,3 +764,54 @@ FROM __reg_eval(model, tbl, outcome, 'gamma', 'gamma_evaluate', offset_col, NULL
 CREATE OR REPLACE MACRO tweedie_evaluate(model, tbl, outcome, power := 1.5, offset_col := NULL) AS TABLE
 SELECT n, rmse, mae, deviance, null_deviance, pseudo_r2, dispersion
 FROM __reg_eval(model, tbl, outcome, 'tweedie', 'tweedie_evaluate', offset_col, power);
+
+
+-- ---------------------------------------------------------------------------
+-- Categorical encoding helper
+--
+-- dummy_encode_sql(tbl, outcome) inspects `tbl` and returns a SELECT statement
+-- (as text) that one-hot / dummy encodes every VARCHAR (categorical) column
+-- except the outcome, using R-style treatment contrasts: k-1 indicator columns
+-- per factor, dropping the first level (alphabetical minimum) as the reference.
+-- Numeric and boolean columns and the outcome pass through unchanged. The
+-- result reproduces R's lm(y ~ ... + C(factor)) / patsy encoding, so it feeds
+-- straight into the *_fit macros.
+--
+-- DuckDB macros cannot return a data-dependent set of columns, so this
+-- generates the SQL rather than the data; run it as a second step:
+--
+--   -- from a driver (Python / R / etc.), two lines:
+--   sql = con.sql("SELECT dummy_encode_sql('sales','revenue')").fetchone()[0]
+--   con.sql(f"CREATE TABLE encoded AS {sql}")
+--   con.sql("SELECT * FROM linreg_fit('encoded','revenue')")
+--
+-- `tbl` must be a table or view (resolvable in duckdb_columns), optionally
+-- schema/catalog-qualified. VARCHAR columns are treated as categorical; a NULL
+-- category yields NULL dummies, so that row is dropped by the fit (as R drops
+-- NA rows). High-cardinality columns produce many dummies -- encode with care.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE MACRO dummy_encode_sql(tbl, outcome) AS (
+  WITH __reg_enc_cat AS (
+    SELECT column_name AS col FROM duckdb_columns()
+    WHERE (table_name = tbl
+           OR schema_name || '.' || table_name = tbl
+           OR database_name || '.' || schema_name || '.' || table_name = tbl)
+      AND data_type = 'VARCHAR' AND column_name != outcome
+  ),
+  __reg_enc_lvl AS (
+    SELECT DISTINCT name AS col, val
+    FROM (UNPIVOT (SELECT CAST(COLUMNS(*) AS VARCHAR) FROM query_table(tbl)) ON COLUMNS(*) INTO NAME name VALUE val)
+    WHERE name IN (SELECT col FROM __reg_enc_cat) AND val IS NOT NULL
+  ),
+  __reg_enc_ref AS (SELECT col, min(val) AS ref FROM __reg_enc_lvl GROUP BY col),
+  __reg_enc_dum AS (
+    SELECT string_agg('(' || l.col || ' = ''' || replace(l.val, '''', '''''') || ''')::INT AS "'
+                      || replace(l.col || '_' || l.val, '"', '""') || '"',
+                      ', ' ORDER BY l.col, l.val) AS dummies
+    FROM __reg_enc_lvl l JOIN __reg_enc_ref r ON r.col = l.col WHERE l.val <> r.ref
+  ),
+  __reg_enc_ex AS (SELECT string_agg(col, ', ' ORDER BY col) AS excl FROM __reg_enc_cat)
+  SELECT CASE WHEN (SELECT count(*) FROM __reg_enc_cat) = 0 THEN 'SELECT * FROM ' || tbl
+              ELSE 'SELECT * EXCLUDE (' || (SELECT excl FROM __reg_enc_ex) || ')'
+                   || coalesce(', ' || (SELECT dummies FROM __reg_enc_dum), '') || ' FROM ' || tbl END
+);
