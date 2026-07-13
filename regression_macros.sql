@@ -1,18 +1,21 @@
 -- ============================================================================
--- Logistic, linear, Poisson, Gamma, Tweedie & multinomial (softmax) regression
--- as pure DuckDB (>= 1.5) SQL macros. The single-outcome families take optional
--- ridge/lasso/elastic-net regularization, an offset/exposure term, and weights.
+-- Logistic, linear, Poisson, Gamma, Tweedie, negative binomial & multinomial
+-- (softmax) regression as pure DuckDB (>= 1.5) SQL macros. The single-outcome
+-- families take optional ridge/lasso/elastic-net regularization, an
+-- offset/exposure term, and weights.
 --
 -- Public macros (15): fit / predict / evaluate for each family.
 --   {logit,linreg,poisson,gamma}_fit(tbl, outcome, ...)
 --   tweedie_fit(tbl, outcome, power := 1.5, ...)
+--   nbinom_fit(tbl, outcome, alpha := 1.0, ...)   (fixed dispersion alpha)
 --       -> table (feature VARCHAR, coefficient DOUBLE), with an '(Intercept)' row
 --   logit_predict(model, tbl, threshold := 0.5, offset_col := NULL)
 --       -> input rows + prob DOUBLE + pred BOOLEAN
---   {linreg,poisson,gamma,tweedie}_predict(model, tbl, offset_col := NULL)
+--   {linreg,poisson,gamma,tweedie,nbinom}_predict(model, tbl, offset_col := NULL)
 --       -> input rows + prediction DOUBLE (linear: score; log-link: exp(score))
 --   {logit,linreg,poisson,gamma}_evaluate(model, tbl, outcome, offset_col := NULL)
 --   tweedie_evaluate(model, tbl, outcome, power := 1.5, offset_col := NULL)
+--   nbinom_evaluate(model, tbl, outcome, alpha := 1.0, offset_col := NULL)
 --       -> one-row table of goodness-of-fit metrics
 --
 -- Fit macros accept: max_iter, learning_rate, tol, l2, l1, offset_col,
@@ -115,7 +118,7 @@
 -- same name. The __reg_ prefix is reserved (and enforced below) so that
 -- shadowing cannot happen.
 
-CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1) AS TABLE
+CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1, alpha) AS TABLE
 WITH RECURSIVE
 -- Every column cast to DOUBLE, with a synthetic row id.
 __reg_wide AS MATERIALIZED (
@@ -144,6 +147,10 @@ __reg_ycheck AS (
                THEN error(caller || ': outcome column "' || outcome || '" must be strictly positive for Tweedie power >= 2')
              WHEN family = 'tweedie' AND min(v) < 0
                THEN error(caller || ': outcome column "' || outcome || '" must be non-negative for Tweedie regression')
+             WHEN family = 'nbinom' AND min(v) < 0
+               THEN error(caller || ': outcome column "' || outcome || '" must be non-negative for negative binomial regression')
+             WHEN family = 'nbinom' AND alpha <= 0
+               THEN error(caller || ': alpha (dispersion) must be > 0')
              ELSE true
            END AS ok
     FROM __reg_long
@@ -255,7 +262,7 @@ __reg_feats AS MATERIALIZED (
 __reg_ystats AS (
     SELECT CASE WHEN family = 'linear' THEN sum(w.w * s.v) / sum(w.w) ELSE 0.0 END AS mu_y,
            CASE WHEN family = 'logistic' THEN 1.0
-                WHEN family IN ('poisson', 'gamma', 'tweedie')
+                WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom')
                   THEN (CASE WHEN sum(w.w * s.v) / sum(w.w) < 1e-300 THEN 1.0
                              ELSE sum(w.w * s.v) / sum(w.w) END)
                 ELSE (CASE WHEN sqrt(greatest(sum(w.w * s.v * s.v) / sum(w.w)
@@ -351,7 +358,10 @@ __reg_cfg AS (
                                 THEN 4.0 / (f.d + 1 + 4.0 * l2)
                                 ELSE 1.0 / (f.d + 1 + l2)
                            END)
-           END AS step
+           END AS step,
+           -- Negative-binomial dispersion on the mean-scaled internal problem:
+           -- dividing y by its mean multiplies the effective alpha by that mean.
+           coalesce(alpha, 0.0) * (SELECT sd_y FROM __reg_ystats) AS alpha_int
     FROM __reg_feats f, __reg_packed p, __reg_ycheck y, __reg_namecheck nc
     WHERE y.ok AND nc.ok
 ),
@@ -395,7 +405,7 @@ __reg_gd AS (
                    -- The log-link families (Poisson/Gamma/Tweedie) have
                    -- unbounded curvature, so damp the step by the largest
                    -- per-row Hessian weight hw. 1 for the bounded families.
-                   CASE WHEN family IN ('poisson', 'gamma', 'tweedie')
+                   CASE WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom')
                         THEN greatest(1.0, list_aggregate(
                                list_transform(res, lambda ob: ob.hw), 'max'))
                         ELSE 1.0
@@ -428,6 +438,11 @@ __reg_gd AS (
                                       WHEN family = 'tweedie'
                                       THEN (rw.y - exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)))
                                            * pow(exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)), 1.0 - power)
+                                      WHEN family = 'nbinom'
+                                      -- NB2: r = (y - mu) / (1 + alpha*mu), mu = exp(eta);
+                                      -- reduces to Poisson (y - mu) as alpha -> 0
+                                      THEN (rw.y - exp(least(list_dot_product(rw.xs, look) + rw.o, 700.0)))
+                                           / (1.0 + alpha_int * exp(least(list_dot_product(rw.xs, look) + rw.o, 700.0)))
                                       ELSE rw.y - (list_dot_product(rw.xs, look) + rw.o)
                                  END,
                            hw := CASE WHEN family = 'poisson'
@@ -437,10 +452,14 @@ __reg_gd AS (
                                       WHEN family = 'tweedie'
                                       THEN (2.0 - power) * pow(exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)), 2.0 - power)
                                            + (power - 1.0) * rw.y * pow(exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)), 1.0 - power)
+                                      WHEN family = 'nbinom'
+                                      -- NB Hessian weight mu(1+alpha*y)/(1+alpha*mu)^2
+                                      THEN exp(least(list_dot_product(rw.xs, look) + rw.o, 700.0)) * (1.0 + alpha_int * rw.y)
+                                           / pow(1.0 + alpha_int * exp(least(list_dot_product(rw.xs, look) + rw.o, 700.0)), 2.0)
                                       ELSE 0.0
                                  END)) AS res
                 FROM (
-                    SELECT g.it, g.betas, p.rows, p.n, p.sumw, c.step,
+                    SELECT g.it, g.betas, p.rows, p.n, p.sumw, c.step, c.alpha_int,
                            -- Nesterov lookahead point
                            list_transform(g.betas, lambda b, j:
                                b + (g.it::DOUBLE / (g.it + 3)) * (b - g.prev[j])) AS look
@@ -464,7 +483,7 @@ __reg_sol AS (
 SELECT feature, coefficient
 FROM (
     SELECT '(Intercept)' AS feature,
-           CASE WHEN family IN ('poisson', 'gamma', 'tweedie')
+           CASE WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom')
                 THEN ln(ys.sd_y) + (s.betas[1] - coalesce(list_sum(list_transform(f.names,
                      lambda nm, j: s.betas[j + 1] * f.mus[j] / f.sigmas[j])), 0.0))
                 ELSE ys.mu_y + ys.sd_y * (s.betas[1] - coalesce(list_sum(list_transform(f.names,
@@ -474,7 +493,7 @@ FROM (
     UNION ALL
     SELECT unnest(f.names),
            unnest(list_transform(f.names, lambda nm, j:
-               (CASE WHEN family IN ('poisson', 'gamma', 'tweedie') THEN 1.0 ELSE ys.sd_y END) * s.betas[j + 1] / f.sigmas[j]))
+               (CASE WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom') THEN 1.0 ELSE ys.sd_y END) * s.betas[j + 1] / f.sigmas[j]))
     FROM __reg_sol s, __reg_feats f, __reg_ystats ys
 )
 ORDER BY (feature = '(Intercept)') DESC, feature;
@@ -562,10 +581,10 @@ LEFT JOIN __reg_offset o ON o.rid = n.__reg_rid__;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE MACRO logit_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'logistic', 'logit_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1);
+SELECT * FROM __reg_fit(tbl, outcome, 'logistic', 'logit_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL);
 
 CREATE OR REPLACE MACRO linreg_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'linear', 'linreg_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1);
+SELECT * FROM __reg_fit(tbl, outcome, 'linear', 'linreg_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL);
 
 CREATE OR REPLACE MACRO logit_predict(model, tbl, threshold := 0.5, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
@@ -581,7 +600,7 @@ FROM __reg_score(model, tbl, 'linreg_predict', offset_col)
 ORDER BY __reg_rid__;
 
 CREATE OR REPLACE MACRO poisson_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'poisson', 'poisson_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1);
+SELECT * FROM __reg_fit(tbl, outcome, 'poisson', 'poisson_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL);
 
 CREATE OR REPLACE MACRO poisson_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
@@ -590,7 +609,7 @@ FROM __reg_score(model, tbl, 'poisson_predict', offset_col)
 ORDER BY __reg_rid__;
 
 CREATE OR REPLACE MACRO gamma_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'gamma', 'gamma_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1);
+SELECT * FROM __reg_fit(tbl, outcome, 'gamma', 'gamma_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL);
 
 CREATE OR REPLACE MACRO gamma_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
@@ -603,12 +622,25 @@ ORDER BY __reg_rid__;
 -- admits exact zeros alongside positive values (e.g. insurance pure premium).
 -- Matches sklearn TweedieRegressor(power=p, alpha=0, link='log').
 CREATE OR REPLACE MACRO tweedie_fit(tbl, outcome, power := 1.5, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'tweedie', 'tweedie_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1);
+SELECT * FROM __reg_fit(tbl, outcome, 'tweedie', 'tweedie_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1, NULL);
 
 CREATE OR REPLACE MACRO tweedie_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
        exp(__reg_score__) AS prediction
 FROM __reg_score(model, tbl, 'tweedie_predict', offset_col)
+ORDER BY __reg_rid__;
+
+-- Negative binomial (NB2, log link) for overdispersed counts. `alpha` is the
+-- fixed dispersion (variance = mu + alpha*mu^2); alpha -> 0 recovers Poisson.
+-- Matches statsmodels GLM NegativeBinomial(alpha=alpha) (fixed dispersion);
+-- alpha is a hyperparameter here, not estimated.
+CREATE OR REPLACE MACRO nbinom_fit(tbl, outcome, alpha := 1.0, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'nbinom', 'nbinom_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, alpha);
+
+CREATE OR REPLACE MACRO nbinom_predict(model, tbl, offset_col := NULL) AS TABLE
+SELECT * EXCLUDE (__reg_rid__, __reg_score__),
+       exp(__reg_score__) AS prediction
+FROM __reg_score(model, tbl, 'nbinom_predict', offset_col)
 ORDER BY __reg_rid__;
 
 
@@ -625,7 +657,7 @@ ORDER BY __reg_rid__;
 -- (intercept included); log-likelihoods, deviances, R^2 and AUC follow the
 -- standard statsmodels/scikit-learn definitions.
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE MACRO __reg_eval(model, tbl, outcome, family, caller, offset_col, power) AS TABLE
+CREATE OR REPLACE MACRO __reg_eval(model, tbl, outcome, family, caller, offset_col, power, alpha) AS TABLE
 WITH
 __reg_numbered AS MATERIALIZED (
     SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)
@@ -665,6 +697,7 @@ __reg_rows AS (
                        WHEN 'poisson'  THEN exp(z.z)
                        WHEN 'gamma'    THEN exp(z.z)
                        WHEN 'tweedie'  THEN exp(z.z)
+                       WHEN 'nbinom'   THEN exp(z.z)
                        ELSE z.z END AS yhat
     FROM __reg_z z JOIN __reg_y y ON y.rid = z.rid
     WHERE z.z IS NOT NULL AND y.y IS NOT NULL
@@ -700,7 +733,15 @@ __reg_agg AS (
            sum(pow(greatest(y, 0.0), 2.0 - power) / ((1.0 - power) * (2.0 - power))
                - y * pow(yhat, 1.0 - power) / (1.0 - power)
                + pow(yhat, 2.0 - power) / (2.0 - power)) AS dev_tw_half,
-           sum((y - yhat) * (y - yhat) / pow(yhat, power)) AS pearson_tw
+           sum((y - yhat) * (y - yhat) / pow(yhat, power)) AS pearson_tw,
+           -- Negative binomial (NB2, r = 1/alpha): log-likelihood, half-deviance,
+           -- and Pearson chi-square (variance = mu + alpha*mu^2).
+           sum(lgamma(y + 1.0 / alpha) - lgamma(1.0 / alpha) - lgamma(y + 1)
+               + (1.0 / alpha) * ln((1.0 / alpha) / (1.0 / alpha + yhat))
+               + y * ln(yhat / (1.0 / alpha + yhat))) AS ll_nb,
+           sum((CASE WHEN y > 0 THEN y * ln(y / yhat) ELSE 0.0 END)
+               - (y + 1.0 / alpha) * ln((y + 1.0 / alpha) / (yhat + 1.0 / alpha))) AS dev_nb_half,
+           sum((y - yhat) * (y - yhat) / (yhat + alpha * yhat * yhat)) AS pearson_nb
     FROM __reg_rows
 ),
 -- Null-model quantities need ybar, so aggregate a second time against it.
@@ -711,7 +752,9 @@ __reg_null AS (
            sum(-ln(y / a.ybar) + (y - a.ybar) / a.ybar) AS null_dev_gam_half,
            sum(pow(greatest(y, 0.0), 2.0 - power) / ((1.0 - power) * (2.0 - power))
                - y * pow(a.ybar, 1.0 - power) / (1.0 - power)
-               + pow(a.ybar, 2.0 - power) / (2.0 - power)) AS null_dev_tw_half
+               + pow(a.ybar, 2.0 - power) / (2.0 - power)) AS null_dev_tw_half,
+           sum((CASE WHEN y > 0 THEN y * ln(y / a.ybar) ELSE 0.0 END)
+               - (y + 1.0 / alpha) * ln((y + 1.0 / alpha) / (a.ybar + 1.0 / alpha))) AS null_dev_nb_half
     FROM __reg_rows r, __reg_agg a
 )
 SELECT
@@ -725,50 +768,61 @@ SELECT
     CASE WHEN family = 'logistic' THEN -a.ll_bin / a.n END AS log_loss,
     CASE family WHEN 'linear'   THEN -a.n / 2.0 * (ln(2 * pi()) + ln(a.sse / a.n) + 1.0)
                 WHEN 'logistic' THEN a.ll_bin
-                WHEN 'poisson'  THEN a.ll_pois END AS loglik,
+                WHEN 'poisson'  THEN a.ll_pois
+                WHEN 'nbinom'   THEN a.ll_nb END AS loglik,
     CASE family WHEN 'logistic' THEN -2.0 * a.ll_bin
                 WHEN 'poisson'  THEN 2.0 * a.dev_pois_half
                 WHEN 'gamma'    THEN 2.0 * a.dev_gam_half
-                WHEN 'tweedie'  THEN 2.0 * a.dev_tw_half END AS deviance,
+                WHEN 'tweedie'  THEN 2.0 * a.dev_tw_half
+                WHEN 'nbinom'   THEN 2.0 * a.dev_nb_half END AS deviance,
     CASE family WHEN 'logistic' THEN -2.0 * nu.ll0_bin
                 WHEN 'poisson'  THEN 2.0 * nu.null_dev_pois_half
                 WHEN 'gamma'    THEN 2.0 * nu.null_dev_gam_half
-                WHEN 'tweedie'  THEN 2.0 * nu.null_dev_tw_half END AS null_deviance,
+                WHEN 'tweedie'  THEN 2.0 * nu.null_dev_tw_half
+                WHEN 'nbinom'   THEN 2.0 * nu.null_dev_nb_half END AS null_deviance,
     CASE family WHEN 'logistic' THEN 1.0 - a.ll_bin / nu.ll0_bin
                 WHEN 'poisson'  THEN 1.0 - a.dev_pois_half / nu.null_dev_pois_half
                 WHEN 'gamma'    THEN 1.0 - a.dev_gam_half / nu.null_dev_gam_half
-                WHEN 'tweedie'  THEN 1.0 - a.dev_tw_half / nu.null_dev_tw_half END AS pseudo_r2,
+                WHEN 'tweedie'  THEN 1.0 - a.dev_tw_half / nu.null_dev_tw_half
+                WHEN 'nbinom'   THEN 1.0 - a.dev_nb_half / nu.null_dev_nb_half END AS pseudo_r2,
     CASE WHEN family = 'gamma'   THEN a.pearson_gam / (a.n - m.kparams)
-         WHEN family = 'tweedie' THEN a.pearson_tw / (a.n - m.kparams) END AS dispersion,
+         WHEN family = 'tweedie' THEN a.pearson_tw / (a.n - m.kparams)
+         WHEN family = 'nbinom'  THEN a.pearson_nb / (a.n - m.kparams) END AS dispersion,
     CASE family WHEN 'linear'   THEN -2.0 * (-a.n / 2.0 * (ln(2 * pi()) + ln(a.sse / a.n) + 1.0)) + 2.0 * m.kparams
                 WHEN 'logistic' THEN -2.0 * a.ll_bin  + 2.0 * m.kparams
-                WHEN 'poisson'  THEN -2.0 * a.ll_pois + 2.0 * m.kparams END AS aic,
+                WHEN 'poisson'  THEN -2.0 * a.ll_pois + 2.0 * m.kparams
+                WHEN 'nbinom'   THEN -2.0 * a.ll_nb   + 2.0 * m.kparams END AS aic,
     CASE family WHEN 'linear'   THEN -2.0 * (-a.n / 2.0 * (ln(2 * pi()) + ln(a.sse / a.n) + 1.0)) + ln(a.n) * m.kparams
                 WHEN 'logistic' THEN -2.0 * a.ll_bin  + ln(a.n) * m.kparams
-                WHEN 'poisson'  THEN -2.0 * a.ll_pois + ln(a.n) * m.kparams END AS bic
+                WHEN 'poisson'  THEN -2.0 * a.ll_pois + ln(a.n) * m.kparams
+                WHEN 'nbinom'   THEN -2.0 * a.ll_nb   + ln(a.n) * m.kparams END AS bic
 FROM __reg_agg a, __reg_null nu, __reg_auc au, __reg_meta m, __reg_evalcheck ck
 WHERE ck.ok;
 
 
 CREATE OR REPLACE MACRO linreg_evaluate(model, tbl, outcome, offset_col := NULL) AS TABLE
 SELECT n, rmse, mae, r2, adj_r2, loglik, aic, bic
-FROM __reg_eval(model, tbl, outcome, 'linear', 'linreg_evaluate', offset_col, NULL);
+FROM __reg_eval(model, tbl, outcome, 'linear', 'linreg_evaluate', offset_col, NULL, NULL);
 
 CREATE OR REPLACE MACRO logit_evaluate(model, tbl, outcome, offset_col := NULL) AS TABLE
 SELECT n, accuracy, auc, log_loss, loglik, deviance, null_deviance, pseudo_r2, aic, bic
-FROM __reg_eval(model, tbl, outcome, 'logistic', 'logit_evaluate', offset_col, NULL);
+FROM __reg_eval(model, tbl, outcome, 'logistic', 'logit_evaluate', offset_col, NULL, NULL);
 
 CREATE OR REPLACE MACRO poisson_evaluate(model, tbl, outcome, offset_col := NULL) AS TABLE
 SELECT n, rmse, mae, loglik, deviance, null_deviance, pseudo_r2, aic, bic
-FROM __reg_eval(model, tbl, outcome, 'poisson', 'poisson_evaluate', offset_col, NULL);
+FROM __reg_eval(model, tbl, outcome, 'poisson', 'poisson_evaluate', offset_col, NULL, NULL);
 
 CREATE OR REPLACE MACRO gamma_evaluate(model, tbl, outcome, offset_col := NULL) AS TABLE
 SELECT n, rmse, mae, deviance, null_deviance, pseudo_r2, dispersion
-FROM __reg_eval(model, tbl, outcome, 'gamma', 'gamma_evaluate', offset_col, NULL);
+FROM __reg_eval(model, tbl, outcome, 'gamma', 'gamma_evaluate', offset_col, NULL, NULL);
 
 CREATE OR REPLACE MACRO tweedie_evaluate(model, tbl, outcome, power := 1.5, offset_col := NULL) AS TABLE
 SELECT n, rmse, mae, deviance, null_deviance, pseudo_r2, dispersion
-FROM __reg_eval(model, tbl, outcome, 'tweedie', 'tweedie_evaluate', offset_col, power);
+FROM __reg_eval(model, tbl, outcome, 'tweedie', 'tweedie_evaluate', offset_col, power, NULL);
+
+CREATE OR REPLACE MACRO nbinom_evaluate(model, tbl, outcome, alpha := 1.0, offset_col := NULL) AS TABLE
+SELECT n, rmse, mae, loglik, deviance, null_deviance, pseudo_r2, dispersion, aic, bic
+FROM __reg_eval(model, tbl, outcome, 'nbinom', 'nbinom_evaluate', offset_col, NULL, alpha);
 
 
 -- ---------------------------------------------------------------------------

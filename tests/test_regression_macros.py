@@ -700,6 +700,90 @@ class TestTweedie:
 
 
 # --------------------------------------------------------------------------- #
+# Negative binomial (overdispersed counts)
+# --------------------------------------------------------------------------- #
+class TestNegativeBinomial:
+    def _overdispersed(self, seed, alpha=0.6, n=4000):
+        rng = np.random.default_rng(seed)
+        X = np.column_stack([rng.normal(0, 1, n), rng.normal(0, 1, n)])
+        mu = np.exp(0.5 + 0.7 * X[:, 0] - 0.4 * X[:, 1])
+        y = rng.poisson(rng.gamma(1 / alpha, mu * alpha)).astype(float)  # NB2 via gamma-Poisson
+        return pd.DataFrame({"x1": X[:, 0], "x2": X[:, 1], "y": y}), X, y
+
+    def test_score_equations_optimality(self, con):
+        # the NB2 MLE satisfies sum_i x_ij (y_i - mu_i)/(1 + alpha*mu_i) = 0
+        alpha = 0.6
+        df, X, y = self._overdispersed(41, alpha)
+        assert y.var() / y.mean() > 2                        # genuinely overdispersed
+        coefs = fit(con, "nbinom_fit", df, alpha=alpha)
+        mu = np.exp(coefs["(Intercept)"] + X @ [coefs["x1"], coefs["x2"]])
+        resid = (y - mu) / (1 + alpha * mu)
+        n = len(y)
+        for xv in [np.ones(n), X[:, 0], X[:, 1]]:
+            assert abs((xv * resid).sum()) / n < 1e-6
+
+    def test_reduces_to_poisson(self, con):
+        df, X, y = self._overdispersed(42, alpha=0.5)
+        nb = fit(con, "nbinom_fit", df, alpha=1e-6)
+        po = fit(con, "poisson_fit", df)
+        for k in po:
+            assert nb[k] == pytest.approx(po[k], abs=1e-3)
+
+    def test_predict_is_exp_score(self, con):
+        df, X, y = self._overdispersed(43)
+        coefs = fit(con, "nbinom_fit", df, alpha=0.6)
+        out = predict(con, "nbinom_predict", coefs, df)
+        z = coefs["(Intercept)"] + X @ [coefs["x1"], coefs["x2"]]
+        assert out["prediction"].to_numpy() == pytest.approx(np.exp(z), rel=1e-9)
+        assert (out["prediction"] > 0).all()
+
+    def test_evaluate_matches_formula(self, con):
+        from scipy.special import gammaln
+        alpha = 0.6
+        df, X, y = self._overdispersed(44, alpha)
+        coefs = fit(con, "nbinom_fit", df, alpha=alpha)
+        mu = predict(con, "nbinom_predict", coefs, df)["prediction"].to_numpy()
+        m = evaluate(con, "nbinom_evaluate", coefs, df, alpha=alpha)
+        r = 1 / alpha
+        ylog = np.where(y > 0, y * np.log(np.maximum(y, 1e-300) / mu), 0.0)
+        dev = 2 * (ylog - (y + r) * np.log((y + r) / (mu + r))).sum()
+        ll = (gammaln(y + r) - gammaln(r) - gammaln(y + 1)
+              + r * np.log(r / (r + mu)) + y * np.log(mu / (r + mu))).sum()
+        assert m["deviance"] == pytest.approx(dev, rel=1e-8)
+        assert m["loglik"] == pytest.approx(ll, rel=1e-8)
+        assert m["aic"] == pytest.approx(-2 * ll + 2 * len(coefs), rel=1e-8)
+
+    def test_offset_composes(self, con):
+        # NB inherits offset from the shared core: score eqs hold with an offset
+        alpha = 0.5
+        rng = np.random.default_rng(45)
+        n = 3000
+        X = np.column_stack([rng.normal(0, 1, n), rng.normal(0, 1, n)])
+        logo = np.log(rng.uniform(0.5, 4, n))
+        mu = np.exp(logo - 0.3 + 0.5 * X[:, 0])
+        y = rng.poisson(rng.gamma(1 / alpha, mu * alpha)).astype(float)
+        df = pd.DataFrame({"x1": X[:, 0], "x2": X[:, 1], "logexp": logo, "y": y})
+        coefs = fit(con, "nbinom_fit", df, alpha=alpha, offset_col="'logexp'")
+        muhat = np.exp(coefs["(Intercept)"] + X @ [coefs["x1"], coefs["x2"]] + logo)
+        resid = (y - muhat) / (1 + alpha * muhat)
+        for xv in [np.ones(n), X[:, 0], X[:, 1]]:
+            assert abs((xv * resid).sum()) / n < 1e-6
+
+    def test_errors(self, con):
+        rng = np.random.default_rng(46)
+        df = pd.DataFrame({"x1": rng.normal(0, 1, 100), "y": rng.poisson(2, 100).astype(float)})
+        _load(con, "traindata", df)
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM nbinom_fit('traindata','y', alpha := -1.0)").fetchall()
+        assert "alpha" in str(e.value)
+        df.loc[0, "y"] = -1.0
+        _load(con, "traindata", df)
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM nbinom_fit('traindata','y', alpha := 0.5)").fetchall()
+        assert "non-negative" in str(e.value)
+
+
+# --------------------------------------------------------------------------- #
 # Sample weights
 # --------------------------------------------------------------------------- #
 class TestWeights:

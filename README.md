@@ -1,9 +1,10 @@
-# duckLM — GLM regression (logistic, linear, Poisson, Gamma, Tweedie, multinomial) in pure DuckDB SQL
+# duckLM — GLM regression (logistic, linear, Poisson, Gamma, Tweedie, negative binomial, multinomial) in pure DuckDB SQL
 
 Table macros for DuckDB **1.5+**, no extensions required: **fit**, **predict**,
 and **evaluate** for binary logistic regression, ordinary least-squares linear
-regression, Poisson regression, Gamma regression, Tweedie regression (all but
-linear use a log link), and **multinomial (softmax)** classification. The
+regression, Poisson regression, Gamma regression, Tweedie regression, negative
+binomial regression (all but linear use a log link), and **multinomial
+(softmax)** classification. The
 single-outcome families take optional ridge/lasso/elastic-net regularization,
 an offset/exposure term, and sample weights. Everything runs inside DuckDB —
 training is Nesterov-accelerated gradient descent implemented with a recursive
@@ -37,6 +38,11 @@ SELECT * FROM gamma_fit('claims', 'claim_amount');
 -- power=1.5 is the compound Poisson-Gamma; p=1 is Poisson, p=2 is Gamma
 CREATE TABLE pure_premium AS
 SELECT * FROM tweedie_fit('policies', 'loss_cost', power := 1.5);
+
+-- negative binomial for overdispersed counts (variance > mean);
+-- alpha is the fixed dispersion (variance = mu + alpha*mu^2), alpha->0 = Poisson
+CREATE TABLE visits_model AS
+SELECT * FROM nbinom_fit('patients', 'n_visits', alpha := 0.5);
 
 -- optional ridge regularization on any family
 CREATE TABLE churn_model_reg AS
@@ -81,6 +87,13 @@ CREATE TABLE m AS
 SELECT * FROM poisson_fit('policies', 'n_claims', offset_col := 'log_exposure');
 SELECT * FROM poisson_predict('m', 'new_policies', offset_col := 'log_exposure');
 ```
+
+**Negative binomial.** `nbinom_fit(tbl, outcome, alpha := 1.0, ...)` models
+overdispersed counts (variance = μ + α·μ², so variance > mean). `alpha` is the
+**fixed dispersion** (a hyperparameter — grid-search it or tune with CV; it's
+not estimated here); α→0 recovers Poisson. Matches statsmodels
+`GLM(..., family=NegativeBinomial(alpha=α))`. Composes with offset, weights,
+and ridge/lasso.
 
 **Sample weights.** `weights_col` names a column of non-negative per-row
 weights; the loss and the internal standardization are weighted by them.
@@ -147,6 +160,9 @@ SELECT * FROM gamma_predict('severity_model', 'open_claims');
 
 -- tweedie: adds prediction DOUBLE = exp(score), the expected value
 SELECT * FROM tweedie_predict('pure_premium', 'renewals');
+
+-- negative binomial: adds prediction DOUBLE = exp(score), the expected count
+SELECT * FROM nbinom_predict('visits_model', 'new_patients');
 ```
 
 ## Evaluating: `logit_evaluate` / `linreg_evaluate` / `poisson_evaluate` / `gamma_evaluate`
@@ -173,6 +189,7 @@ SELECT * FROM logit_evaluate('churn_model', 'training_data', 'churned');
 | `poisson_evaluate` | `n, rmse, mae, loglik, deviance, null_deviance, pseudo_r2, aic, bic` |
 | `gamma_evaluate` | `n, rmse, mae, deviance, null_deviance, pseudo_r2, dispersion` |
 | `tweedie_evaluate` | `n, rmse, mae, deviance, null_deviance, pseudo_r2, dispersion` |
+| `nbinom_evaluate` | `n, rmse, mae, loglik, deviance, null_deviance, pseudo_r2, dispersion, aic, bic` |
 
 `pseudo_r2` is McFadden's (logistic) or deviance-based (Poisson/Gamma); `aic`
 and `bic` use *k* = number of model coefficients (intercept included). Gamma's

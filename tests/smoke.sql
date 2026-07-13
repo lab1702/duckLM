@@ -159,4 +159,16 @@ SELECT CASE
     ELSE error('SMOKE FAIL: multinomial output invalid')
   END;
 
+-- Negative binomial: fits overdispersed counts, predicts positive means, and
+-- alpha -> 0 approaches the Poisson fit.
+CREATE TABLE nb AS SELECT i AS x1, (i % 7) * (1 + (i % 3)) AS y FROM range(300) t(i);
+CREATE TABLE nb_m AS SELECT * FROM nbinom_fit('nb', 'y', alpha := 0.5);
+SELECT CASE
+    WHEN (SELECT bool_and(prediction > 0 AND NOT isinf(prediction)) FROM nbinom_predict('nb_m', 'nb'))
+     AND abs((SELECT coefficient FROM nbinom_fit('nb','y', alpha := 1e-8) WHERE feature='x1')
+             - (SELECT coefficient FROM poisson_fit('nb','y') WHERE feature='x1')) < 1e-3
+    THEN 'PASS  negative binomial fits, predicts positive, -> Poisson as alpha->0'
+    ELSE error('SMOKE FAIL: negative binomial output invalid')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;
