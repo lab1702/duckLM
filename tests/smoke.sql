@@ -77,4 +77,22 @@ SELECT CASE
     ELSE error('SMOKE FAIL: gamma prediction not positive/finite')
   END;
 
+-- Evaluate: on the noiseless linear data R^2 is ~1 and RMSE ~0.
+SELECT CASE
+    WHEN (SELECT n FROM linreg_evaluate('lin_m', 'lin', 'y')) = 200
+     AND (SELECT r2 FROM linreg_evaluate('lin_m', 'lin', 'y')) > 0.9999
+     AND (SELECT rmse FROM linreg_evaluate('lin_m', 'lin', 'y')) < 1e-6
+    THEN 'PASS  linreg_evaluate reports R^2 ~ 1 on noiseless data'
+    ELSE error('SMOKE FAIL: linreg_evaluate metrics wrong on noiseless data')
+  END;
+
+-- Evaluate: logistic metrics are in valid ranges.
+SELECT CASE
+    WHEN (SELECT auc FROM logit_evaluate('clf_m', 'clf', 'y')) BETWEEN 0 AND 1
+     AND (SELECT accuracy FROM logit_evaluate('clf_m', 'clf', 'y')) BETWEEN 0 AND 1
+     AND (SELECT deviance FROM logit_evaluate('clf_m', 'clf', 'y')) > 0
+    THEN 'PASS  logit_evaluate reports valid AUC/accuracy/deviance'
+    ELSE error('SMOKE FAIL: logit_evaluate metrics out of range')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;

@@ -1,12 +1,12 @@
 # duckLM — logistic, linear, Poisson & Gamma regression in pure DuckDB SQL
 
-Eight table macros for DuckDB **1.5+**, no extensions required: fit and
-predict for binary logistic regression, ordinary least-squares linear
-regression, Poisson regression, and Gamma regression (both log link), each
-with optional ridge (L2) regularization. Everything runs inside DuckDB —
-training is Nesterov-accelerated gradient descent implemented with a
-recursive CTE and list lambdas, sharing a single optimizer core across all
-four model families.
+Twelve table macros for DuckDB **1.5+**, no extensions required: **fit**,
+**predict**, and **evaluate** for binary logistic regression, ordinary
+least-squares linear regression, Poisson regression, and Gamma regression
+(both log link), each with optional ridge (L2) regularization. Everything runs
+inside DuckDB — training is Nesterov-accelerated gradient descent implemented
+with a recursive CTE and list lambdas, sharing a single optimizer core across
+all four model families.
 
 ## Setup
 
@@ -88,6 +88,35 @@ SELECT * FROM poisson_predict('claims_model', 'new_policies');
 SELECT * FROM gamma_predict('severity_model', 'open_claims');
 ```
 
+## Evaluating: `logit_evaluate` / `linreg_evaluate` / `poisson_evaluate` / `gamma_evaluate`
+
+Scores `tbl` with a fitted model and its outcome column and returns a one-row
+table of goodness-of-fit metrics. Pass the training table for in-sample fit or
+a holdout for out-of-sample. Metrics follow the standard statsmodels /
+scikit-learn definitions (verified against both).
+
+```sql
+SELECT * FROM linreg_evaluate('rev_model', 'sales', 'revenue');
+-- ┌───────┬────────┬────────┬────────┬─────────┬──────────┬─────────┬─────────┐
+-- │   n   │  rmse  │  mae   │   r2   │ adj_r2  │  loglik  │   aic   │   bic   │
+-- └───────┴────────┴────────┴────────┴─────────┴──────────┴─────────┴─────────┘
+
+SELECT * FROM logit_evaluate('churn_model', 'training_data', 'churned');
+-- n, accuracy, auc, log_loss, loglik, deviance, null_deviance, pseudo_r2, aic, bic
+```
+
+| macro | metrics returned |
+|---|---|
+| `linreg_evaluate` | `n, rmse, mae, r2, adj_r2, loglik, aic, bic` |
+| `logit_evaluate` | `n, accuracy, auc, log_loss, loglik, deviance, null_deviance, pseudo_r2, aic, bic` |
+| `poisson_evaluate` | `n, rmse, mae, loglik, deviance, null_deviance, pseudo_r2, aic, bic` |
+| `gamma_evaluate` | `n, rmse, mae, deviance, null_deviance, pseudo_r2, dispersion` |
+
+`pseudo_r2` is McFadden's (logistic) or deviance-based (Poisson/Gamma); `aic`
+and `bic` use *k* = number of model coefficients (intercept included). Gamma's
+log-likelihood/AIC depend on the dispersion parameter, so it reports deviance,
+deviance-based pseudo-R², and the Pearson `dispersion` instead.
+
 ## Contract / fine print
 
 - Feature columns must be castable to `DOUBLE` (numeric or boolean). Booleans
@@ -122,8 +151,8 @@ SELECT * FROM gamma_predict('severity_model', 'open_claims');
   string — score with the same column spellings you trained with.
 - The training set is materialized as an in-memory list during optimization —
   comfortable up to a few hundred thousand rows × dozens of features.
-- `__reg_fit` and `__reg_score` are internal helpers; call the eight public
-  macros instead.
+- `__reg_fit`, `__reg_score`, and `__reg_eval` are internal helpers; call the
+  twelve public macros instead.
 
 ## Testing
 
@@ -140,7 +169,7 @@ duckdb < tests/smoke.sql
 
 ## Files
 
-- [regression_macros.sql](regression_macros.sql) — all eight macros + shared core
+- [regression_macros.sql](regression_macros.sql) — all twelve macros + shared core
 - [tests/](tests) — pytest suite (vs scikit-learn) and a pure-SQL smoke test
 - [LICENSE](LICENSE) — MIT
 

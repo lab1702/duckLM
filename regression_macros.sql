@@ -446,3 +446,138 @@ SELECT * EXCLUDE (__reg_rid__, __reg_score__),
        exp(__reg_score__) AS prediction
 FROM __reg_score(model, tbl, 'gamma_predict')
 ORDER BY __reg_rid__;
+
+
+-- ---------------------------------------------------------------------------
+-- Goodness-of-fit evaluation
+--
+-- __reg_eval scores `tbl` with `model` and the outcome column, then computes
+-- every metric as a single-row aggregation. The public *_evaluate wrappers
+-- select the subset that is meaningful for each family. Metrics are computed
+-- from the model's own predictions, so they measure the fit of that model on
+-- that data (pass the training table for in-sample fit, a holdout for
+-- out-of-sample). Rows where a model feature or the outcome is NULL are
+-- dropped, as in training. AIC/BIC use k = number of model coefficients
+-- (intercept included); log-likelihoods, deviances, R^2 and AUC follow the
+-- standard statsmodels/scikit-learn definitions.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE MACRO __reg_eval(model, tbl, outcome, family, caller) AS TABLE
+WITH
+__reg_numbered AS MATERIALIZED (
+    SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)
+),
+__reg_long AS MATERIALIZED (
+    SELECT __reg_rid__ AS rid, name AS col, value AS v
+    FROM (UNPIVOT (SELECT __reg_rid__, TRY_CAST(COLUMNS(* EXCLUDE (__reg_rid__)) AS DOUBLE) FROM __reg_numbered)
+          ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
+),
+__reg_coefs AS MATERIALIZED (SELECT feature, coefficient FROM query_table(model)),
+__reg_meta AS (
+    SELECT coalesce((SELECT coefficient FROM __reg_coefs WHERE feature = '(Intercept)'), 0.0) AS b0,
+           (SELECT count(*) FROM __reg_coefs WHERE feature != '(Intercept)')                  AS kfeat,
+           (SELECT count(*) FROM __reg_coefs)                                                  AS kparams
+),
+-- Linear predictor z = b0 + sum(coef * feature); NULL if a model feature is
+-- missing or NULL for the row.
+__reg_z AS (
+    SELECT l.rid, CASE WHEN count(*) = m.kfeat THEN m.b0 + sum(c.coefficient * l.v) END AS z
+    FROM __reg_coefs c JOIN __reg_long l ON l.col = c.feature CROSS JOIN __reg_meta m
+    WHERE c.feature != '(Intercept)'
+    GROUP BY l.rid, m.b0, m.kfeat
+),
+__reg_y AS (SELECT rid, v AS y FROM __reg_long WHERE col = outcome),
+-- One row per evaluated observation: actual y, linear predictor z, and the
+-- mean response yhat under the family's inverse link.
+__reg_rows AS (
+    SELECT y.y, z.z,
+           CASE family WHEN 'logistic' THEN 1.0 / (1.0 + exp(-z.z))
+                       WHEN 'poisson'  THEN exp(z.z)
+                       WHEN 'gamma'    THEN exp(z.z)
+                       ELSE z.z END AS yhat
+    FROM __reg_z z JOIN __reg_y y ON y.rid = z.rid
+    WHERE z.z IS NOT NULL AND y.y IS NOT NULL
+),
+__reg_evalcheck AS (
+    SELECT CASE WHEN (SELECT count(*) FROM __reg_rows) = 0
+                THEN error(caller || ': no rows with a non-NULL prediction and outcome to evaluate')
+                ELSE true END AS ok
+),
+-- AUC via the Mann-Whitney statistic on average ranks of yhat (logistic only).
+__reg_ranked AS (
+    SELECT y, avg(rn) OVER (PARTITION BY yhat) AS rk
+    FROM (SELECT y, yhat, row_number() OVER (ORDER BY yhat) AS rn FROM __reg_rows)
+),
+__reg_auc AS (
+    SELECT CASE WHEN sum(y) = 0 OR sum(y) = count(*) THEN NULL
+                ELSE (sum(CASE WHEN y = 1 THEN rk END) - sum(y) * (sum(y) + 1) / 2.0)
+                     / (sum(y) * (count(*) - sum(y))) END AS auc
+    FROM __reg_ranked
+),
+__reg_agg AS (
+    SELECT count(*)::DOUBLE AS n,
+           avg(y) AS ybar,
+           sum((y - yhat) * (y - yhat)) AS sse,
+           sum(abs(y - yhat)) AS sae,
+           sum(y * ln(greatest(yhat, 1e-15)) + (1 - y) * ln(greatest(1 - yhat, 1e-15))) AS ll_bin,
+           avg(CASE WHEN (yhat >= 0.5) = (y >= 0.5) THEN 1.0 ELSE 0.0 END) AS accuracy,
+           sum(y * ln(yhat) - yhat - lgamma(y + 1)) AS ll_pois,
+           sum((CASE WHEN y > 0 THEN y * ln(y / yhat) ELSE 0.0 END) - (y - yhat)) AS dev_pois_half,
+           sum(-ln(y / yhat) + (y - yhat) / yhat) AS dev_gam_half,
+           sum(((y - yhat) / yhat) * ((y - yhat) / yhat)) AS pearson_gam
+    FROM __reg_rows
+),
+-- Null-model quantities need ybar, so aggregate a second time against it.
+__reg_null AS (
+    SELECT sum((y - a.ybar) * (y - a.ybar)) AS sst,
+           sum(y * ln(a.ybar) + (1 - y) * ln(1 - a.ybar)) AS ll0_bin,
+           sum((CASE WHEN y > 0 THEN y * ln(y / a.ybar) ELSE 0.0 END) - (y - a.ybar)) AS null_dev_pois_half,
+           sum(-ln(y / a.ybar) + (y - a.ybar) / a.ybar) AS null_dev_gam_half
+    FROM __reg_rows r, __reg_agg a
+)
+SELECT
+    a.n::BIGINT AS n,
+    sqrt(a.sse / a.n) AS rmse,
+    a.sae / a.n AS mae,
+    CASE WHEN family = 'linear' THEN 1.0 - a.sse / nu.sst END AS r2,
+    CASE WHEN family = 'linear' THEN 1.0 - (a.sse / (a.n - m.kparams)) / (nu.sst / (a.n - 1)) END AS adj_r2,
+    a.accuracy AS accuracy,
+    au.auc AS auc,
+    CASE WHEN family = 'logistic' THEN -a.ll_bin / a.n END AS log_loss,
+    CASE family WHEN 'linear'   THEN -a.n / 2.0 * (ln(2 * pi()) + ln(a.sse / a.n) + 1.0)
+                WHEN 'logistic' THEN a.ll_bin
+                WHEN 'poisson'  THEN a.ll_pois END AS loglik,
+    CASE family WHEN 'logistic' THEN -2.0 * a.ll_bin
+                WHEN 'poisson'  THEN 2.0 * a.dev_pois_half
+                WHEN 'gamma'    THEN 2.0 * a.dev_gam_half END AS deviance,
+    CASE family WHEN 'logistic' THEN -2.0 * nu.ll0_bin
+                WHEN 'poisson'  THEN 2.0 * nu.null_dev_pois_half
+                WHEN 'gamma'    THEN 2.0 * nu.null_dev_gam_half END AS null_deviance,
+    CASE family WHEN 'logistic' THEN 1.0 - a.ll_bin / nu.ll0_bin
+                WHEN 'poisson'  THEN 1.0 - a.dev_pois_half / nu.null_dev_pois_half
+                WHEN 'gamma'    THEN 1.0 - a.dev_gam_half / nu.null_dev_gam_half END AS pseudo_r2,
+    CASE WHEN family = 'gamma' THEN a.pearson_gam / (a.n - m.kparams) END AS dispersion,
+    CASE family WHEN 'linear'   THEN -2.0 * (-a.n / 2.0 * (ln(2 * pi()) + ln(a.sse / a.n) + 1.0)) + 2.0 * m.kparams
+                WHEN 'logistic' THEN -2.0 * a.ll_bin  + 2.0 * m.kparams
+                WHEN 'poisson'  THEN -2.0 * a.ll_pois + 2.0 * m.kparams END AS aic,
+    CASE family WHEN 'linear'   THEN -2.0 * (-a.n / 2.0 * (ln(2 * pi()) + ln(a.sse / a.n) + 1.0)) + ln(a.n) * m.kparams
+                WHEN 'logistic' THEN -2.0 * a.ll_bin  + ln(a.n) * m.kparams
+                WHEN 'poisson'  THEN -2.0 * a.ll_pois + ln(a.n) * m.kparams END AS bic
+FROM __reg_agg a, __reg_null nu, __reg_auc au, __reg_meta m, __reg_evalcheck ck
+WHERE ck.ok;
+
+
+CREATE OR REPLACE MACRO linreg_evaluate(model, tbl, outcome) AS TABLE
+SELECT n, rmse, mae, r2, adj_r2, loglik, aic, bic
+FROM __reg_eval(model, tbl, outcome, 'linear', 'linreg_evaluate');
+
+CREATE OR REPLACE MACRO logit_evaluate(model, tbl, outcome) AS TABLE
+SELECT n, accuracy, auc, log_loss, loglik, deviance, null_deviance, pseudo_r2, aic, bic
+FROM __reg_eval(model, tbl, outcome, 'logistic', 'logit_evaluate');
+
+CREATE OR REPLACE MACRO poisson_evaluate(model, tbl, outcome) AS TABLE
+SELECT n, rmse, mae, loglik, deviance, null_deviance, pseudo_r2, aic, bic
+FROM __reg_eval(model, tbl, outcome, 'poisson', 'poisson_evaluate');
+
+CREATE OR REPLACE MACRO gamma_evaluate(model, tbl, outcome) AS TABLE
+SELECT n, rmse, mae, deviance, null_deviance, pseudo_r2, dispersion
+FROM __reg_eval(model, tbl, outcome, 'gamma', 'gamma_evaluate');

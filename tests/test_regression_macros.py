@@ -23,6 +23,17 @@ from sklearn.linear_model import (
     PoissonRegressor,
     Ridge,
 )
+from sklearn.metrics import (
+    accuracy_score,
+    d2_tweedie_score,
+    log_loss,
+    mean_absolute_error,
+    mean_gamma_deviance,
+    mean_poisson_deviance,
+    mean_squared_error,
+    r2_score,
+    roc_auc_score,
+)
 
 warnings.filterwarnings("ignore")  # silence sklearn solver/deprecation chatter
 
@@ -67,6 +78,16 @@ def predict(con, macro, coefs, data, **kw):
     return con.execute(
         f"SELECT * FROM {macro}('modeltbl', 'scoredata'{_params(kw)})"
     ).df()
+
+
+def evaluate(con, macro, coefs, data, outcome="y"):
+    """Run a *_evaluate macro and return its single metrics row as a Series."""
+    model = pd.DataFrame({"feature": list(coefs), "coefficient": list(coefs.values())})
+    _load(con, "modeltbl", model)
+    _load(con, "scoredata", data)
+    return con.execute(
+        f"SELECT * FROM {macro}('modeltbl', 'scoredata', '{outcome}')"
+    ).df().iloc[0]
 
 
 def zscore(X):
@@ -324,6 +345,108 @@ class TestPredict:
         assert out["label"].tolist() == data["label"].tolist()
         base = predict(con, "logit_predict", coefs, df.drop(columns="y"))
         assert out["prob"].to_numpy() == pytest.approx(base["prob"].to_numpy())
+
+
+# --------------------------------------------------------------------------- #
+# Goodness-of-fit metrics
+# --------------------------------------------------------------------------- #
+class TestEvaluate:
+    def test_linreg_evaluate_matches_sklearn(self, con):
+        X = mixed_features(51)
+        rng = np.random.default_rng(501)
+        y = 2 + X @ [1.0, -1.5, 0.3] + rng.normal(0, 2, len(X))
+        df = frame(X, y)
+        coefs = fit(con, "linreg_fit", df)
+        pred = predict(con, "linreg_predict", coefs, df)["prediction"].to_numpy()
+        m = evaluate(con, "linreg_evaluate", coefs, df)
+        assert m["n"] == len(X)
+        assert m["r2"] == pytest.approx(r2_score(y, pred), abs=1e-9)
+        assert m["rmse"] == pytest.approx(np.sqrt(mean_squared_error(y, pred)), rel=1e-9)
+        assert m["mae"] == pytest.approx(mean_absolute_error(y, pred), rel=1e-9)
+        # log-likelihood / AIC / BIC from the standard Gaussian-MLE formula
+        n, k = len(X), len(coefs)
+        sse = float(((y - pred) ** 2).sum())
+        ll = -n / 2 * (np.log(2 * np.pi) + np.log(sse / n) + 1)
+        assert m["loglik"] == pytest.approx(ll, rel=1e-9)
+        assert m["aic"] == pytest.approx(-2 * ll + 2 * k, rel=1e-9)
+        assert m["bic"] == pytest.approx(-2 * ll + np.log(n) * k, rel=1e-9)
+
+    def test_logit_evaluate_matches_sklearn(self, con):
+        X = mixed_features(52)
+        Xs, _, _ = zscore(X)
+        rng = np.random.default_rng(502)
+        y = rng.binomial(1, 1 / (1 + np.exp(-(0.4 + Xs @ [1.0, -0.8, 0.4]))))
+        df = frame(X, y)
+        coefs = fit(con, "logit_fit", df)
+        prob = predict(con, "logit_predict", coefs, df)["prob"].to_numpy()
+        m = evaluate(con, "logit_evaluate", coefs, df)
+        assert m["auc"] == pytest.approx(roc_auc_score(y, prob), abs=1e-9)
+        assert m["log_loss"] == pytest.approx(log_loss(y, prob), rel=1e-9)
+        assert m["accuracy"] == pytest.approx(accuracy_score(y, (prob >= 0.5).astype(int)))
+        ll = float((y * np.log(prob) + (1 - y) * np.log(1 - prob)).sum())
+        assert m["loglik"] == pytest.approx(ll, rel=1e-9)
+        assert m["deviance"] == pytest.approx(-2 * ll, rel=1e-9)
+        n, k = len(X), len(coefs)
+        assert m["aic"] == pytest.approx(-2 * ll + 2 * k, rel=1e-9)
+
+    def test_poisson_evaluate_matches_sklearn(self, con):
+        X = mixed_features(53)
+        Xs, _, _ = zscore(X)
+        rng = np.random.default_rng(503)
+        y = rng.poisson(np.exp(0.7 + Xs @ [0.4, -0.3, 0.2])).astype(float)
+        df = frame(X, y)
+        coefs = fit(con, "poisson_fit", df)
+        mu = predict(con, "poisson_predict", coefs, df)["prediction"].to_numpy()
+        m = evaluate(con, "poisson_evaluate", coefs, df)
+        n = len(X)
+        assert m["deviance"] == pytest.approx(n * mean_poisson_deviance(y, mu), rel=1e-8)
+        assert m["pseudo_r2"] == pytest.approx(d2_tweedie_score(y, mu, power=1), rel=1e-8)
+
+    def test_gamma_evaluate_matches_sklearn(self, con):
+        X = mixed_features(54)
+        Xs, _, _ = zscore(X)
+        rng = np.random.default_rng(504)
+        y = rng.gamma(2.0, np.exp(0.8 + Xs @ [0.4, -0.2, 0.3]) / 2.0)
+        df = frame(X, y)
+        coefs = fit(con, "gamma_fit", df)
+        mu = predict(con, "gamma_predict", coefs, df)["prediction"].to_numpy()
+        m = evaluate(con, "gamma_evaluate", coefs, df)
+        n = len(X)
+        assert m["deviance"] == pytest.approx(n * mean_gamma_deviance(y, mu), rel=1e-8)
+        assert m["pseudo_r2"] == pytest.approx(d2_tweedie_score(y, mu, power=2), rel=1e-8)
+        disp = float((((y - mu) / mu) ** 2).sum()) / (n - len(coefs))
+        assert m["dispersion"] == pytest.approx(disp, rel=1e-8)
+
+    def test_evaluate_on_holdout(self, con):
+        Xtr = mixed_features(55, n=600)
+        rng = np.random.default_rng(505)
+        ytr = 1 + Xtr @ [0.5, -1.0, 0.2] + rng.normal(0, 1, len(Xtr))
+        coefs = fit(con, "linreg_fit", frame(Xtr, ytr))
+        Xte = mixed_features(56, n=200)
+        yte = 1 + Xte @ [0.5, -1.0, 0.2] + rng.normal(0, 1, len(Xte))
+        m = evaluate(con, "linreg_evaluate", coefs, frame(Xte, yte))
+        pred = predict(con, "linreg_predict", coefs, frame(Xte, yte))["prediction"].to_numpy()
+        assert m["n"] == 200
+        assert m["r2"] == pytest.approx(r2_score(yte, pred), abs=1e-9)
+
+    def test_evaluate_drops_null_rows(self, con):
+        X = mixed_features(57, n=300)
+        rng = np.random.default_rng(507)
+        y = 1 + X @ [0.5, -0.5, 0.2] + rng.normal(0, 1, len(X))
+        df = frame(X, y)
+        coefs = fit(con, "linreg_fit", df)
+        df.loc[[1, 2, 3], "x1"] = np.nan  # 3 rows become incomplete
+        m = evaluate(con, "linreg_evaluate", coefs, df)
+        assert m["n"] == 297
+
+    def test_evaluate_errors_on_no_rows(self, con):
+        X = mixed_features(58, n=100)
+        rng = np.random.default_rng(508)
+        y = 1 + X @ [0.5, -0.5, 0.2] + rng.normal(0, 1, len(X))
+        coefs = fit(con, "linreg_fit", frame(X, y))
+        with pytest.raises(DuckDBError) as e:
+            evaluate(con, "linreg_evaluate", coefs, frame(X, y), outcome="not_a_column")
+        assert "no rows" in str(e.value)
 
 
 # --------------------------------------------------------------------------- #
