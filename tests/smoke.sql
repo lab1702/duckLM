@@ -127,4 +127,14 @@ SELECT CASE
     ELSE error('SMOKE FAIL: tweedie prediction not positive/finite')
   END;
 
+-- L1 (lasso): a strong penalty drives an irrelevant feature's coefficient to
+-- exactly 0 (feature selection) while a relevant one survives.
+CREATE TABLE l1t AS SELECT i AS x1, (i * 7 + 3) % 13 AS noise, 2 + 3.0 * i AS y FROM range(300) t(i);
+SELECT CASE
+    WHEN (SELECT coefficient FROM linreg_fit('l1t', 'y', l1 := 0.3) WHERE feature = 'noise') = 0.0
+     AND (SELECT coefficient FROM linreg_fit('l1t', 'y', l1 := 0.3) WHERE feature = 'x1') != 0.0
+    THEN 'PASS  L1 zeros an irrelevant feature, keeps a relevant one'
+    ELSE error('SMOKE FAIL: L1 did not select features as expected')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;

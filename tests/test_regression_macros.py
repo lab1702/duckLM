@@ -17,7 +17,9 @@ import numpy as np
 import pandas as pd
 import pytest
 from sklearn.linear_model import (
+    ElasticNet,
     GammaRegressor,
+    Lasso,
     LinearRegression,
     LogisticRegression,
     PoissonRegressor,
@@ -514,6 +516,107 @@ class TestOffset:
                 "SELECT * FROM poisson_fit('traindata', 'y', offset_col := 'nope')"
             ).fetchall()
         assert "offset column" in str(e.value) and "nope" in str(e.value)
+
+
+# --------------------------------------------------------------------------- #
+# L1 / elastic-net (sparse feature selection)
+# --------------------------------------------------------------------------- #
+class TestL1:
+    def _sparse(self, seed, n=2000):
+        """6 features on different scales; true coefficient vector is sparse."""
+        rng = np.random.default_rng(seed)
+        X = rng.normal(0, 1, (n, 6)) * [1, 2, 0.5, 3, 1, 0.2] + [2, -1, 5, 0, 3, -2]
+        beta = np.array([1.5, 0.0, -2.0, 0.0, 0.8, 0.0])  # x2, x4, x6 truly zero
+        return X, beta
+
+    def _cols(self, X):
+        return pd.DataFrame(X, columns=[f"x{i + 1}" for i in range(X.shape[1])])
+
+    def test_linear_lasso_matches_sklearn(self, con):
+        X, beta = self._sparse(101)
+        rng = np.random.default_rng(1010)
+        y = 3 + X @ beta + rng.normal(0, 1.5, len(X))
+        Xs, _, sd = zscore(X)
+        names = [f"x{i + 1}" for i in range(6)]
+        coefs = fit(con, "linreg_fit", self._cols(X).assign(y=y), l1=0.05)
+        got = np.array([coefs[c] for c in names]) * sd / y.std()
+        ref = Lasso(alpha=0.05, max_iter=200000, tol=1e-12).fit(Xs, (y - y.mean()) / y.std())
+        assert got == pytest.approx(ref.coef_, abs=1e-4)
+
+    def test_linear_elasticnet_matches_sklearn(self, con):
+        X, beta = self._sparse(102)
+        rng = np.random.default_rng(1020)
+        y = 3 + X @ beta + rng.normal(0, 1.5, len(X))
+        Xs, _, sd = zscore(X)
+        names = [f"x{i + 1}" for i in range(6)]
+        l1, l2 = 0.03, 0.04
+        coefs = fit(con, "linreg_fit", self._cols(X).assign(y=y), l1=l1, l2=l2)
+        got = np.array([coefs[c] for c in names]) * sd / y.std()
+        ref = ElasticNet(alpha=l1 + l2, l1_ratio=l1 / (l1 + l2),
+                         max_iter=200000, tol=1e-12).fit(Xs, (y - y.mean()) / y.std())
+        assert got == pytest.approx(ref.coef_, abs=1e-4)
+
+    def test_lasso_selects_true_zeros(self, con):
+        X, beta = self._sparse(103)
+        rng = np.random.default_rng(1030)
+        y = 3 + X @ beta + rng.normal(0, 1.5, len(X))
+        coefs = fit(con, "linreg_fit", self._cols(X).assign(y=y), l1=0.15)
+        # the three genuinely-zero features get coefficient exactly 0
+        assert coefs["x2"] == 0.0 and coefs["x4"] == 0.0 and coefs["x6"] == 0.0
+        # a genuinely-nonzero feature survives
+        assert coefs["x1"] != 0.0 and coefs["x3"] != 0.0
+
+    def test_l1_zero_equals_unpenalized(self, con):
+        X, beta = self._sparse(104)
+        rng = np.random.default_rng(1040)
+        y = 1 + X @ beta + rng.normal(0, 1, len(X))
+        with_l1 = fit(con, "linreg_fit", self._cols(X).assign(y=y), l1=0.0)
+        plain = fit(con, "linreg_fit", self._cols(X).assign(y=y))
+        for k in plain:
+            assert with_l1[k] == pytest.approx(plain[k], abs=1e-9)
+
+    def test_logistic_l1_matches_sklearn(self, con):
+        X, beta = self._sparse(105)
+        Xs, _, sd = zscore(X)
+        rng = np.random.default_rng(1050)
+        yb = rng.binomial(1, 1 / (1 + np.exp(-(0.3 + Xs @ beta))))
+        names = [f"x{i + 1}" for i in range(6)]
+        l1 = 0.02
+        coefs = fit(con, "logit_fit", self._cols(X).assign(y=yb), l1=l1)
+        got = np.array([coefs[c] for c in names]) * sd
+        ref = LogisticRegression(penalty="l1", solver="saga", C=1 / (len(X) * l1),
+                                 max_iter=500000, tol=1e-10).fit(Xs, yb)
+        assert got == pytest.approx(ref.coef_[0], abs=5e-3)
+
+    def test_poisson_l1_kkt_optimality(self, con):
+        # sklearn has no L1 Poisson, so check the subgradient KKT conditions:
+        # active coords have |grad| = l1, zeroed coords have |grad| <= l1.
+        X, beta = self._sparse(106)
+        Xs, mu, sd = zscore(X)
+        rng = np.random.default_rng(1060)
+        y = rng.poisson(np.exp(0.4 + Xs @ (beta * 0.5))).astype(float)
+        l1, n = 0.02, len(X)
+        coefs = fit(con, "poisson_fit", self._cols(X).assign(y=y), l1=l1)
+        bstd = np.array([coefs[f"x{i + 1}"] for i in range(6)]) * sd
+        z = np.log(y.mean()) - np.log(y.mean()) + Xs @ bstd  # standardized eta (intercept cancels below)
+        # rebuild standardized intercept so mean(mu)~mean(ytil): use macro intercept
+        b0_std = coefs["(Intercept)"] - np.log(y.mean()) + (np.array([coefs[f"x{i+1}"] for i in range(6)]) * mu).sum()
+        muhat = np.exp(b0_std + Xs @ bstd)
+        g = -(Xs.T @ (y / y.mean() - muhat)) / n
+        for j in range(6):
+            if abs(bstd[j]) > 1e-8:
+                assert abs(abs(g[j]) - l1) < 1e-4
+            else:
+                assert abs(g[j]) <= l1 + 1e-4
+
+    def test_negative_l1_errors(self, con):
+        X, beta = self._sparse(107, n=200)
+        rng = np.random.default_rng(1070)
+        y = 1 + X @ beta + rng.normal(0, 1, len(X))
+        _load(con, "traindata", self._cols(X).assign(y=y))
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM linreg_fit('traindata', 'y', l1 := -1.0)").fetchall()
+        assert "l1 must be >= 0" in str(e.value)
 
 
 # --------------------------------------------------------------------------- #

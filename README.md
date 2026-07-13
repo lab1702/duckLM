@@ -3,8 +3,9 @@
 Table macros for DuckDB **1.5+**, no extensions required: **fit**, **predict**,
 and **evaluate** for binary logistic regression, ordinary least-squares linear
 regression, Poisson regression, Gamma regression, and Tweedie regression (all
-but linear use a log link), each with optional ridge (L2) regularization, an
-offset/exposure term, and sample weights. Everything runs inside DuckDB —
+but linear use a log link), each with optional ridge/lasso/elastic-net
+regularization, an offset/exposure term, and sample weights. Everything runs
+inside DuckDB —
 training is Nesterov-accelerated gradient descent implemented with a recursive
 CTE and list lambdas, sharing a single optimizer core across all model
 families.
@@ -58,6 +59,7 @@ SELECT * FROM rev_model;
 | `learning_rate` | `NULL` | step size on the standardized scale; `NULL` auto-picks a convergent default (`4/(d+1+4·l2)` logistic, `1/(d+1+l2)` otherwise; Poisson/Gamma steps are additionally damped each iteration by the largest curvature weight, since theirs is unbounded) |
 | `tol` | `1e-10` | stop early when the gradient step is smaller than this |
 | `l2` | `0.0` | ridge penalty `(l2/2)·Σβ²` added to the mean loss of the internally standardized problem, intercept unpenalized |
+| `l1` | `0.0` | lasso penalty `l1·Σ\|β\|` (feature selection); combine with `l2` for elastic net. Intercept unpenalized |
 | `offset_col` | `NULL` | name of a column holding a per-row **offset** added to the linear predictor `η = offset + xβ` with a fixed coefficient of 1 (not fit, not penalized) |
 | `weights_col` | `NULL` | name of a column of non-negative per-row **sample weights** — the loss (and internal standardization) are weighted by them |
 
@@ -109,6 +111,19 @@ internally): `Ridge(alpha = n*l2)` for linear, `LogisticRegression(C =
 1/(n*l2))` for logistic, `PoissonRegressor(alpha = l2)` / `GammaRegressor(
 alpha = l2)` on the mean-scaled outcome. A small `l2` also gives perfectly
 separable logistic data a finite, fast solution.
+
+**Lasso & elastic net.** `l1` adds an L1 penalty that drives coefficients to
+**exactly zero** for feature selection (FISTA / proximal-gradient); combine
+`l1` and `l2` for elastic net. Available on every family (the intercept is
+never penalized). Linear matches `Lasso(alpha = l1)` /
+`ElasticNet(alpha = l1+l2, l1_ratio = l1/(l1+l2))` on the standardized problem.
+
+```sql
+-- keep only the features that matter
+CREATE TABLE sparse_model AS
+SELECT * FROM linreg_fit('wide_table', 'target', l1 := 0.1);
+SELECT feature FROM sparse_model WHERE coefficient != 0;   -- selected features
+```
 
 ## Predicting: `logit_predict` / `linreg_predict` / `poisson_predict` / `gamma_predict`
 

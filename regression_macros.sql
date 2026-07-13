@@ -1,7 +1,7 @@
 -- ============================================================================
 -- Logistic, linear, Poisson, Gamma & Tweedie regression as pure DuckDB
--- (>= 1.5) SQL macros, with optional ridge (L2) regularization, an
--- offset/exposure term, and sample weights.
+-- (>= 1.5) SQL macros, with optional ridge/lasso/elastic-net regularization,
+-- an offset/exposure term, and sample weights.
 --
 -- Public macros (15): fit / predict / evaluate for each family.
 --   {logit,linreg,poisson,gamma}_fit(tbl, outcome, ...)
@@ -20,7 +20,7 @@
 --
 -- Internal helpers (do not call directly, subject to change):
 --   __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2,
---             offset_col, weights_col, power)
+--             offset_col, weights_col, power, l1)
 --   __reg_score(model, tbl, caller, offset_col)
 --   __reg_eval(model, tbl, outcome, family, caller, offset_col, power)
 --
@@ -87,6 +87,13 @@
 --                            l2 > 0 also gives perfectly separable logistic
 --                            data a finite optimum (fast convergence instead
 --                            of running to max_iter).
+--   l1            := 0.0     lasso penalty l1*sum(|beta_j|) on the standardized
+--                            coefficients (intercept unpenalized), applied via
+--                            a FISTA soft-threshold prox so coefficients are
+--                            driven to EXACTLY zero (feature selection).
+--                            Combine with l2 for elastic net. Linear matches
+--                            Lasso(alpha=l1) / ElasticNet(alpha=l1+l2,
+--                            l1_ratio=l1/(l1+l2)) on the standardized problem.
 --
 -- Example:
 --   CREATE TABLE model AS SELECT * FROM linreg_fit('sales', 'revenue');
@@ -99,7 +106,7 @@
 -- same name. The __reg_ prefix is reserved (and enforced below) so that
 -- shadowing cannot happen.
 
-CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2, offset_col, weights_col, power) AS TABLE
+CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1) AS TABLE
 WITH RECURSIVE
 -- Every column cast to DOUBLE, with a synthetic row id.
 __reg_wide AS MATERIALIZED (
@@ -322,6 +329,7 @@ __reg_cfg AS (
              WHEN weights_col IS NOT NULL AND (SELECT coalesce(sum(w), 0) FROM __reg_w) <= 0
                THEN error(caller || ': sample weights sum to zero')
              WHEN l2 < 0 THEN error(caller || ': l2 must be >= 0, got ' || l2)
+             WHEN l1 < 0 THEN error(caller || ': l1 must be >= 0, got ' || l1)
              -- Guaranteed-convergent steps: on standardized data the mean-loss
              -- gradient is L-Lipschitz with L <= (d+1)/4 (logistic, from the
              -- sigmoid derivative bound) or L <= d+1 (linear), plus l2 from the
@@ -358,13 +366,23 @@ __reg_gd AS (
            list_aggregate(list_transform(newbetas, lambda nb, j: abs(nb - look[j])), 'max')
     FROM (
         SELECT it, betas, look,
-               -- beta_j <- look_j + (step/damp) * ((1/sumw) * sum_i w_i xs_ij r_i
-               --                                   - l2 * look_j [not intercept])
-               list_transform(look, lambda b, j:
-                   b + (step / damp) * (list_sum(list_transform(res, lambda ob: ob.w * ob.xs[j] * ob.r)) / sumw
-                                        - CASE WHEN j = 1 THEN 0.0 ELSE l2 * b END)) AS newbetas
+               -- L1 proximal step (soft-threshold): beta_j <- prox_{t*l1}(z_j),
+               -- prox(z) = sign(z) * max(|z| - t*l1, 0), zeroing small coefficients
+               -- exactly (feature selection). The intercept is never penalized; a
+               -- no-op when l1 = 0, so unpenalized / pure-ridge fits are unchanged.
+               list_transform(zstep, lambda zj, j:
+                   CASE WHEN j = 1 THEN zj
+                        ELSE sign(zj) * greatest(abs(zj) - threshl1, 0.0) END) AS newbetas
         FROM (
-            SELECT it, betas, n, sumw, step, look, res,
+            SELECT it, betas, look, (step / damp) * l1 AS threshl1,
+                   -- smooth-part gradient step z = look + (step/damp)*(grad - l2*look);
+                   -- (1/sumw) sum_i w_i xs_ij r_i is the mean-loss gradient, and the
+                   -- smooth L2 gradient l2*look_j stays here (not in the prox).
+                   list_transform(look, lambda b, j:
+                       b + (step / damp) * (list_sum(list_transform(res, lambda ob: ob.w * ob.xs[j] * ob.r)) / sumw
+                                            - CASE WHEN j = 1 THEN 0.0 ELSE l2 * b END)) AS zstep
+            FROM (
+                SELECT it, betas, n, sumw, step, look, res,
                    -- The log-link families (Poisson/Gamma/Tweedie) have
                    -- unbounded curvature, so damp the step by the largest
                    -- per-row Hessian weight hw. 1 for the bounded families.
@@ -421,6 +439,7 @@ __reg_gd AS (
                     WHERE g.it < max_iter AND g.move >= tol
                 )
             )
+        )
         )
     )
 ),
@@ -533,11 +552,11 @@ LEFT JOIN __reg_offset o ON o.rid = n.__reg_rid__;
 -- Public wrappers
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE MACRO logit_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'logistic', 'logit_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL);
+CREATE OR REPLACE MACRO logit_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'logistic', 'logit_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1);
 
-CREATE OR REPLACE MACRO linreg_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'linear', 'linreg_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL);
+CREATE OR REPLACE MACRO linreg_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'linear', 'linreg_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1);
 
 CREATE OR REPLACE MACRO logit_predict(model, tbl, threshold := 0.5, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
@@ -552,8 +571,8 @@ SELECT * EXCLUDE (__reg_rid__, __reg_score__),
 FROM __reg_score(model, tbl, 'linreg_predict', offset_col)
 ORDER BY __reg_rid__;
 
-CREATE OR REPLACE MACRO poisson_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'poisson', 'poisson_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL);
+CREATE OR REPLACE MACRO poisson_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'poisson', 'poisson_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1);
 
 CREATE OR REPLACE MACRO poisson_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
@@ -561,8 +580,8 @@ SELECT * EXCLUDE (__reg_rid__, __reg_score__),
 FROM __reg_score(model, tbl, 'poisson_predict', offset_col)
 ORDER BY __reg_rid__;
 
-CREATE OR REPLACE MACRO gamma_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'gamma', 'gamma_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL);
+CREATE OR REPLACE MACRO gamma_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'gamma', 'gamma_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1);
 
 CREATE OR REPLACE MACRO gamma_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
@@ -574,8 +593,8 @@ ORDER BY __reg_rid__;
 -- Poisson (p=1) and Gamma (p=2); 1<p<2 is the compound Poisson-Gamma that
 -- admits exact zeros alongside positive values (e.g. insurance pure premium).
 -- Matches sklearn TweedieRegressor(power=p, alpha=0, link='log').
-CREATE OR REPLACE MACRO tweedie_fit(tbl, outcome, power := 1.5, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'tweedie', 'tweedie_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, power);
+CREATE OR REPLACE MACRO tweedie_fit(tbl, outcome, power := 1.5, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'tweedie', 'tweedie_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1);
 
 CREATE OR REPLACE MACRO tweedie_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
