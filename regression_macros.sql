@@ -1384,3 +1384,75 @@ SELECT alpha,
 FROM __reg_nbd_ll
 GROUP BY alpha
 ORDER BY alpha;
+
+
+-- ---------------------------------------------------------------------------
+-- Two-stage grid refinement (pure SQL)
+--
+-- reg_grid(lo, hi, n) builds a linear (or, with log_spaced := true,
+-- log-spaced) grid of n points in [lo, hi] -- handy for the COARSE grid.
+--
+-- The *_refine wrappers do a two-stage sweep in a single call: they run the
+-- coarse grid, locate the best hyperparameter, then re-sweep a finer grid of
+-- n_refine points BRACKETING that best value between its two coarse-grid
+-- neighbours, and return the refined (param, metric) curve. If the best value
+-- sits on a grid boundary the refined grid is one-sided toward the interior.
+-- Take the argmin cv_deviance (or argmax loglik) of the result as the estimate.
+--
+--   cv_l2_refine / cv_l1_refine / cv_power_refine / cv_alpha_refine  -> min cv_deviance
+--   nbinom_dispersion_refine                                         -> max loglik
+--
+-- Two stages of n points resolve the optimum as finely as ~n^2 of a single
+-- grid at a fraction of the cost. Assumes the coarse grid brackets the optimum
+-- (widen it if the best lands on an endpoint and you expect the optimum beyond).
+-- ---------------------------------------------------------------------------
+
+-- linear or log-spaced grid of n points spanning [lo, hi]
+CREATE OR REPLACE MACRO reg_grid(lo, hi, n, log_spaced := false) AS (
+  CASE WHEN n < 2 THEN [lo::DOUBLE]
+       WHEN log_spaced THEN list_transform(range(n), lambda i: exp(ln(lo) + (ln(hi)-ln(lo))*i/(n-1.0)))
+       ELSE list_transform(range(n), lambda i: lo + (hi-lo)*i/(n-1.0)) END
+);
+
+-- a finer grid of n points bracketing `best` between its neighbours in `grid`
+-- (one-sided toward the interior when `best` is a grid endpoint)
+CREATE OR REPLACE MACRO __reg_refine_grid(grid, best, n) AS (
+  WITH nb AS (
+    SELECT coalesce((SELECT max(g) FROM unnest(grid) AS t(g) WHERE g < best), best) AS lo,
+           coalesce((SELECT min(g) FROM unnest(grid) AS t(g) WHERE g > best), best) AS hi
+  )
+  SELECT CASE WHEN lo = hi THEN [best::DOUBLE]
+              ELSE list_transform(range(n), lambda i: lo + (hi-lo)*i/(n-1.0)) END
+  FROM nb
+);
+
+-- two-stage CV engine: sweep coarse grid, then a finer grid around the best
+CREATE OR REPLACE MACRO __reg_cv_refine(tbl, outcome, family, grid, sweep, k, n_refine, max_iter, learning_rate, tol) AS TABLE
+WITH __rr_best AS (
+  SELECT param AS b FROM __reg_cv(tbl, outcome, family, grid, sweep, k, max_iter, learning_rate, tol)
+  ORDER BY cv_deviance LIMIT 1
+)
+SELECT param, cv_deviance
+FROM __reg_cv(tbl, outcome, family,
+              (SELECT __reg_refine_grid(grid, b, n_refine) FROM __rr_best),
+              sweep, k, max_iter, learning_rate, tol);
+
+CREATE OR REPLACE MACRO cv_l2_refine(tbl, outcome, family, l2_grid, k := 5, n_refine := 10, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
+SELECT param AS l2, cv_deviance FROM __reg_cv_refine(tbl, outcome, family, l2_grid, 'l2', k, n_refine, max_iter, learning_rate, tol);
+CREATE OR REPLACE MACRO cv_l1_refine(tbl, outcome, family, l1_grid, k := 5, n_refine := 10, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
+SELECT param AS l1, cv_deviance FROM __reg_cv_refine(tbl, outcome, family, l1_grid, 'l1', k, n_refine, max_iter, learning_rate, tol);
+CREATE OR REPLACE MACRO cv_power_refine(tbl, outcome, power_grid, k := 5, n_refine := 10, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
+SELECT param AS power, cv_deviance FROM __reg_cv_refine(tbl, outcome, 'tweedie', power_grid, 'power', k, n_refine, max_iter, learning_rate, tol);
+CREATE OR REPLACE MACRO cv_alpha_refine(tbl, outcome, alpha_grid, k := 5, n_refine := 10, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
+SELECT param AS alpha, cv_deviance FROM __reg_cv_refine(tbl, outcome, 'nbinom', alpha_grid, 'alpha', k, n_refine, max_iter, learning_rate, tol);
+
+-- two-stage dispersion estimation: refine around the profile-likelihood peak
+CREATE OR REPLACE MACRO nbinom_dispersion_refine(tbl, outcome, alpha_grid, n_refine := 10, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
+WITH __rr_best AS (
+  SELECT alpha AS b FROM nbinom_dispersion(tbl, outcome, alpha_grid, max_iter, learning_rate, tol)
+  ORDER BY loglik DESC LIMIT 1
+)
+SELECT alpha, loglik
+FROM nbinom_dispersion(tbl, outcome,
+       (SELECT __reg_refine_grid(alpha_grid, b, n_refine) FROM __rr_best),
+       max_iter, learning_rate, tol);

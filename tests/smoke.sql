@@ -205,4 +205,22 @@ SELECT CASE
     ELSE error('SMOKE FAIL: nbinom_dispersion output invalid')
   END;
 
+-- Two-stage refinement: reg_grid builds grids; the *_refine wrappers re-sweep a
+-- finer grid (n_refine rows) within the coarse span, and NB refinement raises
+-- the profile log-likelihood by zooming in on its peak.
+SELECT CASE
+    WHEN len(reg_grid(0.0, 1.0, 5)) = 5
+     AND len(reg_grid(0.01, 100.0, 5, log_spaced := true)) = 5
+     -- cv_l2_refine: 10 finite deviances on a grid zoomed below the coarse max
+     AND (SELECT count(*) = 10 AND bool_and(cv_deviance > 0 AND NOT isinf(cv_deviance))
+                              AND min(l2) >= 0.0 AND max(l2) < 100.0
+          FROM cv_l2_refine('cvt', 'y', 'linear', [0.0, 0.1, 1.0, 100.0], k := 5))
+     -- nbinom_dispersion_refine: 10 points, and refining sharpens the peak loglik
+     AND (SELECT count(*) FROM nbinom_dispersion_refine('cvnb', 'y', [0.2, 0.5, 1.0, 2.0])) = 10
+     AND (SELECT max(loglik) FROM nbinom_dispersion_refine('cvnb', 'y', [0.2, 0.5, 1.0, 2.0]))
+       >= (SELECT max(loglik) FROM nbinom_dispersion('cvnb', 'y', [0.2, 0.5, 1.0, 2.0])) - 0.01
+    THEN 'PASS  reg_grid + two-stage refinement search a finer grid and sharpen the optimum'
+    ELSE error('SMOKE FAIL: grid refinement output invalid')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;

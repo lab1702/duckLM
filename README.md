@@ -101,6 +101,9 @@ SELECT alpha FROM nbinom_dispersion('patients', 'n_visits', [0.1, 0.25, 0.5, 1.0
 ORDER BY loglik DESC LIMIT 1;   -- the estimated dispersion
 ```
 
+For a sharper estimate without a huge grid, `nbinom_dispersion_refine` re-sweeps
+a fine grid around the peak automatically ([two-stage refinement](#two-stage-refinement)).
+
 **Sample weights.** `weights_col` names a column of non-negative per-row
 weights; the loss and the internal standardization are weighted by them.
 Matches scikit-learn's `sample_weight` and R's `weights=`. Integer weights
@@ -257,6 +260,38 @@ Standardization is global (matching `cv.glmnet`), and folds are assigned
 deterministically as `(row# − 1) % k` — shuffle the table first if its rows are
 ordered by the outcome. Cost scales with `k · |grid| · features · rows ·
 iterations`, so keep the grid modest.
+
+### Two-stage refinement
+
+Rather than pay for one dense grid, sweep a **coarse** grid and then a **fine**
+one zoomed in on the winner. `reg_grid(lo, hi, n)` builds an evenly spaced grid
+(`log_spaced := true` for a geometric one), and each `cv_*_refine` /
+`nbinom_dispersion_refine` wrapper runs the whole two-stage sweep in a single
+call: it fits the coarse grid, finds the best value, then re-sweeps `n_refine`
+(default 10) points **bracketing that value between its two coarse-grid
+neighbours**, returning the refined curve. Take its argmin `cv_deviance` (or
+argmax `loglik`) as the estimate. Two `n`-point stages resolve the optimum about
+as finely as one `n²`-point grid at a fraction of the cost.
+
+| macro | coarse → refined |
+|---|---|
+| `cv_l2_refine` / `cv_l1_refine(tbl, outcome, family, grid, k := 5, n_refine := 10)` | ridge/lasso `l2`/`l1` |
+| `cv_power_refine(tbl, outcome, grid, k := 5, n_refine := 10)` | Tweedie `power` |
+| `cv_alpha_refine(tbl, outcome, grid, k := 5, n_refine := 10)` | neg-binom `alpha` |
+| `nbinom_dispersion_refine(tbl, outcome, grid, n_refine := 10)` | dispersion (profile likelihood) |
+
+```sql
+-- coarse log grid, then auto-refine around the best ridge penalty
+SELECT * FROM cv_l2_refine('training_data', 'churned', 'logistic', reg_grid(1e-3, 10, 8, log_spaced := true))
+ORDER BY cv_deviance LIMIT 1;
+
+SELECT * FROM nbinom_dispersion_refine('patients', 'n_visits', [0.1, 0.5, 1.0, 2.0, 4.0])
+ORDER BY loglik DESC LIMIT 1;   -- sharper dispersion estimate than the coarse grid
+```
+
+Assumes the coarse grid **brackets** the optimum; if the best lands on an
+endpoint the refined grid is one-sided toward the interior — widen the coarse
+grid if you expect the optimum beyond it.
 
 ## Categorical features: `dummy_encode_sql`
 

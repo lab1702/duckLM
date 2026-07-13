@@ -1331,6 +1331,112 @@ class TestCrossValidation:
 
 
 # --------------------------------------------------------------------------- #
+# Two-stage grid refinement (reg_grid, cv_*_refine, nbinom_dispersion_refine)
+# --------------------------------------------------------------------------- #
+class TestGridRefinement:
+    def _ridge_interior(self, seed, n=60, p=8):
+        # correlated features + noise so the CV-optimal l2 is strictly interior
+        rng = np.random.default_rng(seed)
+        base = rng.standard_normal((n, 1))
+        X = base + 0.6 * rng.standard_normal((n, p))
+        beta = np.array([1.5, -1.0, 0.8, 0, 0, 0, 0, 0])
+        y = X @ beta + 2.0 * rng.standard_normal(n)
+        return pd.DataFrame(X, columns=[f"x{j+1}" for j in range(p)]).assign(y=y)
+
+    def test_reg_grid(self, con):
+        lin = con.execute("SELECT reg_grid(0.0, 1.0, 5)").fetchone()[0]
+        assert lin == pytest.approx([0.0, 0.25, 0.5, 0.75, 1.0])
+        log = con.execute("SELECT reg_grid(0.01, 10.0, 4, log_spaced := true)").fetchone()[0]
+        assert log == pytest.approx([0.01, 0.1, 1.0, 10.0])
+        one = con.execute("SELECT reg_grid(0.7, 9.0, 1)").fetchone()[0]  # n < 2 -> [lo]
+        assert one == [0.7]
+
+    def test_refine_grid_brackets_best(self, con):
+        g = "[0.0, 0.05, 0.1, 0.5, 1.0]::DOUBLE[]"
+        interior = con.execute(f"SELECT __reg_refine_grid({g}, 0.1, 5)").fetchone()[0]
+        assert len(interior) == 5
+        assert min(interior) == pytest.approx(0.05) and max(interior) == pytest.approx(0.5)
+        lo = con.execute(f"SELECT __reg_refine_grid({g}, 0.0, 5)").fetchone()[0]
+        assert min(lo) == pytest.approx(0.0) and max(lo) == pytest.approx(0.05)  # one-sided at min
+        hi = con.execute(f"SELECT __reg_refine_grid({g}, 1.0, 5)").fetchone()[0]
+        assert min(hi) == pytest.approx(0.5) and max(hi) == pytest.approx(1.0)  # one-sided at max
+        deg = con.execute("SELECT __reg_refine_grid([0.3]::DOUBLE[], 0.3, 5)").fetchone()[0]
+        assert deg == [0.3]  # single-point grid -> nothing to refine
+
+    def test_cv_l2_refine_improves_and_brackets(self, con):
+        df = self._ridge_interior(7)
+        _load(con, "cvr", df)
+        coarse = [0.0, 0.1, 0.5, 2.0, 10.0]
+        gsql = "[" + ", ".join(str(g) for g in coarse) + "]::DOUBLE[]"
+        cb = con.execute(f"SELECT l2, cv_deviance FROM cv_l2('cvr','y','linear', {gsql}) "
+                         "ORDER BY cv_deviance LIMIT 1").fetchone()
+        rb = con.execute(f"SELECT l2, cv_deviance FROM cv_l2_refine('cvr','y','linear', {gsql}, n_refine := 11) "
+                         "ORDER BY cv_deviance LIMIT 1").fetchone()
+        # refinement never yields a worse optimum than the coarse grid
+        assert rb[1] <= cb[1] + 1e-9
+        # and here it is strictly better, with the refined l2 inside the coarse bracket
+        assert rb[1] < cb[1]
+        assert 0.0 < rb[0] < 2.0
+
+    def test_cv_refine_equals_manual_two_stage(self, con):
+        # cv_l2_refine is exactly cv_l2 re-run on __reg_refine_grid around the coarse best
+        df = self._ridge_interior(8)
+        _load(con, "cvr", df)
+        gsql = "[0.0, 0.1, 0.5, 2.0, 10.0]::DOUBLE[]"
+        best = con.execute(f"SELECT l2 FROM cv_l2('cvr','y','linear', {gsql}) "
+                           "ORDER BY cv_deviance LIMIT 1").fetchone()[0]
+        manual = con.execute(
+            f"SELECT l2, cv_deviance FROM cv_l2('cvr','y','linear', "
+            f"(SELECT __reg_refine_grid({gsql}, {best}, 10)) ) ORDER BY l2").fetchall()
+        auto = con.execute(f"SELECT l2, cv_deviance FROM cv_l2_refine('cvr','y','linear', {gsql}) "
+                           "ORDER BY l2").fetchall()
+        assert len(auto) == len(manual)
+        for (la, va), (lm, vm) in zip(auto, manual):
+            assert float(la) == pytest.approx(float(lm))
+            assert float(va) == pytest.approx(float(vm))
+
+    def test_refine_wrappers_return_named_columns(self, con):
+        # each wrapper renames the swept param to its own column name
+        X, y = TestCrossValidation()._data("linear", 91)
+        _load(con, "cvr", pd.DataFrame(X, columns=["x1", "x2"]).assign(y=y))
+        for macro, col, extra in [
+            ("cv_l2_refine", "l2", "'linear', [0.0,0.1,1.0]::DOUBLE[]"),
+            ("cv_l1_refine", "l1", "'linear', [0.0,0.01,0.05]::DOUBLE[]"),
+        ]:
+            cols = [d[0] for d in con.execute(
+                f"SELECT * FROM {macro}('cvr','y', {extra}) LIMIT 1").description]
+            assert cols == [col, "cv_deviance"]
+
+    def test_cv_power_refine_and_alpha_refine_run(self, con):
+        rng = np.random.default_rng(93); n = 1200
+        X = np.column_stack([rng.normal(0, 1, n), rng.normal(0, 1, n)])
+        Xs = (X - X.mean(0)) / X.std(0)
+        yt = np.where(rng.random(n) < 0.3, 0.0,
+                      rng.gamma(2.0, np.exp(0.4 + 0.9 * Xs[:, 0] - 0.6 * Xs[:, 1]) / 2.0))
+        _load(con, "cvr", pd.DataFrame(X, columns=["x1", "x2"]).assign(y=yt))
+        pr = con.execute("SELECT power, cv_deviance FROM cv_power_refine('cvr','y', "
+                         "[1.2,1.5,1.8]::DOUBLE[], n_refine := 7)").fetchall()
+        assert len(pr) == 7 and all(1.2 <= float(p) <= 1.8 and np.isfinite(v) for p, v in pr)
+        ya = rng.poisson(rng.gamma(1 / 0.6, np.exp(0.4 + 0.9 * Xs[:, 0]) * 0.6)).astype(float)
+        _load(con, "cvr2", pd.DataFrame(X, columns=["x1", "x2"]).assign(y=ya))
+        ar = con.execute("SELECT alpha, cv_deviance FROM cv_alpha_refine('cvr2','y', "
+                         "[0.1,0.5,1.0,2.0]::DOUBLE[], n_refine := 7)").fetchall()
+        assert len(ar) == 7 and all(0.1 <= float(a) <= 2.0 and np.isfinite(v) for a, v in ar)
+
+    def test_nbinom_dispersion_refine_sharpens_peak(self, con):
+        df = TestNBDispersion()._nb_data(64, alpha=0.6)
+        _load(con, "dtab", df)
+        coarse = "[0.1, 0.5, 1.0, 2.0, 4.0]::DOUBLE[]"
+        cb = con.execute(f"SELECT alpha, loglik FROM nbinom_dispersion('dtab','y', {coarse}) "
+                         "ORDER BY loglik DESC LIMIT 1").fetchone()
+        rb = con.execute(f"SELECT alpha, loglik FROM nbinom_dispersion_refine('dtab','y', {coarse}, "
+                         "n_refine := 11) ORDER BY loglik DESC LIMIT 1").fetchone()
+        # refined peak is at least as high, and lands nearer the true dispersion 0.6
+        assert rb[1] >= cb[1] - 1e-6
+        assert abs(rb[0] - 0.6) <= abs(cb[0] - 0.6)
+
+
+# --------------------------------------------------------------------------- #
 # Error handling & reserved names
 # --------------------------------------------------------------------------- #
 class TestErrors:

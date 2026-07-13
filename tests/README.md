@@ -9,7 +9,8 @@ model on the same fixed-seed data, so a failure means the macros disagree with a
 trusted reference (not just that a recorded number drifted). Covers all four
 families (including Tweedie across powers, negative binomial, multinomial softmax,
 offset/exposure, sample weights, k-fold cross-validation via cv_l2/cv_l1/
-cv_power/cv_alpha, and NB dispersion estimation via nbinom_dispersion),
+cv_power/cv_alpha, NB dispersion estimation via nbinom_dispersion, and
+two-stage grid refinement via reg_grid/cv_*_refine/nbinom_dispersion_refine),
 ridge/lasso/elastic-net with the documented sklearn equivalences
 (and KKT-optimality checks for L1 where sklearn has no reference), predict
 semantics, goodness-of-fit metrics (`*_evaluate` vs sklearn R²/AUC/log-loss/
