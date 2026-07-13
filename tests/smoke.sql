@@ -106,4 +106,14 @@ SELECT CASE
     ELSE error('SMOKE FAIL: poisson offset prediction not positive/finite')
   END;
 
+-- Sample weights: a constant weight column reproduces the unweighted fit on
+-- the noiseless linear data (still recovers y = 2 + 3*x1 - x2).
+CREATE TABLE linw AS SELECT x1, x2, 2.0 AS w, y FROM lin;
+SELECT CASE
+    WHEN abs((SELECT coefficient FROM linreg_fit('linw', 'y', weights_col := 'w') WHERE feature = 'x1') - 3.0) < 1e-6
+     AND abs((SELECT coefficient FROM linreg_fit('linw', 'y', weights_col := 'w') WHERE feature = 'x2') + 1.0) < 1e-6
+    THEN 'PASS  weighted fit (constant weights) matches unweighted'
+    ELSE error('SMOKE FAIL: weighted linreg wrong with constant weights')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;

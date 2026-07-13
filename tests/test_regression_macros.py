@@ -515,6 +515,108 @@ class TestOffset:
 
 
 # --------------------------------------------------------------------------- #
+# Sample weights
+# --------------------------------------------------------------------------- #
+class TestWeights:
+    def test_linear_weights_match_sklearn(self, con):
+        X = mixed_features(71)
+        rng = np.random.default_rng(701)
+        w = rng.uniform(0.1, 5, len(X))
+        y = 2 + X @ [1.5, -1.0, 0.4] + rng.normal(0, 2, len(X))
+        df = frame(X, y).assign(w=w)
+        coefs = fit(con, "linreg_fit", df, weights_col="'w'")
+        ref = LinearRegression().fit(X, y, sample_weight=w)
+        assert_coefs(coefs, ref.intercept_, ref.coef_, atol=1e-6, rtol=1e-6)
+
+    def test_logistic_weights_match_sklearn(self, con):
+        X = mixed_features(72)
+        Xs, _, _ = zscore(X)
+        rng = np.random.default_rng(702)
+        w = rng.uniform(0.1, 5, len(X))
+        y = rng.binomial(1, 1 / (1 + np.exp(-(0.3 + Xs @ [0.9, -0.6, 0.4]))))
+        df = frame(X, y).assign(w=w)
+        coefs = fit(con, "logit_fit", df, weights_col="'w'")
+        ref = logreg_unpenalized(X, y).fit(X, y, sample_weight=w)
+        assert_coefs(coefs, ref.intercept_[0], ref.coef_[0], atol=1e-4, rtol=1e-4)
+
+    def test_poisson_weights_match_sklearn(self, con):
+        X = mixed_features(73)
+        Xs, _, _ = zscore(X)
+        rng = np.random.default_rng(703)
+        w = rng.uniform(0.1, 5, len(X))
+        y = rng.poisson(np.exp(0.5 + Xs @ [0.4, -0.3, 0.2])).astype(float)
+        df = frame(X, y).assign(w=w)
+        coefs = fit(con, "poisson_fit", df, weights_col="'w'")
+        ref = PoissonRegressor(alpha=0, max_iter=20000, tol=1e-12).fit(X, y, sample_weight=w)
+        assert_coefs(coefs, ref.intercept_, ref.coef_, atol=1e-4, rtol=1e-4)
+
+    def test_gamma_weights_match_sklearn(self, con):
+        X = mixed_features(74)
+        Xs, _, _ = zscore(X)
+        rng = np.random.default_rng(704)
+        w = rng.uniform(0.1, 5, len(X))
+        y = rng.gamma(2.0, np.exp(0.6 + Xs @ [0.4, -0.2, 0.3]) / 2.0)
+        df = frame(X, y).assign(w=w)
+        coefs = fit(con, "gamma_fit", df, weights_col="'w'")
+        ref = GammaRegressor(alpha=0, max_iter=20000, tol=1e-12).fit(X, y, sample_weight=w)
+        assert_coefs(coefs, ref.intercept_, ref.coef_, atol=1e-4, rtol=1e-4)
+
+    def test_equal_weights_equal_unweighted(self, con):
+        X = mixed_features(75)
+        rng = np.random.default_rng(705)
+        y = 1 + X @ [0.5, -1.0, 0.3] + rng.normal(0, 1, len(X))
+        weighted = fit(con, "linreg_fit", frame(X, y).assign(w=3.0), weights_col="'w'")
+        plain = fit(con, "linreg_fit", frame(X, y))
+        for k in plain:
+            assert weighted[k] == pytest.approx(plain[k], abs=1e-9)
+
+    def test_integer_weights_equal_replicated_rows(self, con):
+        X = mixed_features(76, n=300)
+        rng = np.random.default_rng(706)
+        freq = rng.integers(1, 5, len(X))
+        y = 1 + X @ [0.8, -0.5, 0.2] + rng.normal(0, 1, len(X))
+        weighted = fit(con, "linreg_fit", frame(X, y).assign(w=freq.astype(float)), weights_col="'w'")
+        rep = frame(np.repeat(X, freq, axis=0), np.repeat(y, freq))
+        replicated = fit(con, "linreg_fit", rep)
+        for k in replicated:
+            assert weighted[k] == pytest.approx(replicated[k], abs=1e-7)
+
+    def test_weights_with_offset(self, con):
+        # score-equation optimality of the weighted, offset Poisson fit
+        X = mixed_features(77)
+        rng = np.random.default_rng(707)
+        w = rng.uniform(0.2, 4, len(X))
+        logo = np.log(rng.uniform(0.5, 4, len(X)))
+        y = rng.poisson(np.exp(logo - 0.3 + zscore(X)[0] @ [0.5, -0.2, 0.3])).astype(float)
+        df = frame(X, y).assign(w=w, logexp=logo)
+        coefs = fit(con, "poisson_fit", df, weights_col="'w'", offset_col="'logexp'")
+        z = coefs["(Intercept)"] + X @ [coefs[c] for c in NAMES] + logo
+        resid = w * (y - np.exp(z))  # weighted score equations
+        n = len(X)
+        for xv in [np.ones(n), X[:, 0], X[:, 1], X[:, 2]]:
+            assert abs((resid * xv).sum()) / w.sum() < 1e-6
+
+    def test_negative_weight_errors(self, con):
+        X = mixed_features(78, n=100)
+        rng = np.random.default_rng(708)
+        w = rng.uniform(0.1, 3, len(X)); w[0] = -1.0
+        y = 1 + X @ [0.5, -0.5, 0.2] + rng.normal(0, 1, len(X))
+        _load(con, "traindata", frame(X, y).assign(w=w))
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM linreg_fit('traindata', 'y', weights_col := 'w')").fetchall()
+        assert "non-negative" in str(e.value)
+
+    def test_missing_weights_column_errors(self, con):
+        X = mixed_features(79, n=100)
+        rng = np.random.default_rng(709)
+        y = 1 + X @ [0.5, -0.5, 0.2] + rng.normal(0, 1, len(X))
+        _load(con, "traindata", frame(X, y))
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM linreg_fit('traindata', 'y', weights_col := 'nope')").fetchall()
+        assert "weights column" in str(e.value) and "nope" in str(e.value)
+
+
+# --------------------------------------------------------------------------- #
 # Edge cases
 # --------------------------------------------------------------------------- #
 class TestEdgeCases:

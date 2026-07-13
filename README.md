@@ -3,8 +3,8 @@
 Twelve table macros for DuckDB **1.5+**, no extensions required: **fit**,
 **predict**, and **evaluate** for binary logistic regression, ordinary
 least-squares linear regression, Poisson regression, and Gamma regression
-(both log link), each with optional ridge (L2) regularization and an optional
-offset/exposure term. Everything runs inside DuckDB — training is
+(both log link), each with optional ridge (L2) regularization, an offset/
+exposure term, and sample weights. Everything runs inside DuckDB — training is
 Nesterov-accelerated gradient descent implemented with a recursive CTE and list
 lambdas, sharing a single optimizer core across all four model families.
 
@@ -53,6 +53,7 @@ SELECT * FROM rev_model;
 | `tol` | `1e-10` | stop early when the gradient step is smaller than this |
 | `l2` | `0.0` | ridge penalty `(l2/2)·Σβ²` added to the mean loss of the internally standardized problem, intercept unpenalized |
 | `offset_col` | `NULL` | name of a column holding a per-row **offset** added to the linear predictor `η = offset + xβ` with a fixed coefficient of 1 (not fit, not penalized) |
+| `weights_col` | `NULL` | name of a column of non-negative per-row **sample weights** — the loss (and internal standardization) are weighted by them |
 
 Coefficients are on the **original feature scale** (features — and for
 linear/Poisson/Gamma regression the outcome — are rescaled internally only
@@ -71,6 +72,17 @@ statsmodels' GLM `offset=`.
 CREATE TABLE m AS
 SELECT * FROM poisson_fit('policies', 'n_claims', offset_col := 'log_exposure');
 SELECT * FROM poisson_predict('m', 'new_policies', offset_col := 'log_exposure');
+```
+
+**Sample weights.** `weights_col` names a column of non-negative per-row
+weights; the loss and the internal standardization are weighted by them.
+Matches scikit-learn's `sample_weight` and R's `weights=`. Integer weights
+behave exactly like replicating each row that many times. Weights apply to
+fitting only — `*_predict` and `*_evaluate` don't take them.
+
+```sql
+CREATE TABLE m AS
+SELECT * FROM linreg_fit('survey', 'income', weights_col := 'sampling_weight');
 ```
 
 **Ridge semantics.** Like glmnet, the penalty applies to *standardized*

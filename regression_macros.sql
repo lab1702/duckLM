@@ -1,20 +1,26 @@
 -- ============================================================================
 -- Logistic, linear, Poisson & Gamma regression as pure DuckDB (>= 1.5) SQL
--- macros, with optional ridge (L2) regularization.
+-- macros, with optional ridge (L2) regularization, an offset/exposure term,
+-- and sample weights.
 --
--- Public macros:
---   logit_fit(tbl, outcome, ...)    -> table (feature VARCHAR, coefficient DOUBLE)
---   logit_predict(model, tbl, ...)  -> input rows + prob DOUBLE + pred BOOLEAN
---   linreg_fit(tbl, outcome, ...)   -> table (feature VARCHAR, coefficient DOUBLE)
---   linreg_predict(model, tbl)      -> input rows + prediction DOUBLE
---   poisson_fit(tbl, outcome, ...)  -> table (feature VARCHAR, coefficient DOUBLE)
---   poisson_predict(model, tbl)     -> input rows + prediction DOUBLE (mean count)
---   gamma_fit(tbl, outcome, ...)    -> table (feature VARCHAR, coefficient DOUBLE)
---   gamma_predict(model, tbl)       -> input rows + prediction DOUBLE (mean, log link)
+-- Public macros (12): fit / predict / evaluate for each family.
+--   {logit,linreg,poisson,gamma}_fit(tbl, outcome, ...)
+--       -> table (feature VARCHAR, coefficient DOUBLE), with an '(Intercept)' row
+--   logit_predict(model, tbl, threshold := 0.5, offset_col := NULL)
+--       -> input rows + prob DOUBLE + pred BOOLEAN
+--   {linreg,poisson,gamma}_predict(model, tbl, offset_col := NULL)
+--       -> input rows + prediction DOUBLE (linear: score; log-link: exp(score))
+--   {logit,linreg,poisson,gamma}_evaluate(model, tbl, outcome, offset_col := NULL)
+--       -> one-row table of goodness-of-fit metrics
+--
+-- Fit macros accept: max_iter, learning_rate, tol, l2, offset_col, weights_col
+-- (see "Fit parameters" below).
 --
 -- Internal helpers (do not call directly, subject to change):
---   __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol)
---   __reg_score(model, tbl, caller)
+--   __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2,
+--             offset_col, weights_col)
+--   __reg_score(model, tbl, caller, offset_col)
+--   __reg_eval(model, tbl, outcome, family, caller, offset_col)
 --
 -- All macros take *table names as strings* and resolve them via query_table(),
 -- so they work on any table or view visible in the current connection
@@ -49,8 +55,18 @@
 --                            1/(d+1+l2) otherwise; Poisson/Gamma steps are
 --                            additionally damped each iteration by the largest
 --                            curvature weight, since theirs is unbounded)
---   tol           := 1e-10   stop when no coefficient moves more than this
---                            (standardized scale) between iterations
+--   tol           := 1e-10   stop when the gradient step is smaller than this
+--   offset_col    := NULL    name of a column added to the linear predictor
+--                            eta = offset + x.beta with a fixed coefficient of
+--                            1 (not fit, not penalized); pass the same
+--                            offset_col to predict/evaluate. Standard for rate
+--                            models, e.g. a log(exposure) offset. Matches R /
+--                            statsmodels GLM offset=.
+--   weights_col   := NULL    name of a column of non-negative per-row sample
+--                            weights; the loss and internal standardization are
+--                            weighted by them. Integer weights == replicating
+--                            each row that many times. Matches sklearn
+--                            sample_weight. Applies to fitting only.
 --   l2            := 0.0     ridge penalty (l2/2)*sum(beta_j^2) added to the
 --                            MEAN loss of the internally standardized problem,
 --                            intercept unpenalized (glmnet-style: penalizing
@@ -77,7 +93,7 @@
 -- same name. The __reg_ prefix is reserved (and enforced below) so that
 -- shadowing cannot happen.
 
-CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2, offset_col) AS TABLE
+CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2, offset_col, weights_col) AS TABLE
 WITH RECURSIVE
 -- Every column cast to DOUBLE, with a synthetic row id.
 __reg_wide AS MATERIALIZED (
@@ -132,30 +148,34 @@ __reg_namecheck AS (
 ),
 -- Feature columns that have at least one non-NULL value anywhere. Used for
 -- the "entirely NULL column" check and to define a complete row. The outcome
--- and the optional offset column are not features. coalesce(offset_col, '')
--- turns "no offset" into a name no real column can have.
+-- and the optional offset / weights columns are not features.
+-- coalesce(col, '') turns "not supplied" into a name no real column can have.
 __reg_featcols AS (
     SELECT DISTINCT col AS colname FROM __reg_long
-    WHERE col != outcome AND col != coalesce(offset_col, '')
+    WHERE col != outcome
+      AND col != coalesce(offset_col, '')
+      AND col != coalesce(weights_col, '')
 ),
 -- Number of columns every complete row must have non-NULL: features + outcome
--- + offset (when supplied).
+-- + offset + weights (each when supplied).
 __reg_reqn AS (
     SELECT (SELECT count(*) FROM __reg_featcols) + 1
-           + CASE WHEN offset_col IS NOT NULL THEN 1 ELSE 0 END AS req
+           + CASE WHEN offset_col IS NOT NULL THEN 1 ELSE 0 END
+           + CASE WHEN weights_col IS NOT NULL THEN 1 ELSE 0 END AS req
 ),
--- Rows used for training: every feature column, the outcome, and the offset
--- (if any) non-NULL. Standardization (below) is computed over exactly these
--- rows so that ridge, whose penalty is on the standardized coefficients,
--- matches "drop the NULL rows, then standardize" no matter which columns the
--- NULLs sit in. For unpenalized fits and for tables with no NULLs this changes
--- nothing (the fit is invariant to the standardization scale, and with no
--- NULLs every row is complete).
+-- Rows used for training: every feature column, the outcome, the offset and
+-- the weight (each if any) non-NULL. Standardization (below) is computed over
+-- exactly these rows -- and weighted by the sample weights -- so that ridge,
+-- whose penalty is on the standardized coefficients, matches "drop the NULL
+-- rows, then (weighted-)standardize". For unpenalized fits with no NULLs this
+-- changes nothing (the fit is invariant to the standardization scale, and with
+-- no NULLs every row is complete).
 __reg_complete AS (
     SELECT rid
     FROM __reg_long
     WHERE col = outcome
        OR col = coalesce(offset_col, '')
+       OR col = coalesce(weights_col, '')
        OR col IN (SELECT colname FROM __reg_featcols)
     GROUP BY rid
     HAVING count(*) = (SELECT req FROM __reg_reqn)
@@ -164,19 +184,32 @@ __reg_clong AS MATERIALIZED (
     SELECT l.rid, l.col, l.v
     FROM __reg_long l SEMI JOIN __reg_complete c ON c.rid = l.rid
 ),
+-- Sample weight per complete row (1.0 when no weights column is given).
+__reg_w AS (
+    SELECT c.rid, coalesce(wv.v, 1.0) AS w
+    FROM __reg_complete c
+    LEFT JOIN __reg_clong wv ON wv.rid = c.rid AND wv.col = coalesce(weights_col, '')
+),
 -- Standardization stats per feature (over complete rows). Constant columns
 -- (detected exactly by min = max) get mu = min(v) and sigma = 1: centering on
 -- an actual stored value makes every z-score exactly 0 (avg() of a
 -- non-representable constant like 4.2 is not bit-exact, which would otherwise
 -- leave a ~1e-16 z-score and drift the coefficient off 0), so the coefficient
 -- stays exactly 0.
+-- Weighted mean and weighted population sd. With equal weights these reduce to
+-- the ordinary avg / stddev_pop, so no-weights fits are unchanged.
 __reg_stats AS MATERIALIZED (
-    SELECT col,
-           CASE WHEN min(v) = max(v) THEN min(v) ELSE avg(v) END AS mu,
-           CASE WHEN min(v) = max(v) THEN 1.0     ELSE stddev_pop(v) END AS sigma
-    FROM __reg_clong
-    WHERE col != outcome AND col != coalesce(offset_col, '')
-    GROUP BY col
+    SELECT s.col,
+           CASE WHEN min(s.v) = max(s.v) THEN min(s.v)
+                ELSE sum(w.w * s.v) / sum(w.w) END AS mu,
+           CASE WHEN min(s.v) = max(s.v) THEN 1.0
+                ELSE sqrt(greatest(sum(w.w * s.v * s.v) / sum(w.w)
+                                   - (sum(w.w * s.v) / sum(w.w)) ^ 2, 0.0)) END AS sigma
+    FROM __reg_clong s JOIN __reg_w w ON w.rid = s.rid
+    WHERE s.col != outcome
+      AND s.col != coalesce(offset_col, '')
+      AND s.col != coalesce(weights_col, '')
+    GROUP BY s.col
 ),
 __reg_feats AS MATERIALIZED (
     SELECT list(col   ORDER BY col) AS names,
@@ -192,15 +225,19 @@ __reg_feats AS MATERIALIZED (
 -- in the back-transform below) and makes the optimizer start at fitted means
 -- ~= 1 from the zero initialization.
 __reg_ystats AS (
-    SELECT CASE WHEN family = 'linear' THEN avg(v) ELSE 0.0 END AS mu_y,
+    SELECT CASE WHEN family = 'linear' THEN sum(w.w * s.v) / sum(w.w) ELSE 0.0 END AS mu_y,
            CASE WHEN family = 'logistic' THEN 1.0
                 WHEN family IN ('poisson', 'gamma')
-                  THEN (CASE WHEN avg(v) < 1e-300 THEN 1.0 ELSE avg(v) END)
-                WHEN coalesce(stddev_pop(v), 0) < 1e-300 THEN 1.0
-                ELSE stddev_pop(v)
+                  THEN (CASE WHEN sum(w.w * s.v) / sum(w.w) < 1e-300 THEN 1.0
+                             ELSE sum(w.w * s.v) / sum(w.w) END)
+                ELSE (CASE WHEN sqrt(greatest(sum(w.w * s.v * s.v) / sum(w.w)
+                                              - (sum(w.w * s.v) / sum(w.w)) ^ 2, 0.0)) < 1e-300
+                           THEN 1.0
+                           ELSE sqrt(greatest(sum(w.w * s.v * s.v) / sum(w.w)
+                                              - (sum(w.w * s.v) / sum(w.w)) ^ 2, 0.0)) END)
            END AS sd_y
-    FROM __reg_clong
-    WHERE col = outcome
+    FROM __reg_clong s JOIN __reg_w w ON w.rid = s.rid
+    WHERE s.col = outcome
 ),
 -- The whole training set packed into one row: a list of {y, xs} structs where
 -- xs = [1.0 (intercept), standardized features in name order]. __reg_clong is
@@ -211,20 +248,29 @@ __reg_ystats AS (
 -- families it passes through unchanged (dividing y by its mean only shifts the
 -- intercept); for linear the outcome is z-scored, so the offset is divided by
 -- sd_y to live on the same scale. o = 0 when no offset column is given.
+-- Each row carries y (transformed), xs (standardized features), o (internal
+-- offset), and w (sample weight). sumw is the total weight; the gradient is
+-- (1/sumw) * sum_i w_i xs_ij r_i.
 __reg_packed AS MATERIALIZED (
-    SELECT list(struct_pack(y := y, xs := xs, o := o)) AS rows, count(*)::DOUBLE AS n
+    SELECT list(struct_pack(y := y, xs := xs, o := o, w := w)) AS rows,
+           count(*)::DOUBLE AS n,
+           sum(w) AS sumw
     FROM (
         SELECT x.rid,
                (any_value(yv.v) - any_value(ys.mu_y)) / any_value(ys.sd_y) AS y,
                [1.0::DOUBLE] || list((x.v - s.mu) / s.sigma ORDER BY x.col) AS xs,
                coalesce(any_value(ov.v), 0.0)
-                 / (CASE WHEN family = 'linear' THEN any_value(ys.sd_y) ELSE 1.0 END) AS o
+                 / (CASE WHEN family = 'linear' THEN any_value(ys.sd_y) ELSE 1.0 END) AS o,
+               any_value(wt.w) AS w
         FROM __reg_clong x
         JOIN __reg_stats s  ON s.col = x.col
         JOIN __reg_clong yv ON yv.rid = x.rid AND yv.col = outcome
+        JOIN __reg_w wt     ON wt.rid = x.rid
         LEFT JOIN __reg_clong ov ON ov.rid = x.rid AND ov.col = coalesce(offset_col, '')
         CROSS JOIN __reg_ystats ys
-        WHERE x.col != outcome AND x.col != coalesce(offset_col, '')
+        WHERE x.col != outcome
+          AND x.col != coalesce(offset_col, '')
+          AND x.col != coalesce(weights_col, '')
         GROUP BY x.rid
     )
 ),
@@ -233,8 +279,13 @@ __reg_cfg AS (
              WHEN offset_col IS NOT NULL
                     AND offset_col NOT IN (SELECT colname FROM __reg_cols)
                THEN error(caller || ': offset column "' || offset_col || '" not found')
+             WHEN weights_col IS NOT NULL
+                    AND weights_col NOT IN (SELECT colname FROM __reg_cols)
+               THEN error(caller || ': weights column "' || weights_col || '" not found')
              WHEN (SELECT count(*) FROM __reg_cols
-                   WHERE colname != outcome AND colname != coalesce(offset_col, '')) = 0
+                   WHERE colname != outcome
+                     AND colname != coalesce(offset_col, '')
+                     AND colname != coalesce(weights_col, '')) = 0
                THEN error(caller || ': no feature columns besides the outcome')
              -- A feature column with no non-NULL values anywhere never reaches
              -- __reg_featcols; silently fitting without it would surprise, so
@@ -242,15 +293,22 @@ __reg_cfg AS (
              -- all-rows basis so it fires independently of complete-row count.
              WHEN (SELECT count(*) FROM __reg_featcols)
                     != (SELECT count(*) FROM __reg_cols
-                        WHERE colname != outcome AND colname != coalesce(offset_col, ''))
+                        WHERE colname != outcome
+                          AND colname != coalesce(offset_col, '')
+                          AND colname != coalesce(weights_col, ''))
                THEN error(caller || ': feature column(s) entirely NULL: '
                           || (SELECT string_agg('"' || colname || '"', ', ')
                               FROM __reg_cols
                               WHERE colname != outcome
                                 AND colname != coalesce(offset_col, '')
+                                AND colname != coalesce(weights_col, '')
                                 AND colname NOT IN (SELECT colname FROM __reg_featcols))
                           || '; drop them (e.g. SELECT * EXCLUDE (...)) or fill them')
              WHEN p.n = 0 THEN error(caller || ': no complete (non-NULL) rows to train on')
+             WHEN weights_col IS NOT NULL AND (SELECT min(w) FROM __reg_w) < 0
+               THEN error(caller || ': weights must be non-negative')
+             WHEN weights_col IS NOT NULL AND (SELECT coalesce(sum(w), 0) FROM __reg_w) <= 0
+               THEN error(caller || ': sample weights sum to zero')
              WHEN l2 < 0 THEN error(caller || ': l2 must be >= 0, got ' || l2)
              -- Guaranteed-convergent steps: on standardized data the mean-loss
              -- gradient is L-Lipschitz with L <= (d+1)/4 (logistic, from the
@@ -288,13 +346,13 @@ __reg_gd AS (
            list_aggregate(list_transform(newbetas, lambda nb, j: abs(nb - look[j])), 'max')
     FROM (
         SELECT it, betas, look,
-               -- beta_j <- look_j + (step/damp) * ((1/n) * sum_i xs_ij * r_i
+               -- beta_j <- look_j + (step/damp) * ((1/sumw) * sum_i w_i xs_ij r_i
                --                                   - l2 * look_j [not intercept])
                list_transform(look, lambda b, j:
-                   b + (step / damp) * (list_sum(list_transform(res, lambda ob: ob.xs[j] * ob.r)) / n
+                   b + (step / damp) * (list_sum(list_transform(res, lambda ob: ob.w * ob.xs[j] * ob.r)) / sumw
                                         - CASE WHEN j = 1 THEN 0.0 ELSE l2 * b END)) AS newbetas
         FROM (
-            SELECT it, betas, n, step, look, res,
+            SELECT it, betas, n, sumw, step, look, res,
                    -- Log-link curvature is unbounded, so damp the step by the
                    -- largest per-row curvature weight, recovered from the
                    -- residual without recomputing exp: Poisson weight is the
@@ -309,15 +367,16 @@ __reg_gd AS (
                         ELSE 1.0
                    END AS damp
             FROM (
-                SELECT it, betas, rows, n, step, look,
+                SELECT it, betas, rows, n, sumw, step, look,
                        -- residual per training row: the per-row gradient in z.
                        -- The linear predictor is the offset plus xs . look;
                        -- the offset is fixed, so it enters the fitted value but
-                       -- not the gradient wrt beta (which stays xs * r).
+                       -- not the gradient wrt beta (which stays w * xs * r).
                        -- logistic/linear/poisson: y - yhat(eta);
                        -- gamma (log link): y/mu - 1 with mu = exp(eta).
                        list_transform(rows, lambda rw: struct_pack(
                            xs := rw.xs,
+                           w  := rw.w,
                            r  := CASE WHEN family = 'logistic'
                                       THEN rw.y - 1.0 / (1.0 + exp(-(list_dot_product(rw.xs, look) + rw.o)))
                                       WHEN family = 'poisson'
@@ -327,7 +386,7 @@ __reg_gd AS (
                                       ELSE rw.y - (list_dot_product(rw.xs, look) + rw.o)
                                  END)) AS res
                 FROM (
-                    SELECT g.it, g.betas, p.rows, p.n, c.step,
+                    SELECT g.it, g.betas, p.rows, p.n, p.sumw, c.step,
                            -- Nesterov lookahead point
                            list_transform(g.betas, lambda b, j:
                                b + (g.it::DOUBLE / (g.it + 3)) * (b - g.prev[j])) AS look
@@ -447,11 +506,11 @@ LEFT JOIN __reg_offset o ON o.rid = n.__reg_rid__;
 -- Public wrappers
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE MACRO logit_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'logistic', 'logit_fit', max_iter, learning_rate, tol, l2, offset_col);
+CREATE OR REPLACE MACRO logit_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'logistic', 'logit_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col);
 
-CREATE OR REPLACE MACRO linreg_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'linear', 'linreg_fit', max_iter, learning_rate, tol, l2, offset_col);
+CREATE OR REPLACE MACRO linreg_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'linear', 'linreg_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col);
 
 CREATE OR REPLACE MACRO logit_predict(model, tbl, threshold := 0.5, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
@@ -466,8 +525,8 @@ SELECT * EXCLUDE (__reg_rid__, __reg_score__),
 FROM __reg_score(model, tbl, 'linreg_predict', offset_col)
 ORDER BY __reg_rid__;
 
-CREATE OR REPLACE MACRO poisson_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'poisson', 'poisson_fit', max_iter, learning_rate, tol, l2, offset_col);
+CREATE OR REPLACE MACRO poisson_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'poisson', 'poisson_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col);
 
 CREATE OR REPLACE MACRO poisson_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
@@ -475,8 +534,8 @@ SELECT * EXCLUDE (__reg_rid__, __reg_score__),
 FROM __reg_score(model, tbl, 'poisson_predict', offset_col)
 ORDER BY __reg_rid__;
 
-CREATE OR REPLACE MACRO gamma_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'gamma', 'gamma_fit', max_iter, learning_rate, tol, l2, offset_col);
+CREATE OR REPLACE MACRO gamma_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'gamma', 'gamma_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col);
 
 CREATE OR REPLACE MACRO gamma_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
