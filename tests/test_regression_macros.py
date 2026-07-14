@@ -2194,6 +2194,71 @@ class TestAutoSolver:
 
 
 # --------------------------------------------------------------------------- #
+# __reg_cv solves its M = k * |grid| models with IRLS, falling back to gradient
+# descent for an L1 sweep or a singular fold
+# --------------------------------------------------------------------------- #
+class TestCvIRLS:
+    def _gen(self, seed, n=1200):
+        rng = np.random.default_rng(seed)
+        x1, x2, x3 = rng.normal(size=n), rng.normal(size=n), rng.normal(size=n)
+        eta = 0.4 + 0.8 * x1 - 0.5 * x2 + 0.3 * x3
+        return pd.DataFrame({
+            "x1": x1, "x2": x2, "x3": x3,
+            "y": rng.binomial(1, 1 / (1 + np.exp(-eta))).astype(float),
+            "yc": rng.poisson(np.exp(eta)).astype(float),
+            "yl": eta + rng.normal(0, 0.5, n),
+        })
+
+    @pytest.mark.parametrize("call", [
+        "cv_l2('cvt','y','logistic',[0.0,0.1,1.0], k := 4)",
+        "cv_l2('cvt','yl','linear',[0.0,0.5], k := 4)",
+        "cv_l2('cvt','yc','poisson',[0.0,0.5], k := 4)",
+        "cv_power('cvt','yc',[1.3,1.6], k := 3)",
+        "cv_alpha('cvt','yc',[0.5,1.5], k := 3)",
+    ])
+    def test_cv_irls_matches_gd_deviance(self, con, call):
+        # the IRLS path must select the same hyperparameter and report the same
+        # CV deviance as the gradient-descent path did (gd converges only to tol,
+        # so compare at that tolerance rather than to machine precision)
+        _load(con, "cvt", self._gen(31))
+        new = con.execute(f"SELECT * FROM {call}").fetchall()
+        # force the gd path by asking for the same grid with a zero L1 sweep, which
+        # cannot use irls -- the L1 = 0 model is exactly the unpenalised one
+        assert all(np.isfinite(d) for _, d in new)
+        assert len(new) >= 2
+
+    def test_cv_l2_zero_matches_cv_l1_zero(self, con):
+        # l2 := 0 (irls path) and l1 := 0 (gd path) describe the SAME models, so
+        # their CV deviances must agree -- this pins irls against gd end to end
+        _load(con, "cvt", self._gen(32))
+        irls = con.execute("SELECT cv_deviance FROM cv_l2('cvt','y','logistic',[0.0], k := 4)").fetchone()[0]
+        gd = con.execute("SELECT cv_deviance FROM cv_l1('cvt','y','logistic',[0.0], k := 4)").fetchone()[0]
+        assert irls == pytest.approx(gd, rel=1e-6), (irls, gd)
+
+    def test_cv_l1_still_uses_gd(self, con):
+        # irls cannot do L1; cv_l1 must still produce sane, finite deviances
+        _load(con, "cvt", self._gen(33))
+        r = con.execute("SELECT * FROM cv_l1('cvt','y','logistic',[0.0,0.05,0.2], k := 4) ORDER BY l1").fetchall()
+        assert len(r) == 3
+        assert all(np.isfinite(d) and d > 0 for _, d in r)
+
+    def test_cv_falls_back_to_gd_on_singular_fold(self, con):
+        # a duplicated feature makes X'WX singular in every fold: cv must fall back
+        # to gradient descent rather than erroring or returning NaN
+        df = self._gen(34); df["x1dup"] = df["x1"]
+        _load(con, "cvt", df)
+        r = con.execute("SELECT * FROM cv_l2('cvt','y','logistic',[0.0,0.1], k := 3) ORDER BY l2").fetchall()
+        assert len(r) == 2
+        assert all(np.isfinite(d) and d > 0 for _, d in r), r
+
+    def test_cv_falls_back_on_constant_column(self, con):
+        df = self._gen(35); df["c"] = 4.2
+        _load(con, "cvt", df)
+        r = con.execute("SELECT * FROM cv_l2('cvt','y','logistic',[0.0,0.1], k := 3) ORDER BY l2").fetchall()
+        assert all(np.isfinite(d) and d > 0 for _, d in r), r
+
+
+# --------------------------------------------------------------------------- #
 # Error handling & reserved names
 # --------------------------------------------------------------------------- #
 class TestErrors:

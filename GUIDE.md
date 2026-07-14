@@ -398,6 +398,14 @@ available for multinomial. Coefficient standard errors are available via
 a grid, returning one row per grid value with the mean held-out deviance
 (squared error for linear). Pick the smallest `cv_deviance`.
 
+All `k × |grid|` models are fit **together in a single pass over the data**, and
+— as with `*_fit` — by IRLS, so a sweep costs a handful of iterations rather than
+the thousands gradient descent needs. `cv_l1` is the exception: IRLS cannot solve
+an L1 penalty, so lasso sweeps stay on gradient descent and are correspondingly
+slower. A rank-deficient design (constant or perfectly collinear feature) sends
+the whole run back to gradient descent automatically, exactly as `solver := 'auto'`
+does for a single fit.
+
 | macro | tunes | families |
 |---|---|---|
 | `cv_l2(tbl, outcome, family, l2_grid, k := 5)` | ridge `l2` | linear/logistic/poisson/gamma |

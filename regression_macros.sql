@@ -1340,12 +1340,123 @@ __reg_cv_cfg AS (
          f.d + 1 AS D1, ma.M AS M
   FROM __reg_cv_feats f, __reg_cv_marr ma, __reg_cv_chk chk WHERE chk.ok
 ),
+-- IRLS / Fisher scoring for all M models at once -- the cross-validation
+-- counterpart of __reg_fit's irls branch. Each iteration solves the penalised
+-- normal equations B_m <- (X'W X + n_m*l2_m*D)^-1 X'W z per model, reaching the
+-- MLE in ~5-10 iterations where gradient descent needs ~1000. Rows held out of
+-- model m's training folds get zero weight, so they drop out of that model's
+-- system. Inert (no seed row, hence no iterations) when any grid point carries an
+-- L1 penalty, which irls cannot solve -- cv_l1 therefore stays on gradient descent.
+__reg_cv_irls(it, B, move) AS (
+  SELECT 0,
+         list_transform(range(c.M), lambda m: list_transform(range(c.D1), lambda j: 0.0::DOUBLE)),
+         1e308::DOUBLE
+  FROM __reg_cv_cfg c, __reg_cv_marr ma
+  WHERE list_aggregate(ma.ml1, 'max') = 0.0
+  UNION ALL
+  SELECT it + 1, Bnew,
+         list_aggregate(list_transform(Bnew, lambda bm, m:
+             list_aggregate(list_transform(bm, lambda v, j: abs(v - B[m][j])), 'max')), 'max')
+  FROM (
+    SELECT it, B,
+           list_transform(range(1, M + 1), lambda m:
+               list_transform(__reg_matinv(XWXpen[m]),
+                              lambda invrow: list_dot_product(invrow, XWr[m]))) AS Bnew
+    FROM (
+      -- ridge on the diagonal, intercept unpenalised. The gd path takes the mean
+      -- loss over model m's mntrain rows, so its l2 scales the same way here.
+      SELECT it, B, M, XWr,
+             list_transform(range(1, M + 1), lambda m:
+                 list_transform(XWX[m], lambda row, a:
+                     list_transform(row, lambda v, b:
+                         CASE WHEN a = b AND a > 1 THEN v + mntrain[m] * ml2[m] ELSE v END))) AS XWXpen
+      FROM (
+        SELECT it, B, M, mntrain, ml2,
+               list_transform(range(1, M + 1), lambda m:
+                   list_transform(range(1, D1 + 1), lambda a:
+                       list_transform(range(1, D1 + 1), lambda b:
+                           list_sum(list_transform(res, lambda ob:
+                               ob.wirls[m] * ob.xs[a] * ob.xs[b]))))) AS XWX,
+               list_transform(range(1, M + 1), lambda m:
+                   list_transform(range(1, D1 + 1), lambda a:
+                       list_sum(list_transform(res, lambda ob: ob.wr[m] * ob.xs[a])))) AS XWr
+        FROM (
+          -- per row and model: expected-information weight and working response,
+          -- both zeroed on the rows held out of that model's training folds
+          SELECT it, B, M, D1, mntrain, ml2,
+                 list_transform(lps, lambda e: struct_pack(
+                   xs := e.xs,
+                   wirls := list_transform(e.lp, lambda l, m:
+                     CASE WHEN mfold[m] = e.fold THEN 0.0 ELSE
+                       (CASE family
+                          WHEN 'logistic' THEN (1.0/(1.0+exp(-greatest(least(l,700.0),-700.0))))
+                                             * (1.0 - 1.0/(1.0+exp(-greatest(least(l,700.0),-700.0))))
+                          WHEN 'linear'   THEN 1.0
+                          WHEN 'poisson'  THEN exp(greatest(least(l,700.0),-700.0))
+                          WHEN 'gamma'    THEN 1.0
+                          WHEN 'tweedie'  THEN pow(exp(greatest(least(l,700.0),-700.0)), 2.0-mpow[m])
+                          WHEN 'nbinom'   THEN exp(greatest(least(l,700.0),-700.0))
+                                             / (1.0 + malp_int[m]*exp(greatest(least(l,700.0),-700.0)))
+                        END) END),
+                   wr := list_transform(e.lp, lambda l, m:
+                     CASE WHEN mfold[m] = e.fold THEN 0.0 ELSE
+                       (CASE family
+                          WHEN 'logistic' THEN (1.0/(1.0+exp(-greatest(least(l,700.0),-700.0))))
+                                             * (1.0 - 1.0/(1.0+exp(-greatest(least(l,700.0),-700.0))))
+                          WHEN 'linear'   THEN 1.0
+                          WHEN 'poisson'  THEN exp(greatest(least(l,700.0),-700.0))
+                          WHEN 'gamma'    THEN 1.0
+                          WHEN 'tweedie'  THEN pow(exp(greatest(least(l,700.0),-700.0)), 2.0-mpow[m])
+                          WHEN 'nbinom'   THEN exp(greatest(least(l,700.0),-700.0))
+                                             / (1.0 + malp_int[m]*exp(greatest(least(l,700.0),-700.0)))
+                        END) * l
+                     + (CASE family
+                          WHEN 'gamma'    THEN e.yt / exp(greatest(least(l,700.0),-700.0)) - 1.0
+                          WHEN 'tweedie'  THEN (e.yt - exp(greatest(least(l,700.0),-700.0)))
+                                             * pow(exp(greatest(least(l,700.0),-700.0)), 1.0-mpow[m])
+                          WHEN 'nbinom'   THEN (e.yt - exp(greatest(least(l,700.0),-700.0)))
+                                             / (1.0 + malp_int[m]*exp(greatest(least(l,700.0),-700.0)))
+                          WHEN 'logistic' THEN e.yt - 1.0/(1.0+exp(-greatest(least(l,700.0),-700.0)))
+                          WHEN 'linear'   THEN e.yt - l
+                          WHEN 'poisson'  THEN e.yt - exp(greatest(least(l,700.0),-700.0))
+                        END) END)
+                 )) AS res
+          FROM (
+            SELECT g.it, g.B, c.M, c.D1, ma.mfold, ma.ml2, ma.mntrain, ma.mpow, ma.malp_int,
+                   -- one dot product per (row, model); mu is derived from it below
+                   list_transform(p.rows, lambda rw: struct_pack(
+                       xs := rw.xs, yt := rw.yt, fold := rw.fold,
+                       lp := list_transform(g.B, lambda bm, m: list_dot_product(rw.xs, bm)))) AS lps
+            FROM __reg_cv_irls g, __reg_cv_packed p, __reg_cv_cfg c, __reg_cv_marr ma
+            WHERE g.it < max_iter AND g.move >= tol AND isfinite(g.move)
+          )
+        )
+      )
+    )
+  )
+),
+__reg_cv_irls_beta AS (SELECT B FROM __reg_cv_irls ORDER BY it DESC LIMIT 1),
+-- Trustworthy only if every coefficient of every model came back finite and sane;
+-- a singular X'WX in any fold (or divergence under separation) sends the whole run
+-- back to gradient descent. Empty -- hence false -- when irls did not run at all,
+-- which is exactly the gate gradient descent wants for the L1 sweeps.
+__reg_cv_irls_ok AS (
+  SELECT coalesce(
+           (SELECT list_aggregate(list_transform(B, lambda bm:
+                      list_aggregate(list_transform(bm,
+                          lambda v: isfinite(v) AND abs(v) < 1e100), 'bool_and')), 'bool_and')
+            FROM __reg_cv_irls_beta),
+           false) AS ok
+),
+-- Gated so it produces no seed row (and so never iterates) when irls already
+-- solved every model.
 __reg_cv_gd AS (
   SELECT 0 AS it,
          list_transform(range(c.M), lambda m: list_transform(range(c.D1), lambda j: 0.0::DOUBLE)) AS B,
          list_transform(range(c.M), lambda m: list_transform(range(c.D1), lambda j: 0.0::DOUBLE)) AS prev,
          1e308::DOUBLE AS move
   FROM __reg_cv_cfg c
+  WHERE NOT (SELECT ok FROM __reg_cv_irls_ok)
   UNION ALL
   SELECT it+1, newB, B,
          list_aggregate(list_transform(newB, lambda bm, m:
@@ -1413,7 +1524,14 @@ __reg_cv_gd AS (
     )
   )
 ),
-__reg_cv_sol AS (SELECT B FROM __reg_cv_gd ORDER BY it DESC LIMIT 1),
+__reg_cv_gd_beta AS (SELECT B FROM __reg_cv_gd ORDER BY it DESC LIMIT 1),
+-- Exactly one solver produced rows: irls when it applied and converged, gradient
+-- descent otherwise (an L1 sweep, or the fallback from a singular fold).
+__reg_cv_sol AS (
+  SELECT CASE WHEN (SELECT count(*) FROM __reg_cv_gd_beta) > 0
+              THEN (SELECT B FROM __reg_cv_gd_beta)
+              ELSE (SELECT B FROM __reg_cv_irls_beta) END AS B
+),
 __reg_cv_score AS (
   SELECT gg.g AS g, r.y AS y,
          list_dot_product(r.xs, s.B[(gg.g - 1) * k + r.fold + 1]) AS eta,
