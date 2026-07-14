@@ -265,8 +265,15 @@ __reg_w AS (
 -- stays exactly 0.
 -- Weighted mean and weighted population sd. With equal weights these reduce to
 -- the ordinary avg / stddev_pop, so no-weights fits are unchanged.
+-- j is the feature's position in name order. Downstream, the per-row feature
+-- vector is assembled with list(... ORDER BY j) rather than ORDER BY col: an
+-- ordered list aggregate carries its sort key alongside every value, and a
+-- VARCHAR key means n*d column-name strings in the sort buffers. Ordering by
+-- the integer instead is the same order (j is assigned by ORDER BY col) for a
+-- fraction of the time and memory.
 __reg_stats AS MATERIALIZED (
     SELECT s.col,
+           row_number() OVER (ORDER BY s.col) AS j,
            CASE WHEN min(s.v) = max(s.v) THEN min(s.v)
                 ELSE sum(w.w * s.v) / sum(w.w) END AS mu,
            CASE WHEN min(s.v) = max(s.v) THEN 1.0
@@ -325,7 +332,7 @@ __reg_packed AS MATERIALIZED (
     FROM (
         SELECT x.rid,
                (any_value(yv.v) - any_value(ys.mu_y)) / any_value(ys.sd_y) AS y,
-               [1.0::DOUBLE] || list((x.v - s.mu) / s.sigma ORDER BY x.col) AS xs,
+               [1.0::DOUBLE] || list((x.v - s.mu) / s.sigma ORDER BY s.j) AS xs,
                coalesce(any_value(ov.v), 0.0)
                  / (CASE WHEN family = 'linear' THEN any_value(ys.sd_y) ELSE 1.0 END) AS o,
                any_value(wt.w) AS w
@@ -1066,7 +1073,12 @@ __reg_mnonref AS (
   FROM (SELECT DISTINCT lab FROM __reg_mylab WHERE lab <> (SELECT min(lab) FROM __reg_mylab))
 ),
 __reg_mstats AS MATERIALIZED (
+  -- j: feature position in name order. The per-row feature vector below is
+  -- assembled with ORDER BY j rather than ORDER BY col; an ordered list
+  -- aggregate carries its sort key with every value, so a VARCHAR key means
+  -- n*d column-name strings in the sort buffers.
   SELECT col,
+         row_number() OVER (ORDER BY col) AS j,
          CASE WHEN min(v) = max(v) THEN min(v) ELSE avg(v) END AS mu,
          CASE WHEN min(v) = max(v) THEN 1.0 ELSE stddev_pop(v) END AS sigma
   FROM __reg_mflong GROUP BY col
@@ -1091,7 +1103,7 @@ __reg_mpacked AS MATERIALIZED (
          any_value(len(yv)) AS K1, any_value(len(xs)) AS D1
   FROM (
     SELECT x.rid,
-           [1.0::DOUBLE] || list((x.v - s.mu) / s.sigma ORDER BY x.col) AS xs,
+           [1.0::DOUBLE] || list((x.v - s.mu) / s.sigma ORDER BY s.j) AS xs,
            list_transform(any_value(nr.nrf),
              lambda cl: CASE WHEN any_value(yl.lab) = cl THEN 1.0 ELSE 0.0 END) AS yv
     FROM __reg_mflong x
@@ -1279,7 +1291,12 @@ __reg_cv_yraw AS MATERIALIZED (
         ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE val) WHERE name = outcome
 ),
 __reg_cv_stats AS MATERIALIZED (
-  SELECT col, CASE WHEN min(v)=max(v) THEN min(v) ELSE avg(v) END AS mu,
+  -- j: feature position in name order. The per-row feature vector below is
+  -- assembled with ORDER BY j rather than ORDER BY col; an ordered list
+  -- aggregate carries its sort key with every value, so a VARCHAR key means
+  -- n*d column-name strings in the sort buffers.
+  SELECT col, row_number() OVER (ORDER BY col) AS j,
+         CASE WHEN min(v)=max(v) THEN min(v) ELSE avg(v) END AS mu,
          CASE WHEN min(v)=max(v) THEN 1.0 ELSE stddev_pop(v) END AS sigma
   FROM __reg_cv_flong GROUP BY col
 ),
@@ -1311,7 +1328,7 @@ __reg_cv_marr AS (
 __reg_cv_rows AS MATERIALIZED (
   SELECT x.rid, any_value(yr.fold) AS fold, any_value(yr.y) AS y,
          (any_value(yr.y) - any_value(ys.mu_y)) / any_value(ys.sd_y) AS yt,
-         [1.0::DOUBLE] || list((x.v - s.mu)/s.sigma ORDER BY x.col) AS xs
+         [1.0::DOUBLE] || list((x.v - s.mu)/s.sigma ORDER BY s.j) AS xs
   FROM __reg_cv_flong x JOIN __reg_cv_stats s ON s.col=x.col JOIN __reg_cv_yraw yr ON yr.rid=x.rid
   CROSS JOIN __reg_cv_ys ys GROUP BY x.rid
 ),
@@ -1452,7 +1469,12 @@ __reg_nbd_ycheck AS (
   FROM __reg_nbd_yraw
 ),
 __reg_nbd_stats AS MATERIALIZED (
-  SELECT col, CASE WHEN min(v)=max(v) THEN min(v) ELSE avg(v) END AS mu,
+  -- j: feature position in name order. The per-row feature vector below is
+  -- assembled with ORDER BY j rather than ORDER BY col; an ordered list
+  -- aggregate carries its sort key with every value, so a VARCHAR key means
+  -- n*d column-name strings in the sort buffers.
+  SELECT col, row_number() OVER (ORDER BY col) AS j,
+         CASE WHEN min(v)=max(v) THEN min(v) ELSE avg(v) END AS mu,
          CASE WHEN min(v)=max(v) THEN 1.0 ELSE stddev_pop(v) END AS sigma
   FROM __reg_nbd_flong GROUP BY col
 ),
@@ -1466,7 +1488,7 @@ __reg_nbd_marr AS (
 ),
 __reg_nbd_rows AS MATERIALIZED (
   SELECT x.rid, any_value(yr.y) AS y, any_value(yr.y) / any_value(ys.sd_y) AS yt,
-         [1.0::DOUBLE] || list((x.v - s.mu)/s.sigma ORDER BY x.col) AS xs
+         [1.0::DOUBLE] || list((x.v - s.mu)/s.sigma ORDER BY s.j) AS xs
   FROM __reg_nbd_flong x JOIN __reg_nbd_stats s ON s.col=x.col JOIN __reg_nbd_yraw yr ON yr.rid=x.rid
   CROSS JOIN __reg_nbd_ys ys GROUP BY x.rid
 ),
@@ -1749,6 +1771,10 @@ CREATE OR REPLACE MACRO __reg_summary(model, tbl, outcome, family, caller,
                                       robust, cluster_col) AS TABLE
 WITH RECURSIVE
 mdl AS (SELECT feature, coefficient FROM query_table(model)),
+-- Feature position in name order, so the per-row feature vector below can be
+-- ordered by an integer rather than by the VARCHAR column name (see __reg_stats).
+mdlj AS (SELECT feature, row_number() OVER (ORDER BY feature) AS j
+         FROM mdl WHERE feature != '(Intercept)'),
 beta AS (
   SELECT ([ coalesce((SELECT coefficient FROM mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
           || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS bvec,
@@ -1768,8 +1794,8 @@ ov AS (SELECT rid, v AS o  FROM alllong WHERE col = offset_col),
 wv AS (SELECT rid, v AS wt FROM alllong WHERE col = weights_col),
 clv AS (SELECT rid, v AS cl FROM alllong WHERE col = cluster_col),
 feat AS (
-  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY l.col) AS xs, count(*)::INT AS nf
-  FROM alllong l JOIN mdl m ON m.feature = l.col AND m.feature != '(Intercept)'
+  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY m.j) AS xs, count(*)::INT AS nf
+  FROM alllong l JOIN mdlj m ON m.feature = l.col
   GROUP BY l.rid
 ),
 rows0 AS (
@@ -2002,6 +2028,10 @@ CREATE OR REPLACE MACRO __reg_predict_ci(model, tbl, outcome, newdata, family, c
                                          conf_level, offset_col, weights_col, power, alpha) AS TABLE
 WITH RECURSIVE
 mdl AS (SELECT feature, coefficient FROM query_table(model)),
+-- Feature position in name order, so the per-row feature vector below can be
+-- ordered by an integer rather than by the VARCHAR column name (see __reg_stats).
+mdlj AS (SELECT feature, row_number() OVER (ORDER BY feature) AS j
+         FROM mdl WHERE feature != '(Intercept)'),
 beta AS (
   SELECT ([ coalesce((SELECT coefficient FROM mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
           || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS bvec,
@@ -2019,8 +2049,8 @@ yv AS (SELECT rid, v AS y  FROM alllong WHERE col = outcome),
 ov AS (SELECT rid, v AS o  FROM alllong WHERE col = offset_col),
 wv AS (SELECT rid, v AS wt FROM alllong WHERE col = weights_col),
 feat AS (
-  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY l.col) AS xs, count(*)::INT AS nf
-  FROM alllong l JOIN mdl m ON m.feature = l.col AND m.feature != '(Intercept)'
+  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY m.j) AS xs, count(*)::INT AS nf
+  FROM alllong l JOIN mdlj m ON m.feature = l.col
   GROUP BY l.rid
 ),
 rows0 AS (
@@ -2096,8 +2126,8 @@ salllong AS (
 ),
 soff AS (SELECT srid, v AS o FROM salllong WHERE col = offset_col),
 sfeat AS (
-  SELECT l.srid, [1.0::DOUBLE] || list(l.v ORDER BY l.col) AS xs, count(*)::INT AS nf
-  FROM salllong l JOIN mdl m ON m.feature = l.col AND m.feature != '(Intercept)'
+  SELECT l.srid, [1.0::DOUBLE] || list(l.v ORDER BY m.j) AS xs, count(*)::INT AS nf
+  FROM salllong l JOIN mdlj m ON m.feature = l.col
   GROUP BY l.srid
 ),
 scored AS (
@@ -2153,6 +2183,10 @@ SELECT * FROM __reg_predict_ci(model, tbl, outcome, newdata, 'nbinom', 'nbinom_p
 CREATE OR REPLACE MACRO __reg_influence(model, tbl, outcome, family, caller, offset_col, weights_col, power, alpha) AS TABLE
 WITH RECURSIVE
 mdl AS (SELECT feature, coefficient FROM query_table(model)),
+-- Feature position in name order, so the per-row feature vector below can be
+-- ordered by an integer rather than by the VARCHAR column name (see __reg_stats).
+mdlj AS (SELECT feature, row_number() OVER (ORDER BY feature) AS j
+         FROM mdl WHERE feature != '(Intercept)'),
 beta AS (
   SELECT ([ coalesce((SELECT coefficient FROM mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
           || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS bvec,
@@ -2169,8 +2203,8 @@ yv AS (SELECT rid, v AS y  FROM alllong WHERE col = outcome),
 ov AS (SELECT rid, v AS o  FROM alllong WHERE col = offset_col),
 wv AS (SELECT rid, v AS wt FROM alllong WHERE col = weights_col),
 feat AS (
-  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY l.col) AS xs, count(*)::INT AS nf
-  FROM alllong l JOIN mdl m ON m.feature = l.col AND m.feature != '(Intercept)' GROUP BY l.rid
+  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY m.j) AS xs, count(*)::INT AS nf
+  FROM alllong l JOIN mdlj m ON m.feature = l.col GROUP BY l.rid
 ),
 rows0 AS (
   SELECT f.rid, f.xs, y.y,
@@ -2281,9 +2315,13 @@ alllong AS (
         ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE value)
 ),
 kfeat AS (SELECT count(DISTINCT feature) FILTER (WHERE feature != '(Intercept)') AS k FROM mdl),
+mdlj AS (
+  SELECT feature, row_number() OVER (ORDER BY feature) AS j
+  FROM (SELECT DISTINCT feature FROM mdl WHERE feature != '(Intercept)')
+),
 feat AS (
-  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY l.col) AS xs, count(*)::INT AS nf
-  FROM alllong l JOIN (SELECT DISTINCT feature FROM mdl WHERE feature != '(Intercept)') m ON m.feature = l.col
+  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY m.j) AS xs, count(*)::INT AS nf
+  FROM alllong l JOIN mdlj m ON m.feature = l.col
   GROUP BY l.rid
 ),
 -- per-row softmax probabilities for the non-reference classes
