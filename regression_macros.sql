@@ -1920,6 +1920,160 @@ SELECT * FROM __reg_summary(model, tbl, outcome, 'tweedie', 'tweedie_summary', c
 CREATE OR REPLACE MACRO nbinom_summary(model, tbl, outcome, alpha := 1.0, conf_level := 0.95, offset_col := NULL, weights_col := NULL, robust := 'none', cluster_col := NULL) AS TABLE
 SELECT * FROM __reg_summary(model, tbl, outcome, 'nbinom', 'nbinom_summary', conf_level, offset_col, weights_col, NULL, alpha, robust, cluster_col);
 
+-- ---------------------------------------------------------------------------
+-- Confidence intervals on the predicted MEAN response (prediction intervals).
+-- Cov(beta) = phi*(X'WX)^-1 is estimated from the training data `tbl`; then for
+-- each row of `newdata` (default: tbl) the linear predictor eta = x'beta+offset
+-- has SE(eta) = sqrt(phi * x'(X'WX)^-1 x), and the mean CI is g^-1(eta +- crit*
+-- SE(eta)) on the response scale (g^-1 monotone, so bounds keep their order).
+-- z for fixed-dispersion families, Student-t(n-d) for estimated (as *_summary).
+-- Returns the newdata columns plus prediction / conf_low / conf_high.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE MACRO __reg_predict_ci(model, tbl, outcome, newdata, family, caller,
+                                         conf_level, offset_col, weights_col, power, alpha) AS TABLE
+WITH RECURSIVE
+mdl AS (SELECT feature, coefficient FROM query_table(model)),
+beta AS (
+  SELECT ([ coalesce((SELECT coefficient FROM mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
+          || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS bvec,
+         (count(*) FILTER (WHERE feature != '(Intercept)'))::INT AS k
+  FROM mdl
+),
+-- === model-based covariance from the TRAINING data (as __reg_summary) ===
+num AS (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
+alllong AS (
+  SELECT rid, name AS col, value AS v
+  FROM (UNPIVOT (SELECT rid, TRY_CAST(COLUMNS(* EXCLUDE (rid)) AS DOUBLE) FROM num)
+        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE value)
+),
+yv AS (SELECT rid, v AS y  FROM alllong WHERE col = outcome),
+ov AS (SELECT rid, v AS o  FROM alllong WHERE col = offset_col),
+wv AS (SELECT rid, v AS wt FROM alllong WHERE col = weights_col),
+feat AS (
+  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY l.col) AS xs, count(*)::INT AS nf
+  FROM alllong l JOIN mdl m ON m.feature = l.col AND m.feature != '(Intercept)'
+  GROUP BY l.rid
+),
+rows0 AS (
+  SELECT f.rid, f.xs, y.y,
+         CASE WHEN offset_col IS NULL THEN 0.0 ELSE o.o END AS off,
+         CASE WHEN weights_col IS NULL THEN 1.0 ELSE coalesce(w.wt, 1.0) END AS wt
+  FROM feat f JOIN yv y ON y.rid = f.rid
+  LEFT JOIN ov o ON o.rid = f.rid LEFT JOIN wv w ON w.rid = f.rid CROSS JOIN beta
+  WHERE f.nf = beta.k AND y.y IS NOT NULL AND (offset_col IS NULL OR o.o IS NOT NULL)
+),
+rww AS (
+  SELECT r.xs, r.y, r.wt, mu,
+         r.wt * (CASE family WHEN 'logistic' THEN mu*(1.0-mu) WHEN 'linear' THEN 1.0
+                   WHEN 'poisson' THEN mu WHEN 'gamma' THEN 1.0
+                   WHEN 'tweedie' THEN pow(mu, 2.0-power) WHEN 'nbinom' THEN mu/(1.0+alpha*mu) END) AS w,
+         r.wt * (CASE family WHEN 'logistic' THEN (r.y-mu)*(r.y-mu)/(mu*(1.0-mu))
+                   WHEN 'linear' THEN (r.y-mu)*(r.y-mu) WHEN 'poisson' THEN (r.y-mu)*(r.y-mu)/mu
+                   WHEN 'gamma' THEN (r.y-mu)*(r.y-mu)/(mu*mu) WHEN 'tweedie' THEN (r.y-mu)*(r.y-mu)/pow(mu,power)
+                   WHEN 'nbinom' THEN (r.y-mu)*(r.y-mu)/(mu*(1.0+alpha*mu)) END) AS pearson
+  FROM (SELECT xs, y, wt, CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
+                            WHEN 'linear' THEN eta ELSE exp(greatest(-700.0,least(eta,700.0))) END AS mu
+        FROM (SELECT xs, y, wt, off + list_dot_product(xs, (SELECT bvec FROM beta)) AS eta FROM rows0)) r
+),
+dims AS (SELECT count(*)::INT AS n, (SELECT k FROM beta)+1 AS d FROM rww),
+idx AS (SELECT unnest(range(1, (SELECT d FROM dims)+1)) AS i),
+pairs AS (SELECT a.i AS a, b.i AS b FROM idx a, idx b),
+xwx AS (
+  SELECT list(rowlist ORDER BY a) AS A FROM (
+    SELECT a, list(val ORDER BY b) AS rowlist FROM (
+      SELECT p.a AS a, p.b AS b, sum(rww.w * rww.xs[p.a] * rww.xs[p.b]) AS val
+      FROM rww, pairs p GROUP BY p.a, p.b) GROUP BY a)
+),
+scal AS (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc FROM xwx),
+rscaled AS (SELECT dsc, list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dsc[i]*dsc[j]))) AS R FROM scal),
+gj(k, d, sing, M) AS (
+  SELECT 0, len(R), false,
+         list_transform(R, lambda row, i: list_concat(list_transform(row, lambda v, j: v::DOUBLE),
+             list_transform(row, lambda v, j: CASE WHEN j = i THEN 1.0 ELSE 0.0 END)))
+  FROM rscaled
+  UNION ALL
+  SELECT col, d, sing OR abs(piv) < 1e-12,
+         CASE WHEN abs(piv) < 1e-12 THEN Mswap
+              ELSE list_transform(Mswap, lambda row, i: CASE WHEN i = col THEN normpivot
+                       ELSE list_transform(row, lambda v, j: v - row[col]*normpivot[j]) END) END
+  FROM (SELECT col, d, sing, Mswap, Mswap[col][col] AS piv,
+               list_transform(Mswap[col], lambda v, j: v / Mswap[col][col]) AS normpivot
+        FROM (SELECT col, d, sing, list_transform(M, lambda row, i:
+                       CASE WHEN i = col THEN M[p] WHEN i = p THEN M[col] ELSE row END) AS Mswap
+              FROM (SELECT col, d, sing, M, list_position(pcol, list_aggregate(pcol, 'max')) AS p
+                    FROM (SELECT k, k+1 AS col, d, sing, M, list_transform(M, lambda row, i:
+                                   CASE WHEN i >= k+1 THEN abs(row[k+1]) ELSE -1e308 END) AS pcol
+                          FROM gj WHERE k < d))))
+),
+covinv AS (SELECT CASE WHEN sing THEN NULL ELSE list_transform(M, lambda row, i: list_slice(row, d+1, 2*d)) END AS Rinv FROM gj WHERE k = d),
+disp AS (
+  SELECT CASE WHEN family IN ('linear','gamma','tweedie')
+              THEN (SELECT sum(pearson) FROM rww) / nullif((SELECT n-d FROM dims), 0) ELSE 1.0 END AS phi,
+         (family IN ('linear','gamma','tweedie') AND (SELECT n-d FROM dims) > 0) AS uset,
+         (SELECT (n-d)::DOUBLE FROM dims) AS df
+),
+cparams AS (
+  SELECT c.Rinv AS Rinv, s.dsc AS dsc, dp.phi AS phi, dp.uset AS uset, dp.df AS df,
+         CASE WHEN dp.uset THEN t_ppf(1.0-(1.0-conf_level)/2.0, dp.df)
+              ELSE norm_ppf(1.0-(1.0-conf_level)/2.0) END AS crit
+  FROM covinv c CROSS JOIN scal s CROSS JOIN disp dp
+),
+-- === score newdata (default = tbl) ===
+snum AS (SELECT row_number() OVER () AS srid, * FROM query_table(coalesce(newdata, tbl))),
+salllong AS (
+  SELECT srid, name AS col, value AS v
+  FROM (UNPIVOT (SELECT srid, TRY_CAST(COLUMNS(* EXCLUDE (srid)) AS DOUBLE) FROM snum)
+        ON COLUMNS(* EXCLUDE (srid)) INTO NAME name VALUE value)
+),
+soff AS (SELECT srid, v AS o FROM salllong WHERE col = offset_col),
+sfeat AS (
+  SELECT l.srid, [1.0::DOUBLE] || list(l.v ORDER BY l.col) AS xs, count(*)::INT AS nf
+  FROM salllong l JOIN mdl m ON m.feature = l.col AND m.feature != '(Intercept)'
+  GROUP BY l.srid
+),
+scored AS (
+  SELECT sn.srid,
+         CASE WHEN sf.nf = (SELECT k FROM beta)
+                   AND (offset_col IS NULL OR so.o IS NOT NULL)
+              THEN (CASE WHEN offset_col IS NULL THEN 0.0 ELSE so.o END)
+                   + list_dot_product(sf.xs, (SELECT bvec FROM beta)) END AS eta,
+         CASE WHEN sf.nf = (SELECT k FROM beta) AND cp.Rinv IS NOT NULL
+              THEN cp.phi * list_sum(list_transform(
+                       list_transform(sf.xs, lambda v, a: v / cp.dsc[a]),
+                       lambda va, a: va * list_dot_product(cp.Rinv[a], list_transform(sf.xs, lambda v2, a2: v2 / cp.dsc[a2]))))
+              END AS var_eta,
+         cp.crit AS crit
+  FROM snum sn
+  LEFT JOIN sfeat sf ON sf.srid = sn.srid
+  LEFT JOIN soff so ON so.srid = sn.srid
+  CROSS JOIN cparams cp
+)
+SELECT sn.* EXCLUDE (srid),
+       CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-s.eta)) WHEN 'linear' THEN s.eta ELSE exp(s.eta) END AS prediction,
+       CASE WHEN s.var_eta IS NULL OR NOT isfinite(s.var_eta) OR s.var_eta < 0.0 THEN NULL
+            ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta - s.crit*sqrt(s.var_eta))))
+                              WHEN 'linear' THEN s.eta - s.crit*sqrt(s.var_eta)
+                              ELSE exp(s.eta - s.crit*sqrt(s.var_eta)) END) END AS conf_low,
+       CASE WHEN s.var_eta IS NULL OR NOT isfinite(s.var_eta) OR s.var_eta < 0.0 THEN NULL
+            ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta + s.crit*sqrt(s.var_eta))))
+                              WHEN 'linear' THEN s.eta + s.crit*sqrt(s.var_eta)
+                              ELSE exp(s.eta + s.crit*sqrt(s.var_eta)) END) END AS conf_high
+FROM scored s JOIN snum sn ON sn.srid = s.srid
+ORDER BY s.srid;
+
+CREATE OR REPLACE MACRO logit_predict_ci(model, tbl, outcome, newdata := NULL, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_predict_ci(model, tbl, outcome, newdata, 'logistic', 'logit_predict_ci', conf_level, offset_col, weights_col, NULL, NULL);
+CREATE OR REPLACE MACRO linreg_predict_ci(model, tbl, outcome, newdata := NULL, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_predict_ci(model, tbl, outcome, newdata, 'linear', 'linreg_predict_ci', conf_level, offset_col, weights_col, NULL, NULL);
+CREATE OR REPLACE MACRO poisson_predict_ci(model, tbl, outcome, newdata := NULL, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_predict_ci(model, tbl, outcome, newdata, 'poisson', 'poisson_predict_ci', conf_level, offset_col, weights_col, NULL, NULL);
+CREATE OR REPLACE MACRO gamma_predict_ci(model, tbl, outcome, newdata := NULL, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_predict_ci(model, tbl, outcome, newdata, 'gamma', 'gamma_predict_ci', conf_level, offset_col, weights_col, NULL, NULL);
+CREATE OR REPLACE MACRO tweedie_predict_ci(model, tbl, outcome, newdata := NULL, power := 1.5, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_predict_ci(model, tbl, outcome, newdata, 'tweedie', 'tweedie_predict_ci', conf_level, offset_col, weights_col, power, NULL);
+CREATE OR REPLACE MACRO nbinom_predict_ci(model, tbl, outcome, newdata := NULL, alpha := 1.0, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_predict_ci(model, tbl, outcome, newdata, 'nbinom', 'nbinom_predict_ci', conf_level, offset_col, weights_col, NULL, alpha);
+
 -- Multinomial (softmax) coefficient inference. Baseline-category Fisher
 -- information I[(c,j),(c',k)] = sum_i p_ic(delta_cc' - p_ic') x_ij x_ik over the
 -- K-1 non-reference classes; Cov = I^-1, dispersion fixed = 1, z inference.

@@ -1767,6 +1767,111 @@ class TestRobustSE:
 
 
 # --------------------------------------------------------------------------- #
+# Prediction intervals -- CI on the mean response (*_predict_ci)
+# --------------------------------------------------------------------------- #
+class TestPredictionCI:
+    SPEC = {  # family -> (fit macro, predict_ci macro, extra args)
+        "logistic": ("logit_fit", "logit_predict_ci", ""),
+        "linear": ("linreg_fit", "linreg_predict_ci", ""),
+        "poisson": ("poisson_fit", "poisson_predict_ci", ""),
+        "gamma": ("gamma_fit", "gamma_predict_ci", ""),
+        "tweedie": ("tweedie_fit", "tweedie_predict_ci", ", power := 1.5"),
+        "nbinom": ("nbinom_fit", "nbinom_predict_ci", ", alpha := 0.5"),
+    }
+
+    def _ref(self, X, y, beta, family, Xn=None, alpha=0.5, power=1.5, ci=0.95):
+        from scipy.stats import norm, t as tdist
+        n, d = X.shape
+        Xn = X if Xn is None else Xn
+        if family == "logistic":
+            mu = 1 / (1 + np.exp(-X @ beta)); W = mu * (1 - mu); V = W; ginv = lambda e: 1 / (1 + np.exp(-e)); est = False
+        elif family == "linear":
+            mu = X @ beta; W = np.ones(n); V = np.ones(n); ginv = lambda e: e; est = True
+        else:
+            mu = np.exp(X @ beta); ginv = np.exp
+            if family == "poisson": W = mu; V = mu; est = False
+            elif family == "gamma": W = np.ones(n); V = mu ** 2; est = True
+            elif family == "tweedie": W = mu ** (2 - power); V = mu ** power; est = True
+            else: W = mu / (1 + alpha * mu); V = mu + alpha * mu ** 2; est = False
+        Cov = np.linalg.inv((X * W[:, None]).T @ X)
+        if est: Cov = Cov * np.sum((y - mu) ** 2 / V) / (n - d)
+        eta = Xn @ beta; se = np.sqrt(np.einsum("ij,jk,ik->i", Xn, Cov, Xn))
+        q = tdist.ppf(1 - (1 - ci) / 2, n - d) if est else norm.ppf(1 - (1 - ci) / 2)
+        return ginv(eta), ginv(eta - q * se), ginv(eta + q * se)
+
+    def _data(self, family, seed, n=800):
+        rng = np.random.default_rng(seed)
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        eta = 0.5 + 0.6 * x1 - 0.3 * x2
+        if family == "logistic": y = rng.binomial(1, 1 / (1 + np.exp(-eta))).astype(float)
+        elif family == "linear": y = 2 + 1.5 * x1 - 0.8 * x2 + rng.normal(0, 1.5, n)
+        elif family == "poisson": y = rng.poisson(np.exp(eta)).astype(float)
+        elif family == "gamma": y = rng.gamma(2.0, np.exp(eta) / 2.0)
+        elif family == "tweedie": y = np.where(rng.random(n) < 0.3, 0.0, rng.gamma(2.0, np.exp(eta) / 2.0))
+        else: y = rng.poisson(rng.gamma(1 / 0.5, np.exp(eta) * 0.5)).astype(float)
+        return x1, x2, y
+
+    @pytest.mark.parametrize("family", list(SPEC))
+    def test_predict_ci_matches_reference(self, con, family):
+        fitm, cim, extra = self.SPEC[family]
+        x1, x2, y = self._data(family, 400 + len(family))
+        _load(con, "pdata", pd.DataFrame({"x1": x1, "x2": x2, "y": y}))
+        con.execute(f"CREATE OR REPLACE TABLE pmodel AS SELECT * FROM {fitm}('pdata','y'{extra})")
+        s = con.execute(f"SELECT prediction, conf_low, conf_high FROM {cim}('pmodel','pdata','y'{extra})").df()
+        beta = dict(con.execute("SELECT feature, coefficient FROM pmodel").fetchall())
+        X = np.column_stack([np.ones(len(y)), x1, x2])
+        b = np.array([beta["(Intercept)"], beta["x1"], beta["x2"]])
+        _, _, pw = self.SPEC[family]
+        pr, lo, hi = self._ref(X, y, b, family)
+        assert s["prediction"].values == pytest.approx(pr, rel=1e-6, abs=1e-9), family
+        assert s["conf_low"].values == pytest.approx(lo, rel=1e-6, abs=1e-9), family
+        assert s["conf_high"].values == pytest.approx(hi, rel=1e-6, abs=1e-9), family
+        # CI must bracket the point prediction
+        assert (s["conf_low"] < s["prediction"]).all() and (s["prediction"] < s["conf_high"]).all()
+
+    def test_newdata_and_passthrough(self, con):
+        x1, x2, y = self._data("poisson", 61)
+        _load(con, "pdata", pd.DataFrame({"x1": x1, "x2": x2, "y": y}))
+        con.execute("CREATE OR REPLACE TABLE pmodel AS SELECT * FROM poisson_fit('pdata','y')")
+        nd = pd.DataFrame({"label": ["a", "b", "c"], "x1": [0.0, 1.0, -0.5], "x2": [0.0, -1.0, 0.8]})
+        _load(con, "pnew", nd)
+        r = con.execute("SELECT * FROM poisson_predict_ci('pmodel','pdata','y', newdata := 'pnew')").df()
+        assert list(r.columns) == ["label", "x1", "x2", "prediction", "conf_low", "conf_high"]
+        assert list(r["label"]) == ["a", "b", "c"]  # passthrough preserved, order kept
+        beta = dict(con.execute("SELECT feature, coefficient FROM pmodel").fetchall())
+        X = np.column_stack([np.ones(len(y)), x1, x2]); b = np.array([beta["(Intercept)"], beta["x1"], beta["x2"]])
+        Xn = np.column_stack([np.ones(3), nd.x1, nd.x2])
+        pr, lo, hi = self._ref(X, y, b, "poisson", Xn=Xn)
+        assert r["prediction"].values == pytest.approx(pr, rel=1e-6)
+        assert r["conf_low"].values == pytest.approx(lo, rel=1e-6)
+
+    def test_prediction_equals_point_predict(self, con):
+        # the prediction column equals the plain *_predict output
+        x1, x2, y = self._data("gamma", 71)
+        _load(con, "pdata", pd.DataFrame({"x1": x1, "x2": x2, "y": y}))
+        con.execute("CREATE OR REPLACE TABLE pmodel AS SELECT * FROM gamma_fit('pdata','y')")
+        pci = con.execute("SELECT prediction FROM gamma_predict_ci('pmodel','pdata','y')").df()["prediction"].values
+        pp = con.execute("SELECT prediction FROM gamma_predict('pmodel','pdata')").df()["prediction"].values
+        assert pci == pytest.approx(pp, rel=1e-9)
+
+    def test_conf_level_widens(self, con):
+        x1, x2, y = self._data("poisson", 81)
+        _load(con, "pdata", pd.DataFrame({"x1": x1, "x2": x2, "y": y}))
+        con.execute("CREATE OR REPLACE TABLE pmodel AS SELECT * FROM poisson_fit('pdata','y')")
+        s95 = con.execute("SELECT conf_low, conf_high FROM poisson_predict_ci('pmodel','pdata','y')").df()
+        s99 = con.execute("SELECT conf_low, conf_high FROM poisson_predict_ci('pmodel','pdata','y', conf_level := 0.99)").df()
+        assert ((s99["conf_high"] - s99["conf_low"]) > (s95["conf_high"] - s95["conf_low"])).all()
+
+    def test_singular_null_ci_finite_prediction(self, con):
+        x1, x2, y = self._data("poisson", 91)
+        _load(con, "pdata", pd.DataFrame({"x1": x1, "x2": x2, "x1dup": x1, "y": y}))
+        con.execute("CREATE OR REPLACE TABLE pmodel AS SELECT * FROM poisson_fit('pdata','y')")
+        s = con.execute("SELECT prediction, conf_low, conf_high FROM poisson_predict_ci('pmodel','pdata','y')").df()
+        assert s["prediction"].notna().all()          # point prediction unaffected by singular Cov
+        assert s["conf_low"].isna().all() and s["conf_high"].isna().all()
+
+
+# --------------------------------------------------------------------------- #
 # Multinomial (softmax) inference (multinom_summary)
 # --------------------------------------------------------------------------- #
 class TestMultinomInference:

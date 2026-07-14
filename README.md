@@ -195,6 +195,28 @@ SELECT * FROM tweedie_predict('pure_premium', 'renewals');
 SELECT * FROM nbinom_predict('visits_model', 'new_patients');
 ```
 
+**Prediction intervals** (`*_predict_ci`) add a **confidence band on the
+predicted mean** to the point prediction. The coefficient covariance
+`φ·(XᵀWX)⁻¹` is estimated from the training table, giving each row's linear
+predictor a standard error `SE(η̂) = √(x̂ᵀ Cov x̂)`; the band is `g⁻¹(η̂ ± crit·SE)`
+back on the response scale (`prediction`, `conf_low`, `conf_high`). It matches
+R's `predict(..., se.fit=TRUE)` / statsmodels `get_prediction()`. Pass the model,
+the **training** data (for the covariance) and its outcome, and optionally a
+`newdata` table to score (default: the training data); `conf_level`, `offset_col`
+and `weights_col` behave as in the fit:
+
+```sql
+CREATE TABLE model AS SELECT * FROM poisson_fit('policies', 'n_claims');
+-- fitted means with a 95% band, in-sample:
+SELECT * FROM poisson_predict_ci('model', 'policies', 'n_claims');
+-- forecast new rows with a 99% band:
+SELECT * FROM poisson_predict_ci('model', 'policies', 'n_claims', newdata := 'new_policies', conf_level := 0.99);
+```
+
+The interval is on the **mean** (like the coefficient CIs, it is z-based for
+fixed-dispersion families and Student-t for the estimated-dispersion ones). A
+singular `XᵀWX` yields a finite `prediction` but NULL band.
+
 ## Evaluating: `logit_evaluate` / `linreg_evaluate` / `poisson_evaluate` / `gamma_evaluate`
 
 Scores `tbl` with a fitted model and its outcome column and returns a one-row

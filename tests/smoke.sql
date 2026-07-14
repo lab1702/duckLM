@@ -298,4 +298,20 @@ SELECT CASE
     ELSE error('SMOKE FAIL: robust SE output invalid')
   END;
 
+-- Prediction intervals: *_predict_ci returns a fitted mean with a confidence
+-- band that brackets it (one row per input), and wider at higher confidence.
+CREATE TABLE pcd AS SELECT (i%13-6)::DOUBLE AS x1, ((i*5)%9-4)::DOUBLE AS x2,
+  (i%6 + i%4)::DOUBLE AS y FROM range(400) g(i);
+CREATE TABLE pcm AS SELECT * FROM poisson_fit('pcd', 'y');
+SELECT CASE
+    WHEN (SELECT count(*) FROM poisson_predict_ci('pcm','pcd','y')) = (SELECT count(*) FROM pcd)
+     AND (SELECT bool_and(prediction > 0 AND isfinite(conf_high)
+                          AND conf_low < prediction AND prediction < conf_high)
+          FROM poisson_predict_ci('pcm','pcd','y'))
+     AND (SELECT sum(conf_high - conf_low) FROM poisson_predict_ci('pcm','pcd','y', conf_level := 0.99))
+       > (SELECT sum(conf_high - conf_low) FROM poisson_predict_ci('pcm','pcd','y'))
+    THEN 'PASS  *_predict_ci returns a bracketing confidence band, wider at higher confidence'
+    ELSE error('SMOKE FAIL: predict_ci output invalid')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;
