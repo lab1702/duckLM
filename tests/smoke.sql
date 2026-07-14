@@ -265,4 +265,17 @@ SELECT CASE
     ELSE error('SMOKE FAIL: multinom_summary output invalid')
   END;
 
+-- IRLS solver (solver := 'irls'): Fisher scoring reaches the same coefficients
+-- as the default gradient-descent solver, in far fewer iterations.
+CREATE TABLE irdat AS SELECT (i%10-5)::DOUBLE AS x1, ((i*3)%7-3)::DOUBLE AS x2,
+  (i%5 + i%3)::DOUBLE AS y FROM range(400) g(i);
+SELECT CASE
+    WHEN (SELECT max(abs(g.coefficient - r.coefficient))
+          FROM poisson_fit('irdat','y') g JOIN poisson_fit('irdat','y', solver := 'irls') r USING (feature)) < 1e-5
+     AND (SELECT max(abs(g.coefficient - r.coefficient))
+          FROM linreg_fit('irdat','y') g JOIN linreg_fit('irdat','y', solver := 'irls') r USING (feature)) < 1e-6
+    THEN 'PASS  irls solver reaches the same coefficients as gradient descent'
+    ELSE error('SMOKE FAIL: irls solver disagrees with gradient descent')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;

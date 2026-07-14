@@ -71,11 +71,29 @@ SELECT * FROM rev_model;
 | `l1` | `0.0` | lasso penalty `l1·Σ\|β\|` (feature selection); combine with `l2` for elastic net. Intercept unpenalized |
 | `offset_col` | `NULL` | name of a column holding a per-row **offset** added to the linear predictor `η = offset + xβ` with a fixed coefficient of 1 (not fit, not penalized) |
 | `weights_col` | `NULL` | name of a column of non-negative per-row **sample weights** — the loss (and internal standardization) are weighted by them |
+| `solver` | `'gd'` | `'gd'` = Nesterov gradient descent (default); `'irls'` = Fisher-scoring IRLS — far fewer iterations to the exact MLE (supports `l2`, offset, weights; not `l1`; needs full-rank features) |
 
 Coefficients are on the **original feature scale** (features — and for
 linear/Poisson/Gamma regression the outcome — are rescaled internally only
 for optimizer conditioning), so unpenalized results match R's `glm()`/`lm()`,
 statsmodels, or unpenalized scikit-learn up to convergence tolerance.
+
+**Solver.** The single-outcome families fit by Nesterov gradient descent by
+default. Passing `solver := 'irls'` switches to **Fisher scoring / iteratively
+reweighted least squares**, which solves a weighted least-squares system each
+iteration (a pure-SQL matrix inverse) and reaches the exact maximum-likelihood
+estimate in ~5–10 iterations rather than thousands — typically **several times
+to ~30× faster** (most for the log-link families), and matching statsmodels to
+machine precision (tighter than the GD path's `tol`). IRLS supports ridge
+(`l2`), offsets and weights, but **not** L1/elastic-net (use `'gd'` there), and
+it needs a full-rank design: perfectly collinear features or complete separation
+make `XᵀWX` singular and raise a clear error, where the default `'gd'` solver
+degrades gracefully instead.
+
+```sql
+-- identical coefficients to the default, far fewer iterations
+SELECT * FROM poisson_fit('policies', 'n_claims', solver := 'irls');
+```
 
 **Offset / exposure.** An offset is a known per-row term in the linear
 predictor — most often `log(exposure)` for a Poisson/Gamma rate model (claims

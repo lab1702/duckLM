@@ -129,7 +129,28 @@
 -- same name. The __reg_ prefix is reserved (and enforced below) so that
 -- shadowing cannot happen.
 
-CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1, alpha) AS TABLE
+-- Dense matrix inverse of a d x d DOUBLE[][] as a single scalar expression:
+-- Gauss-Jordan elimination folded over columns 1..d with list_reduce (the
+-- accumulator carries the augmented [A|I]). No pivoting -- intended for the
+-- symmetric positive-definite X'WX of the IRLS solver, whose pivots stay
+-- positive. Used inside the IRLS recursive CTE, where a recursive-CTE inverse
+-- cannot be nested.
+CREATE OR REPLACE MACRO __reg_matinv(A) AS (
+  list_transform(
+    list_reduce(
+      [ struct_pack(k := 0, M := list_transform(A, lambda row, i:
+            row || list_transform(row, lambda v, j: CASE WHEN i = j THEN 1.0 ELSE 0.0 END))) ]
+      || list_transform(range(1, len(A)+1), lambda i: struct_pack(k := i, M := [[0.0]]::DOUBLE[][])),
+      (acc, e) -> struct_pack(k := e.k, M :=
+        list_transform(acc.M, lambda row, i:
+          CASE WHEN i = e.k THEN list_transform(acc.M[e.k], lambda v, j: v / acc.M[e.k][e.k])
+               ELSE list_transform(row, lambda v, j: v - row[e.k]*(acc.M[e.k][j]/acc.M[e.k][e.k])) END))
+    ).M,
+    lambda row: list_slice(row, len(A)+1, 2*len(A))
+  )
+);
+
+CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1, alpha, solver) AS TABLE
 WITH RECURSIVE
 -- Every column cast to DOUBLE, with a synthetic row id.
 __reg_wide AS MATERIALIZED (
@@ -357,6 +378,10 @@ __reg_cfg AS (
                THEN error(caller || ': sample weights sum to zero')
              WHEN l2 < 0 THEN error(caller || ': l2 must be >= 0, got ' || l2)
              WHEN l1 < 0 THEN error(caller || ': l1 must be >= 0, got ' || l1)
+             WHEN solver NOT IN ('gd', 'irls')
+               THEN error(caller || ': solver must be ''gd'' or ''irls'', got ''' || solver || '''')
+             WHEN solver = 'irls' AND l1 > 0
+               THEN error(caller || ': the irls solver does not support L1 (lasso/elastic-net); use solver := ''gd'' for l1 > 0')
              -- Guaranteed-convergent steps: on standardized data the mean-loss
              -- gradient is L-Lipschitz with L <= (d+1)/4 (logistic, from the
              -- sigmoid derivative bound) or L <= d+1 (linear), plus l2 from the
@@ -475,15 +500,105 @@ __reg_gd AS (
                            list_transform(g.betas, lambda b, j:
                                b + (g.it::DOUBLE / (g.it + 3)) * (b - g.prev[j])) AS look
                     FROM __reg_gd g, __reg_packed p, __reg_cfg c
-                    WHERE g.it < max_iter AND g.move >= tol
+                    WHERE g.it < max_iter AND g.move >= tol AND solver != 'irls'
                 )
             )
         )
         )
     )
 ),
+-- IRLS / Fisher scoring (solver := 'irls'): each iteration solves the weighted
+-- least squares beta <- (X'WX + sumw*l2*D)^-1 X'W z on the standardized data,
+-- where W is the expected-information working weight and z the working response.
+-- Converges to the exact (penalized) MLE in ~5-10 iterations; the matrix solve
+-- uses the __reg_matinv fold (a recursive-CTE inverse cannot nest here). D omits
+-- the intercept. Gated by solver = 'irls' so it is inert (base row only) under
+-- the default gradient-descent solver, and vice versa.
+__reg_irls(it, betas, move) AS (
+    -- cross-join __reg_cfg and touch c.step so ALL input validation (which lives
+    -- in the step CASE: l2/l1 sign, bad solver, l1-with-irls, missing offset/
+    -- weights) fires for the irls path too, not just gradient descent
+    SELECT 0, list_transform(range(f.d + 1), lambda i: 0.0::DOUBLE), 1e308::DOUBLE
+    FROM __reg_feats f, __reg_cfg c
+    WHERE c.step IS NOT NULL
+    UNION ALL
+    SELECT it + 1, betas_new,
+           list_aggregate(list_transform(betas_new, lambda v, j: abs(v - betas[j])), 'max')
+    FROM (
+        SELECT it, betas, list_transform(inv, lambda invrow: list_dot_product(invrow, XWr)) AS betas_new
+        FROM (
+            SELECT it, betas, XWr, __reg_matinv(XWXpen) AS inv
+            FROM (
+                -- ridge penalty on the diagonal (intercept at position 1 unpenalized)
+                SELECT it, betas, XWr,
+                       list_transform(XWX, lambda row, a:
+                           list_transform(row, lambda v, b:
+                               CASE WHEN a = b AND a > 1 THEN v + sumw * l2 ELSE v END)) AS XWXpen
+                FROM (
+                    SELECT it, betas, sumw,
+                           list_transform(range(1, len(betas) + 1), lambda a:
+                               list_transform(range(1, len(betas) + 1), lambda b:
+                                   list_sum(list_transform(res, lambda ob: ob.wirls * ob.xs[a] * ob.xs[b])))) AS XWX,
+                           list_transform(range(1, len(betas) + 1), lambda a:
+                               list_sum(list_transform(res, lambda ob: ob.wr * ob.xs[a]))) AS XWr
+                    FROM (
+                        -- per row: expected-info weight wirls, and wr = wirls*(xs.beta) + w*residual
+                        SELECT it, betas, sumw,
+                               list_transform(mus, lambda e: struct_pack(
+                                   xs := e.xs,
+                                   wirls := e.w * (CASE family
+                                              WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
+                                              WHEN 'linear'   THEN 1.0
+                                              WHEN 'poisson'  THEN e.mu
+                                              WHEN 'gamma'    THEN 1.0
+                                              WHEN 'tweedie'  THEN pow(e.mu, 2.0 - power)
+                                              WHEN 'nbinom'   THEN e.mu / (1.0 + alpha_int * e.mu) END),
+                                   wr := e.w * ((CASE family
+                                              WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
+                                              WHEN 'linear'   THEN 1.0
+                                              WHEN 'poisson'  THEN e.mu
+                                              WHEN 'gamma'    THEN 1.0
+                                              WHEN 'tweedie'  THEN pow(e.mu, 2.0 - power)
+                                              WHEN 'nbinom'   THEN e.mu / (1.0 + alpha_int * e.mu) END) * e.linpred
+                                          + (CASE family
+                                              WHEN 'gamma'    THEN e.y / e.mu - 1.0
+                                              WHEN 'tweedie'  THEN (e.y - e.mu) * pow(e.mu, 1.0 - power)
+                                              WHEN 'nbinom'   THEN (e.y - e.mu) / (1.0 + alpha_int * e.mu)
+                                              ELSE e.y - e.mu END))
+                                   )) AS res
+                        FROM (
+                            SELECT g.it, g.betas, p.sumw, c.alpha_int AS alpha_int,
+                                   list_transform(p.rows, lambda rw: struct_pack(
+                                       xs := rw.xs, w := rw.w, y := rw.y,
+                                       linpred := list_dot_product(rw.xs, g.betas),
+                                       mu := CASE family
+                                               WHEN 'logistic' THEN 1.0 / (1.0 + exp(-greatest(least(list_dot_product(rw.xs, g.betas) + rw.o, 700.0), -700.0)))
+                                               WHEN 'linear'   THEN list_dot_product(rw.xs, g.betas) + rw.o
+                                               ELSE exp(greatest(least(list_dot_product(rw.xs, g.betas) + rw.o, 700.0), -700.0)) END
+                                       )) AS mus
+                            FROM __reg_irls g, __reg_packed p, __reg_cfg c
+                            -- isfinite() stops promptly on a singular step (NaN move),
+                            -- since NaN >= tol is TRUE in DuckDB and would otherwise loop
+                            WHERE g.it < max_iter AND g.move >= tol AND isfinite(g.move) AND solver = 'irls'
+                        )
+                    )
+                )
+            )
+        )
+    )
+),
 __reg_sol AS (
-    SELECT betas FROM __reg_gd ORDER BY it DESC LIMIT 1
+    -- IRLS produces non-finite coefficients on a singular X'WX (perfectly
+    -- collinear features or complete separation); fail clearly rather than
+    -- return NaN. The default gradient-descent solver stays finite, so this
+    -- only ever fires for solver := 'irls'.
+    SELECT CASE WHEN list_aggregate(list_transform(b.betas, lambda v: isfinite(v)), 'bool_and')
+                THEN b.betas
+                ELSE error(caller || ': the irls solver did not converge -- X''WX is singular '
+                           || '(perfectly collinear features, or complete separation for logistic). '
+                           || 'Use the default solver := ''gd'', or add l2 ridge.') END AS betas
+    FROM (SELECT betas FROM (SELECT it, betas FROM __reg_gd UNION ALL SELECT it, betas FROM __reg_irls)
+          ORDER BY it DESC LIMIT 1) b
 )
 -- Map standardized-scale coefficients back to the original scales of x and y.
 -- Linear/logistic: the outcome scaling multiplies the whole linear predictor,
@@ -591,11 +706,11 @@ LEFT JOIN __reg_offset o ON o.rid = n.__reg_rid__;
 -- Public wrappers
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE MACRO logit_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'logistic', 'logit_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL);
+CREATE OR REPLACE MACRO logit_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'gd') AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'logistic', 'logit_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL, solver);
 
-CREATE OR REPLACE MACRO linreg_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'linear', 'linreg_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL);
+CREATE OR REPLACE MACRO linreg_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'gd') AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'linear', 'linreg_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL, solver);
 
 CREATE OR REPLACE MACRO logit_predict(model, tbl, threshold := 0.5, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
@@ -610,8 +725,8 @@ SELECT * EXCLUDE (__reg_rid__, __reg_score__),
 FROM __reg_score(model, tbl, 'linreg_predict', offset_col)
 ORDER BY __reg_rid__;
 
-CREATE OR REPLACE MACRO poisson_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'poisson', 'poisson_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL);
+CREATE OR REPLACE MACRO poisson_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'gd') AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'poisson', 'poisson_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL, solver);
 
 CREATE OR REPLACE MACRO poisson_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
@@ -619,8 +734,8 @@ SELECT * EXCLUDE (__reg_rid__, __reg_score__),
 FROM __reg_score(model, tbl, 'poisson_predict', offset_col)
 ORDER BY __reg_rid__;
 
-CREATE OR REPLACE MACRO gamma_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'gamma', 'gamma_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL);
+CREATE OR REPLACE MACRO gamma_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'gd') AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'gamma', 'gamma_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL, solver);
 
 CREATE OR REPLACE MACRO gamma_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
@@ -632,8 +747,8 @@ ORDER BY __reg_rid__;
 -- Poisson (p=1) and Gamma (p=2); 1<p<2 is the compound Poisson-Gamma that
 -- admits exact zeros alongside positive values (e.g. insurance pure premium).
 -- Matches sklearn TweedieRegressor(power=p, alpha=0, link='log').
-CREATE OR REPLACE MACRO tweedie_fit(tbl, outcome, power := 1.5, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'tweedie', 'tweedie_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1, NULL);
+CREATE OR REPLACE MACRO tweedie_fit(tbl, outcome, power := 1.5, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'gd') AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'tweedie', 'tweedie_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1, NULL, solver);
 
 CREATE OR REPLACE MACRO tweedie_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
@@ -645,8 +760,8 @@ ORDER BY __reg_rid__;
 -- fixed dispersion (variance = mu + alpha*mu^2); alpha -> 0 recovers Poisson.
 -- Matches statsmodels GLM NegativeBinomial(alpha=alpha) (fixed dispersion);
 -- alpha is a hyperparameter here, not estimated.
-CREATE OR REPLACE MACRO nbinom_fit(tbl, outcome, alpha := 1.0, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0) AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'nbinom', 'nbinom_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, alpha);
+CREATE OR REPLACE MACRO nbinom_fit(tbl, outcome, alpha := 1.0, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'gd') AS TABLE
+SELECT * FROM __reg_fit(tbl, outcome, 'nbinom', 'nbinom_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, alpha, solver);
 
 CREATE OR REPLACE MACRO nbinom_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),

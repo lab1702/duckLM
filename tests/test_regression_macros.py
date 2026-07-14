@@ -1690,6 +1690,91 @@ class TestMultinomInference:
 
 
 # --------------------------------------------------------------------------- #
+# IRLS / Fisher-scoring solver (solver := 'irls')
+# --------------------------------------------------------------------------- #
+class TestIRLS:
+    def _gen(self, family, seed, n=1500):
+        rng = np.random.default_rng(seed)
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        eta = 0.5 + 0.7 * x1 - 0.4 * x2
+        if family == "logistic":
+            y = rng.binomial(1, 1 / (1 + np.exp(-eta))).astype(float)
+        elif family == "linear":
+            y = 2 + 1.5 * x1 - 0.8 * x2 + rng.normal(0, 1.5, n)
+        elif family == "poisson":
+            y = rng.poisson(np.exp(eta)).astype(float)
+        elif family == "gamma":
+            y = rng.gamma(2.0, np.exp(eta) / 2.0)
+        elif family == "tweedie":
+            y = np.where(rng.random(n) < 0.3, 0.0, rng.gamma(2.0, np.exp(eta) / 2.0))
+        else:  # nbinom
+            y = rng.poisson(rng.gamma(1 / 0.5, np.exp(eta) * 0.5)).astype(float)
+        return pd.DataFrame({"x1": x1, "x2": x2, "y": y})
+
+    @pytest.mark.parametrize("macro,family,extra", [
+        ("logit_fit", "logistic", ""), ("linreg_fit", "linear", ""),
+        ("poisson_fit", "poisson", ""), ("gamma_fit", "gamma", ""),
+        ("tweedie_fit", "tweedie", ", power := 1.5"), ("nbinom_fit", "nbinom", ", alpha := 0.5"),
+    ])
+    def test_irls_matches_gd(self, con, macro, family, extra):
+        # IRLS reaches the same MLE as the default gradient-descent solver
+        _load(con, "irtrain", self._gen(family, 300 + len(macro)))
+        gd = dict(con.execute(f"SELECT feature, coefficient FROM {macro}('irtrain','y'{extra})").fetchall())
+        ir = dict(con.execute(f"SELECT feature, coefficient FROM {macro}('irtrain','y'{extra}, solver := 'irls')").fetchall())
+        for k in gd:
+            assert ir[k] == pytest.approx(gd[k], rel=1e-5, abs=1e-6), (macro, k)
+
+    def test_irls_linear_is_exact_ols(self, con):
+        # Gaussian identity-link IRLS is exactly OLS (converges in one step)
+        df = self._gen("linear", 11); _load(con, "irtrain", df)
+        ir = dict(con.execute("SELECT feature, coefficient FROM linreg_fit('irtrain','y', solver := 'irls')").fetchall())
+        X = np.column_stack([np.ones(len(df)), df.x1, df.x2])
+        beta = np.linalg.lstsq(X, df.y.values, rcond=None)[0]
+        assert [ir["(Intercept)"], ir["x1"], ir["x2"]] == pytest.approx(beta, rel=1e-8)
+
+    def test_irls_ridge_matches_gd(self, con):
+        _load(con, "irtrain", self._gen("poisson", 22))
+        gd = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('irtrain','y', l2 := 0.5)").fetchall())
+        ir = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('irtrain','y', l2 := 0.5, solver := 'irls')").fetchall())
+        for k in gd:
+            assert ir[k] == pytest.approx(gd[k], rel=1e-5, abs=1e-6)
+
+    def test_irls_offset_weights_matches_gd(self, con):
+        rng = np.random.default_rng(5); n = 1500
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        off, wt = rng.normal(0, 0.4, n), rng.uniform(0.5, 2, n)
+        y = rng.poisson(np.exp(0.4 + 0.6 * x1 - 0.3 * x2 + off)).astype(float)
+        _load(con, "irtrain", pd.DataFrame({"x1": x1, "x2": x2, "e": off, "w": wt, "y": y}))
+        gd = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('irtrain','y', offset_col := 'e', weights_col := 'w')").fetchall())
+        ir = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('irtrain','y', offset_col := 'e', weights_col := 'w', solver := 'irls')").fetchall())
+        for k in gd:
+            assert ir[k] == pytest.approx(gd[k], rel=1e-5, abs=1e-6)
+
+    def test_irls_validation_errors(self, con):
+        _load(con, "irtrain", self._gen("poisson", 7))
+        for sql, msg in [
+            ("poisson_fit('irtrain','y', solver := 'irls', l1 := 0.1)", "does not support L1"),
+            ("poisson_fit('irtrain','y', solver := 'badname')", "must be"),
+            ("poisson_fit('irtrain','y', solver := 'irls', l2 := -1.0)", "l2 must be"),
+        ]:
+            with pytest.raises(DuckDBError) as e:
+                con.execute(f"SELECT * FROM {sql}").fetchall()
+            assert msg in str(e.value)
+
+    def test_irls_singular_errors_not_nan(self, con):
+        # a perfectly collinear feature makes X'WX singular -> IRLS errors
+        # clearly (and promptly) rather than returning NaN or looping to max_iter
+        df = self._gen("poisson", 8); df["x1dup"] = df["x1"]
+        _load(con, "irtrain", df)
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM poisson_fit('irtrain','y', solver := 'irls')").fetchall()
+        assert "did not converge" in str(e.value)
+        # the default gd solver still handles the same data without erroring
+        n = con.execute("SELECT count(*) FROM poisson_fit('irtrain','y', max_iter := 200)").fetchone()[0]
+        assert n == 4  # intercept + 3 features
+
+
+# --------------------------------------------------------------------------- #
 # Error handling & reserved names
 # --------------------------------------------------------------------------- #
 class TestErrors:
