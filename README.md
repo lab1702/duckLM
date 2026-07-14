@@ -255,6 +255,27 @@ SELECT feature, coefficient, conf_low, conf_high
 FROM gamma_summary('model', 'claims', 'cost', weights_col := 'exposure', conf_level := 0.99);
 ```
 
+**Robust & cluster-robust standard errors.** Pass `robust := 'hc0'` (or `'hc1'`,
+`'hc2'`, `'hc3'`) for heteroskedasticity-consistent *sandwich* SEs
+`(XᵀWX)⁻¹ B (XᵀWX)⁻¹` — valid when the variance model is misspecified
+(over/under-dispersion, heteroskedasticity). Pass `cluster_col` for one-way
+cluster-robust SEs (correlated observations within a group — panel/repeated
+measures). Both are **dispersion-free and z-based**, use the observed-information
+bread (so they match **statsmodels** `cov_type='HC0'`/`'cluster'` to machine
+precision for every family), and compose with weights and offsets:
+
+```sql
+-- heteroskedasticity-robust
+SELECT * FROM poisson_summary('model', 'claims', 'n', robust := 'hc0');
+-- clustered by region (correlated within region)
+SELECT * FROM poisson_summary('model', 'claims', 'n', cluster_col := 'region');
+```
+
+`hc0` is the White estimator; `hc1` applies the `n/(n−d)` correction; `hc2`/`hc3`
+divide the squared residual by `(1−hᵢ)` / `(1−hᵢ)²` using the GLM leverage
+`hᵢ` (`hc3` is the recommended default for small samples). Cluster-robust uses
+the Stata finite-sample factor `(G/(G−1))·((n−1)/(n−d))`.
+
 The **reference distribution** follows R's `glm`/`lm` convention: the `statistic`
 is a **z**-score with a normal p-value/CI when the dispersion is fixed
 (`logit`/`poisson`/`nbinom`), and a **t**-score with `n − d` degrees of freedom

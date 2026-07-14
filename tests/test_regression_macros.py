@@ -1626,6 +1626,147 @@ class TestInference:
 
 
 # --------------------------------------------------------------------------- #
+# Robust / cluster-robust (sandwich) standard errors
+# --------------------------------------------------------------------------- #
+class TestRobustSE:
+    def _ref(self, X, y, beta, family, robust="hc0", cluster=None, weights=None, alpha=0.5, power=1.5):
+        # sandwich Cov = A^-1 B A^-1, observed-info bread A, per-family hw and residual r
+        n, d = X.shape
+        a = np.ones(n) if weights is None else np.asarray(weights, float)
+        eta = X @ beta
+        if family == "logistic":
+            mu = 1 / (1 + np.exp(-eta)); hw = mu * (1 - mu); r = y - mu
+        elif family == "linear":
+            mu = eta; hw = np.ones(n); r = y - mu
+        else:
+            mu = np.exp(eta)
+            if family == "poisson": hw = mu; r = y - mu
+            elif family == "gamma": hw = y / mu; r = (y - mu) / mu
+            elif family == "tweedie": hw = (2 - power) * mu ** (2 - power) + (power - 1) * y * mu ** (1 - power); r = (y - mu) * mu ** (1 - power)
+            else: hw = mu * (1 + alpha * y) / (1 + alpha * mu) ** 2; r = (y - mu) / (1 + alpha * mu)
+        A = np.linalg.inv((X * (a * hw)[:, None]).T @ X)
+        h = np.einsum("ij,jk,ik->i", X, A, X) * (a * hw)
+        if cluster is not None:
+            S = (a * r)[:, None] * X; B = np.zeros((d, d))
+            for gi in np.unique(cluster):
+                sg = S[cluster == gi].sum(0); B += np.outer(sg, sg)
+            G = len(np.unique(cluster)); c = (G / (G - 1)) * ((n - 1) / (n - d))
+        else:
+            c = 1.0
+            if robust == "hc0": mw = a * r ** 2
+            elif robust == "hc1": mw = a * r ** 2; c = n / (n - d)
+            elif robust == "hc2": mw = a * r ** 2 / (1 - h)
+            else: mw = a * r ** 2 / (1 - h) ** 2  # hc3
+            B = X.T @ (mw[:, None] * X)
+        return np.sqrt(np.diag(A @ B @ A) * c)
+
+    def _fit_and_summary(self, con, fitmacro, summacro, feat_df, y, summ_args, weights=None):
+        cols = {**feat_df, "y": y}
+        _load(con, "rfit", pd.DataFrame({**cols, **({"w": weights} if weights is not None else {})}))
+        con.execute(f"CREATE OR REPLACE TABLE rmodel AS SELECT * FROM {fitmacro}('rfit','y'"
+                    + (", weights_col := 'w'" if weights is not None else "") + ")")
+        beta = dict(con.execute("SELECT feature, coefficient FROM rmodel").fetchall())
+        s = con.execute(f"SELECT feature, coefficient, std_error, statistic, p_value, conf_low, conf_high "
+                        f"FROM {summacro}('rmodel','rdata','y'{summ_args})").df().set_index("feature")
+        return beta, s
+
+    @pytest.mark.parametrize("robust", ["hc0", "hc1", "hc2", "hc3"])
+    def test_hc_variants_match_reference(self, con, robust):
+        rng = np.random.default_rng(30 + len(robust)); n = 1200
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        y = rng.poisson(np.exp(0.5 + 0.7 * x1 - 0.4 * x2)).astype(float)
+        _load(con, "rdata", pd.DataFrame({"x1": x1, "x2": x2, "y": y}))
+        beta, s = self._fit_and_summary(con, "poisson_fit", "poisson_summary",
+                                        {"x1": x1, "x2": x2}, y, f", robust := '{robust}'")
+        s = s.loc[["(Intercept)", "x1", "x2"]]
+        X = np.column_stack([np.ones(n), x1, x2])
+        b = np.array([beta["(Intercept)"], beta["x1"], beta["x2"]])
+        se = self._ref(X, y, b, "poisson", robust=robust)
+        assert s["std_error"].values == pytest.approx(se, rel=1e-6, abs=1e-9), robust
+
+    def test_hc0_all_families(self, con):
+        rng = np.random.default_rng(51); n = 1500
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        eta = 0.5 + 0.6 * x1 - 0.3 * x2
+        specs = [
+            ("logit_fit", "logit_summary", "logistic", rng.binomial(1, 1 / (1 + np.exp(-eta))).astype(float), ""),
+            ("linreg_fit", "linreg_summary", "linear", 2 + 1.5 * x1 - 0.8 * x2 + rng.normal(0, 1.5, n), ""),
+            ("gamma_fit", "gamma_summary", "gamma", rng.gamma(2.0, np.exp(eta) / 2.0), ""),
+            ("tweedie_fit", "tweedie_summary", "tweedie", np.where(rng.random(n) < 0.3, 0.0, rng.gamma(2.0, np.exp(eta) / 2.0)), ", power := 1.5"),
+            ("nbinom_fit", "nbinom_summary", "nbinom", rng.poisson(rng.gamma(1 / 0.5, np.exp(eta) * 0.5)).astype(float), ", alpha := 0.5"),
+        ]
+        X = np.column_stack([np.ones(n), x1, x2])
+        for fitm, summ, fam, y, extra in specs:
+            _load(con, "rdata", pd.DataFrame({"x1": x1, "x2": x2, "y": y}))
+            beta, s = self._fit_and_summary(con, fitm, summ, {"x1": x1, "x2": x2}, y, extra + ", robust := 'hc0'")
+            s = s.loc[["(Intercept)", "x1", "x2"]]
+            b = np.array([beta["(Intercept)"], beta["x1"], beta["x2"]])
+            se = self._ref(X, y, b, fam, robust="hc0")
+            assert s["std_error"].values == pytest.approx(se, rel=1e-6, abs=1e-9), fam
+
+    def test_cluster_matches_reference(self, con):
+        rng = np.random.default_rng(61); n = 1500
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        grp = rng.integers(0, 35, n).astype(float)
+        y = rng.poisson(np.exp(0.5 + 0.7 * x1 - 0.4 * x2)).astype(float)
+        _load(con, "rdata", pd.DataFrame({"x1": x1, "x2": x2, "grp": grp, "y": y}))
+        beta, s = self._fit_and_summary(con, "poisson_fit", "poisson_summary",
+                                        {"x1": x1, "x2": x2}, y, ", cluster_col := 'grp'")
+        s = s.loc[["(Intercept)", "x1", "x2"]]
+        X = np.column_stack([np.ones(n), x1, x2])
+        b = np.array([beta["(Intercept)"], beta["x1"], beta["x2"]])
+        se = self._ref(X, y, b, "poisson", cluster=grp)
+        assert s["std_error"].values == pytest.approx(se, rel=1e-6, abs=1e-9)
+
+    def test_weighted_robust_uses_first_power(self, con):
+        rng = np.random.default_rng(71); n = 1500
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        wt = rng.uniform(0.5, 2.0, n)
+        y = rng.poisson(np.exp(0.5 + 0.7 * x1 - 0.4 * x2)).astype(float)
+        _load(con, "rdata", pd.DataFrame({"x1": x1, "x2": x2, "w": wt, "y": y}))
+        beta, s = self._fit_and_summary(con, "poisson_fit", "poisson_summary", {"x1": x1, "x2": x2}, y,
+                                        ", weights_col := 'w', robust := 'hc0'", weights=wt)
+        s = s.loc[["(Intercept)", "x1", "x2"]]
+        X = np.column_stack([np.ones(n), x1, x2])
+        b = np.array([beta["(Intercept)"], beta["x1"], beta["x2"]])
+        se = self._ref(X, y, b, "poisson", robust="hc0", weights=wt)
+        assert s["std_error"].values == pytest.approx(se, rel=1e-6, abs=1e-9)
+
+    def test_robust_uses_z_not_t(self, con):
+        # gamma has estimated dispersion (model-based uses t); robust switches to z
+        from scipy import stats as st
+        rng = np.random.default_rng(81); n = 400
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        y = rng.gamma(2.0, np.exp(0.5 + 0.6 * x1 - 0.3 * x2) / 2.0)
+        _load(con, "rdata", pd.DataFrame({"x1": x1, "x2": x2, "y": y}))
+        _, sm = self._fit_and_summary(con, "gamma_fit", "gamma_summary", {"x1": x1, "x2": x2}, y, "")
+        _, sr = self._fit_and_summary(con, "gamma_fit", "gamma_summary", {"x1": x1, "x2": x2}, y, ", robust := 'hc0'")
+        crit_model = ((sm["conf_high"] - sm["coefficient"]) / sm["std_error"]).iloc[0]
+        crit_robust = ((sr["conf_high"] - sr["coefficient"]) / sr["std_error"]).iloc[0]
+        assert crit_model == pytest.approx(st.t.ppf(0.975, n - 3), rel=1e-6)   # t
+        assert crit_robust == pytest.approx(st.norm.ppf(0.975), rel=1e-6)       # z
+
+    def test_robust_bad_value_errors(self, con):
+        rng = np.random.default_rng(91); n = 200
+        x1 = rng.normal(0, 1, n); y = rng.poisson(np.exp(0.3 + 0.5 * x1)).astype(float)
+        _load(con, "rdata", pd.DataFrame({"x1": x1, "y": y}))
+        con.execute("CREATE OR REPLACE TABLE rmodel AS SELECT * FROM poisson_fit('rdata','y')")
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM poisson_summary('rmodel','rdata','y', robust := 'hc9')").fetchall()
+        assert "robust must be one of" in str(e.value)
+
+    def test_robust_saturated_null(self, con):
+        # n == d (saturated, df 0): robust variance is undefined -> NULL for every
+        # variant (hc2/hc3 must not leak a 0/0 finite artifact), no crash
+        con.execute("CREATE OR REPLACE TABLE rdata AS SELECT * FROM "
+                    "(VALUES (0.3,1.0,2.1),(1.1,-0.5,3.4),(-0.7,2.0,1.2)) v(x1,x2,y)")
+        con.execute("CREATE OR REPLACE TABLE rmodel AS SELECT * FROM linreg_fit('rdata','y')")
+        for rob in ["hc0", "hc1", "hc2", "hc3"]:
+            s = con.execute(f"SELECT std_error FROM linreg_summary('rmodel','rdata','y', robust := '{rob}')").df()
+            assert s["std_error"].isna().all(), rob
+
+
+# --------------------------------------------------------------------------- #
 # Multinomial (softmax) inference (multinom_summary)
 # --------------------------------------------------------------------------- #
 class TestMultinomInference:

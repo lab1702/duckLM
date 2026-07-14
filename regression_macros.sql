@@ -1676,7 +1676,8 @@ CREATE OR REPLACE MACRO t_ppf(p, df) AS ( __reg_t_ppf(p::DOUBLE, df::DOUBLE) );
 
 -- ---- Shared coefficient-inference core -------------------------------------
 CREATE OR REPLACE MACRO __reg_summary(model, tbl, outcome, family, caller,
-                                      conf_level, offset_col, weights_col, power, alpha) AS TABLE
+                                      conf_level, offset_col, weights_col, power, alpha,
+                                      robust, cluster_col) AS TABLE
 WITH RECURSIVE
 mdl AS (SELECT feature, coefficient FROM query_table(model)),
 beta AS (
@@ -1696,6 +1697,7 @@ alllong AS (
 yv AS (SELECT rid, v AS y  FROM alllong WHERE col = outcome),
 ov AS (SELECT rid, v AS o  FROM alllong WHERE col = offset_col),
 wv AS (SELECT rid, v AS wt FROM alllong WHERE col = weights_col),
+clv AS (SELECT rid, v AS cl FROM alllong WHERE col = cluster_col),
 feat AS (
   SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY l.col) AS xs, count(*)::INT AS nf
   FROM alllong l JOIN mdl m ON m.feature = l.col AND m.feature != '(Intercept)'
@@ -1801,46 +1803,122 @@ disp AS (
          family IN ('linear','gamma','tweedie') AS est,
          (SELECT (n-d)::DOUBLE FROM dims) AS df
 ),
-final AS (
-  SELECT b.names AS names, b.bvec AS bvec, c.Rinv AS Rinv, s.dsc AS dsc,
-         dp.phi AS phi, dp.est AS est, dp.df AS df,
-         CASE WHEN dp.est AND dp.df > 0.0 THEN t_ppf(1.0-(1.0-conf_level)/2.0, dp.df)
-              WHEN dp.est THEN NULL
-              ELSE norm_ppf(1.0-(1.0-conf_level)/2.0) END AS crit
-  FROM beta b CROSS JOIN covinv c CROSS JOIN scal s CROSS JOIN disp dp
+-- ---- Robust (sandwich) covariance: Cov = A^-1 B A^-1 -----------------------
+-- Computed alongside the model-based covariance; selected when robust != 'none'
+-- or cluster_col is given. A = X'diag(a*hw)X uses the OBSERVED-info weight hw
+-- (matches statsmodels for the non-canonical log-link families); the meat B is
+-- the score-outer-product. Dispersion-free -> z inference. e_i = the GD residual.
+robrow AS (
+  SELECT rww.rid, rww.xs, rww.wt, cl.cl AS cl,
+         rww.wt * (CASE family
+                     WHEN 'logistic' THEN mu*(1.0-mu)  WHEN 'linear' THEN 1.0
+                     WHEN 'poisson'  THEN mu
+                     WHEN 'gamma'    THEN rww.y/mu
+                     WHEN 'tweedie'  THEN (2.0-power)*pow(mu,2.0-power) + (power-1.0)*rww.y*pow(mu,1.0-power)
+                     WHEN 'nbinom'   THEN mu*(1.0+alpha*rww.y)/pow(1.0+alpha*mu,2.0) END) AS hwt,
+         rww.wt * (CASE family
+                     WHEN 'gamma'   THEN (rww.y-mu)/mu
+                     WHEN 'tweedie' THEN (rww.y-mu)*pow(mu,1.0-power)
+                     WHEN 'nbinom'  THEN (rww.y-mu)/(1.0+alpha*mu)
+                     ELSE rww.y-mu END) AS sc                       -- score scalar = a*r
+  FROM rww LEFT JOIN clv cl ON cl.rid = rww.rid
 ),
--- per-coefficient variance with guards: NULL (not a crash / garbage) when the
--- covariance is singular (Rinv NULL), non-finite, or non-positive
+rdims AS (SELECT count(DISTINCT cl)::INT AS G FROM robrow),
+breadA AS (
+  SELECT list(rowlist ORDER BY a) AS A FROM (
+    SELECT a, list(val ORDER BY b) AS rowlist FROM (
+      SELECT p.a AS a, p.b AS b, sum(robrow.hwt * robrow.xs[p.a] * robrow.xs[p.b]) AS val
+      FROM robrow, pairs p GROUP BY p.a, p.b) GROUP BY a)
+),
+breadinv AS (
+  SELECT list_transform(RAinv, lambda row, i: list_transform(row, lambda v, j: v/(dscA[i]*dscA[j]))) AS Ainv
+  FROM (SELECT dscA, __reg_matinv(list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dscA[i]*dscA[j])))) AS RAinv
+        FROM (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dscA FROM breadA))
+),
+lev AS (
+  SELECT r.xs, r.sc, r.cl, r.wt,
+         r.hwt * list_sum(list_transform(r.xs, lambda xa, a: xa * list_dot_product(bi.Ainv[a], r.xs))) AS h
+  FROM robrow r CROSS JOIN breadinv bi
+),
+meat_hc AS (
+  SELECT list(rowlist ORDER BY a) AS B FROM (
+    SELECT a, list(val ORDER BY b) AS rowlist FROM (
+      SELECT p.a AS a, p.b AS b,
+             sum((CASE WHEN robust = 'hc2' THEN m.sc*m.sc/m.wt/(1.0-m.h)
+                       WHEN robust = 'hc3' THEN m.sc*m.sc/m.wt/((1.0-m.h)*(1.0-m.h))
+                       ELSE m.sc*m.sc/m.wt END) * m.xs[p.a] * m.xs[p.b]) AS val
+      FROM lev m, pairs p GROUP BY p.a, p.b) GROUP BY a)
+),
+clsg AS (
+  SELECT cl, list(sga ORDER BY a) AS sg FROM (
+    SELECT l.cl, ix.i AS a, sum(l.sc * l.xs[ix.i]) AS sga FROM lev l, idx ix GROUP BY l.cl, ix.i) GROUP BY cl
+),
+meat_cl AS (
+  SELECT list(rowlist ORDER BY a) AS B FROM (
+    SELECT a, list(val ORDER BY b) AS rowlist FROM (
+      SELECT p.a AS a, p.b AS b, sum(c.sg[p.a] * c.sg[p.b]) AS val
+      FROM clsg c, pairs p GROUP BY p.a, p.b) GROUP BY a)
+),
+robvar AS (
+  SELECT list_transform(range(1, dm.d+1), lambda j:
+      (CASE WHEN cluster_col IS NOT NULL
+            THEN (rd.G::DOUBLE/(rd.G-1)) * ((dm.n-1.0)/(dm.n-dm.d))
+            WHEN robust = 'hc1' THEN dm.n::DOUBLE/(dm.n-dm.d) ELSE 1.0 END)
+      * list_sum(list_transform(bi.Ainv[j], lambda va, a: va * list_dot_product(bm.B[a], bi.Ainv[j])))) AS rv
+  FROM breadinv bi
+       CROSS JOIN (SELECT CASE WHEN cluster_col IS NOT NULL THEN (SELECT B FROM meat_cl) ELSE (SELECT B FROM meat_hc) END AS B) bm
+       CROSS JOIN dims dm CROSS JOIN rdims rd
+),
+robchk AS (
+  SELECT CASE WHEN robust NOT IN ('none','hc0','hc1','hc2','hc3')
+              THEN error(caller || ': robust must be one of ''none'',''hc0'',''hc1'',''hc2'',''hc3''; got ''' || robust || '''')
+              ELSE true END AS ok
+),
+final AS (
+  SELECT b.names AS names, b.bvec AS bvec, c.Rinv AS Rinv, s.dsc AS dsc, rv.rv AS rv,
+         dp.phi AS phi, dp.est AS est, dp.df AS df,
+         (robust != 'none' OR cluster_col IS NOT NULL) AS robactive,
+         (dp.est AND dp.df > 0.0 AND robust = 'none' AND cluster_col IS NULL) AS uset,
+         CASE WHEN dp.est AND dp.df > 0.0 AND robust = 'none' AND cluster_col IS NULL
+                THEN t_ppf(1.0-(1.0-conf_level)/2.0, dp.df)
+              ELSE norm_ppf(1.0-(1.0-conf_level)/2.0) END AS crit
+  FROM beta b CROSS JOIN covinv c CROSS JOIN scal s CROSS JOIN disp dp CROSS JOIN robvar rv
+       CROSS JOIN robchk rc WHERE rc.ok
+),
+-- per-coefficient SE with guards: NULL when the covariance is singular / non-finite / non-positive
 percoef AS (
-  SELECT gs.i AS i, names[gs.i] AS feature, bvec[gs.i] AS coefficient, est, df, crit,
-         CASE WHEN Rinv IS NOT NULL
-               AND isfinite(phi * Rinv[gs.i][gs.i])
-               AND phi * Rinv[gs.i][gs.i] > 0.0
-              THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] ELSE NULL END AS std_error
+  SELECT gs.i AS i, names[gs.i] AS feature, bvec[gs.i] AS coefficient, uset, df, crit,
+         CASE WHEN robactive THEN
+                -- df <= 0 (saturated): robust variance is undefined; at n==d the
+                -- leverage h->1 makes hc2/hc3's sc^2/(1-h)^k a 0/0 finite artifact
+                CASE WHEN df > 0.0 AND isfinite(rv[gs.i]) AND rv[gs.i] > 0.0 THEN sqrt(rv[gs.i]) ELSE NULL END
+              ELSE
+                CASE WHEN Rinv IS NOT NULL AND isfinite(phi * Rinv[gs.i][gs.i]) AND phi * Rinv[gs.i][gs.i] > 0.0
+                     THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] ELSE NULL END
+         END AS std_error
   FROM final, unnest(range(1, len(bvec)+1)) AS gs(i)
 )
 SELECT feature, coefficient, std_error,
        coefficient / std_error AS statistic,
        CASE WHEN std_error IS NULL THEN NULL
-            WHEN est AND df > 0.0 THEN 2.0 * __reg_t_sf(abs(coefficient / std_error), df)
-            WHEN est THEN NULL
+            WHEN uset THEN 2.0 * __reg_t_sf(abs(coefficient / std_error), df)
             ELSE 2.0 * norm_cdf(-abs(coefficient / std_error)) END AS p_value,
        coefficient - crit * std_error AS conf_low,
        coefficient + crit * std_error AS conf_high
 FROM percoef ORDER BY i;
 
-CREATE OR REPLACE MACRO logit_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
-SELECT * FROM __reg_summary(model, tbl, outcome, 'logistic', 'logit_summary', conf_level, offset_col, weights_col, NULL, NULL);
-CREATE OR REPLACE MACRO linreg_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
-SELECT * FROM __reg_summary(model, tbl, outcome, 'linear', 'linreg_summary', conf_level, offset_col, weights_col, NULL, NULL);
-CREATE OR REPLACE MACRO poisson_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
-SELECT * FROM __reg_summary(model, tbl, outcome, 'poisson', 'poisson_summary', conf_level, offset_col, weights_col, NULL, NULL);
-CREATE OR REPLACE MACRO gamma_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
-SELECT * FROM __reg_summary(model, tbl, outcome, 'gamma', 'gamma_summary', conf_level, offset_col, weights_col, NULL, NULL);
-CREATE OR REPLACE MACRO tweedie_summary(model, tbl, outcome, power := 1.5, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
-SELECT * FROM __reg_summary(model, tbl, outcome, 'tweedie', 'tweedie_summary', conf_level, offset_col, weights_col, power, NULL);
-CREATE OR REPLACE MACRO nbinom_summary(model, tbl, outcome, alpha := 1.0, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
-SELECT * FROM __reg_summary(model, tbl, outcome, 'nbinom', 'nbinom_summary', conf_level, offset_col, weights_col, NULL, alpha);
+CREATE OR REPLACE MACRO logit_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL, robust := 'none', cluster_col := NULL) AS TABLE
+SELECT * FROM __reg_summary(model, tbl, outcome, 'logistic', 'logit_summary', conf_level, offset_col, weights_col, NULL, NULL, robust, cluster_col);
+CREATE OR REPLACE MACRO linreg_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL, robust := 'none', cluster_col := NULL) AS TABLE
+SELECT * FROM __reg_summary(model, tbl, outcome, 'linear', 'linreg_summary', conf_level, offset_col, weights_col, NULL, NULL, robust, cluster_col);
+CREATE OR REPLACE MACRO poisson_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL, robust := 'none', cluster_col := NULL) AS TABLE
+SELECT * FROM __reg_summary(model, tbl, outcome, 'poisson', 'poisson_summary', conf_level, offset_col, weights_col, NULL, NULL, robust, cluster_col);
+CREATE OR REPLACE MACRO gamma_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL, robust := 'none', cluster_col := NULL) AS TABLE
+SELECT * FROM __reg_summary(model, tbl, outcome, 'gamma', 'gamma_summary', conf_level, offset_col, weights_col, NULL, NULL, robust, cluster_col);
+CREATE OR REPLACE MACRO tweedie_summary(model, tbl, outcome, power := 1.5, conf_level := 0.95, offset_col := NULL, weights_col := NULL, robust := 'none', cluster_col := NULL) AS TABLE
+SELECT * FROM __reg_summary(model, tbl, outcome, 'tweedie', 'tweedie_summary', conf_level, offset_col, weights_col, power, NULL, robust, cluster_col);
+CREATE OR REPLACE MACRO nbinom_summary(model, tbl, outcome, alpha := 1.0, conf_level := 0.95, offset_col := NULL, weights_col := NULL, robust := 'none', cluster_col := NULL) AS TABLE
+SELECT * FROM __reg_summary(model, tbl, outcome, 'nbinom', 'nbinom_summary', conf_level, offset_col, weights_col, NULL, alpha, robust, cluster_col);
 
 -- Multinomial (softmax) coefficient inference. Baseline-category Fisher
 -- information I[(c,j),(c',k)] = sum_i p_ic(delta_cc' - p_ic') x_ij x_ik over the

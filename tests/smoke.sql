@@ -278,4 +278,24 @@ SELECT CASE
     ELSE error('SMOKE FAIL: irls solver disagrees with gradient descent')
   END;
 
+-- Robust / cluster-robust (sandwich) SEs: finite, positive, z-based intervals,
+-- and distinct from the model-based SE when the variance model is misspecified.
+CREATE TABLE robd AS SELECT (i%13-6)::DOUBLE AS x1, ((i*5)%9-4)::DOUBLE AS x2,
+  (i%17)::DOUBLE AS cl, (i%6 + i%4)::DOUBLE AS y FROM range(500) g(i);
+CREATE TABLE robf AS SELECT x1, x2, y FROM robd;
+CREATE TABLE robm AS SELECT * FROM poisson_fit('robf', 'y');
+SELECT CASE
+    WHEN (SELECT bool_and(std_error > 0 AND p_value BETWEEN 0.0 AND 1.0
+                          AND conf_low < coefficient AND coefficient < conf_high
+                          AND abs((conf_high-coefficient)/std_error - 1.959963984540054) < 1e-6)
+          FROM poisson_summary('robm','robd','y', robust := 'hc0'))
+     AND (SELECT bool_and(std_error > 0 AND isfinite(std_error))
+          FROM poisson_summary('robm','robd','y', cluster_col := 'cl'))
+     AND (SELECT max(abs(r.std_error - mb.std_error))
+          FROM poisson_summary('robm','robd','y', robust := 'hc0') r
+          JOIN poisson_summary('robm','robd','y') mb USING (feature)) > 1e-6
+    THEN 'PASS  robust/cluster SEs are finite, z-based, and differ from model-based'
+    ELSE error('SMOKE FAIL: robust SE output invalid')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;
