@@ -1358,10 +1358,13 @@ __reg_cv_gd AS (
                     ELSE sign(zmj) * greatest(abs(zmj) - (step/damp)*ml1[m], 0.0) END)) AS newB
     FROM (
       SELECT it, B, look, step, damp, ml1,
+             -- The held-out rows are zeroed in `r` (below), not here: this inner
+             -- lambda runs once per (row, model, coefficient), so testing the fold
+             -- here would index mfold[m] and compare it D1 times per (row, model).
+             -- A zero residual contributes nothing to the gradient either way.
              list_transform(look, lambda bm, m: list_transform(bm, lambda lmj, j:
                  lmj + (step/damp) * (
-                   list_sum(list_transform(res, lambda ob:
-                       CASE WHEN mfold[m] != ob.fold THEN ob.xs[j] * ob.r[m] ELSE 0.0 END)) / mntrain[m]
+                   list_sum(list_transform(res, lambda ob: ob.xs[j] * ob.r[m])) / mntrain[m]
                    - CASE WHEN j = 1 THEN 0.0 ELSE ml2[m] * lmj END))) AS zstep
       FROM (
         SELECT it, B, look, step, mfold, ml2, ml1, mntrain, res,
@@ -1373,7 +1376,10 @@ __reg_cv_gd AS (
           SELECT it, B, look, step, mfold, ml2, ml1, mntrain, mpow, malp_int,
                  list_transform(rows, lambda rw: struct_pack(
                    xs := rw.xs, fold := rw.fold,
+                   -- r = 0 for a row held out of model m's training folds, so the
+                   -- gradient sum below can skip the per-coefficient fold test.
                    r := list_transform(look, lambda bm, m:
+                     CASE WHEN mfold[m] = rw.fold THEN 0.0 ELSE
                      (CASE WHEN family='logistic' THEN rw.yt - 1.0/(1.0+exp(-list_dot_product(rw.xs,bm)))
                            WHEN family='poisson'  THEN rw.yt - exp(least(list_dot_product(rw.xs,bm),700.0))
                            WHEN family='gamma'    THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)) - 1.0
@@ -1381,15 +1387,20 @@ __reg_cv_gd AS (
                                                        * pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)), 1.0 - mpow[m])
                            WHEN family='nbinom'   THEN (rw.yt - exp(least(list_dot_product(rw.xs,bm),700.0)))
                                                        / (1.0 + malp_int[m] * exp(least(list_dot_product(rw.xs,bm),700.0)))
-                           ELSE rw.yt - list_dot_product(rw.xs,bm) END)),
-                   hw := list_transform(look, lambda bm, m:
+                           ELSE rw.yt - list_dot_product(rw.xs,bm) END) END),
+                   -- hw damps the step for the unbounded-curvature log-link families
+                   -- only; for the others `damp` is the constant 1.0 and hw is never
+                   -- read, so don't build an M-element list of zeros for every row.
+                   hw := CASE WHEN family NOT IN ('poisson','gamma','tweedie','nbinom')
+                              THEN []::DOUBLE[] ELSE
+                         list_transform(look, lambda bm, m:
                      (CASE WHEN family='poisson' THEN exp(least(list_dot_product(rw.xs,bm),700.0))
                            WHEN family='gamma'   THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0))
                            WHEN family='tweedie' THEN (2.0-mpow[m])*pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),2.0-mpow[m])
                                                      + (mpow[m]-1.0)*rw.yt*pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),1.0-mpow[m])
                            WHEN family='nbinom'  THEN exp(least(list_dot_product(rw.xs,bm),700.0))*(1.0+malp_int[m]*rw.yt)
                                                      / pow(1.0+malp_int[m]*exp(least(list_dot_product(rw.xs,bm),700.0)),2.0)
-                           ELSE 0.0 END)))) AS res
+                           ELSE 0.0 END)) END)) AS res
           FROM (
             SELECT g.it, g.B, p.rows, c.step, ma.mfold, ma.ml2, ma.ml1, ma.mntrain, ma.mpow, ma.malp_int,
                    list_transform(g.B, lambda bm, m: list_transform(bm, lambda v, j:
