@@ -333,6 +333,29 @@ CREATE TABLE model AS SELECT * FROM multinom_fit('iris', 'species');
 SELECT * FROM multinom_summary('model', 'iris', 'species');
 ```
 
+### Influence diagnostics: `*_influence`
+
+`{logit,linreg,poisson,gamma,tweedie,nbinom}_influence(model, tbl, outcome)`
+returns, for every training row, the five standard case-deletion diagnostics
+alongside the input columns — for spotting outliers and high-leverage points:
+
+| column | meaning |
+|---|---|
+| `hat` | leverage `hᵢ = aᵢ·hwᵢ·xᵢᵀ(Xᵀdiag(a·hw)X)⁻¹xᵢ` (GLM hat-matrix diagonal, in `[0,1]`, summing to `d`) |
+| `pearson_resid` | Pearson residual `(y−μ)/√V(μ)` |
+| `deviance_resid` | signed-root deviance residual `sign(y−μ)·√(unit deviance)` |
+| `std_resid` | studentized (standardized Pearson) residual `r_P/√(φ(1−h))` |
+| `cooks_distance` | Cook's distance `(r_P²/φ)·h / (d(1−h)²)` |
+
+These match **statsmodels** `GLMInfluence` to machine precision (leverage and
+Cook's distance use the observed-information hat matrix, as statsmodels does).
+Rows near `cooks_distance > 4/n` or with high `hat` are the influential ones.
+
+```sql
+SELECT * FROM poisson_influence('claims_model', 'policies', 'n_claims')
+ORDER BY cooks_distance DESC LIMIT 10;   -- the 10 most influential observations
+```
+
 ## Multiclass: `multinom_fit` / `multinom_predict` / `multinom_evaluate`
 
 Multinomial (softmax) logistic regression for a categorical outcome with any

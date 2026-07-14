@@ -2074,6 +2074,113 @@ SELECT * FROM __reg_predict_ci(model, tbl, outcome, newdata, 'tweedie', 'tweedie
 CREATE OR REPLACE MACRO nbinom_predict_ci(model, tbl, outcome, newdata := NULL, alpha := 1.0, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
 SELECT * FROM __reg_predict_ci(model, tbl, outcome, newdata, 'nbinom', 'nbinom_predict_ci', conf_level, offset_col, weights_col, NULL, alpha);
 
+-- ---------------------------------------------------------------------------
+-- Influence diagnostics (per training observation). hat = observed-info
+-- leverage h_i = a_i*hw_i * x_i'(X'diag(a*hw)X)^-1 x_i; Pearson and deviance
+-- residuals; the studentized (standardized Pearson) residual r_P/sqrt(phi(1-h));
+-- and Cook's distance (r_P^2/phi)*h/(d(1-h)^2). Matches statsmodels
+-- GLMInfluence. Returns the input columns plus the five diagnostics.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE MACRO __reg_influence(model, tbl, outcome, family, caller, offset_col, weights_col, power, alpha) AS TABLE
+WITH RECURSIVE
+mdl AS (SELECT feature, coefficient FROM query_table(model)),
+beta AS (
+  SELECT ([ coalesce((SELECT coefficient FROM mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
+          || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS bvec,
+         (count(*) FILTER (WHERE feature != '(Intercept)'))::INT AS k
+  FROM mdl
+),
+num AS (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
+alllong AS (
+  SELECT rid, name AS col, value AS v
+  FROM (UNPIVOT (SELECT rid, TRY_CAST(COLUMNS(* EXCLUDE (rid)) AS DOUBLE) FROM num)
+        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE value)
+),
+yv AS (SELECT rid, v AS y  FROM alllong WHERE col = outcome),
+ov AS (SELECT rid, v AS o  FROM alllong WHERE col = offset_col),
+wv AS (SELECT rid, v AS wt FROM alllong WHERE col = weights_col),
+feat AS (
+  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY l.col) AS xs, count(*)::INT AS nf
+  FROM alllong l JOIN mdl m ON m.feature = l.col AND m.feature != '(Intercept)' GROUP BY l.rid
+),
+rows0 AS (
+  SELECT f.rid, f.xs, y.y,
+         CASE WHEN offset_col IS NULL THEN 0.0 ELSE o.o END AS off,
+         CASE WHEN weights_col IS NULL THEN 1.0 ELSE coalesce(w.wt, 1.0) END AS wt
+  FROM feat f JOIN yv y ON y.rid = f.rid
+  LEFT JOIN ov o ON o.rid = f.rid LEFT JOIN wv w ON w.rid = f.rid CROSS JOIN beta
+  WHERE f.nf = beta.k AND y.y IS NOT NULL AND (offset_col IS NULL OR o.o IS NOT NULL)
+),
+-- per row: mu, observed weight hw, variance V, residual, unit deviance
+pr AS (
+  SELECT rid, xs, wt, y, mu,
+         wt * (CASE family WHEN 'logistic' THEN mu*(1.0-mu) WHEN 'linear' THEN 1.0
+                 WHEN 'poisson' THEN mu WHEN 'gamma' THEN y/mu
+                 WHEN 'tweedie' THEN (2.0-power)*pow(mu,2.0-power)+(power-1.0)*y*pow(mu,1.0-power)
+                 WHEN 'nbinom' THEN mu*(1.0+alpha*y)/pow(1.0+alpha*mu,2.0) END) AS hwt,
+         (y - mu) AS resid,
+         (CASE family WHEN 'logistic' THEN mu*(1.0-mu) WHEN 'linear' THEN 1.0 WHEN 'poisson' THEN mu
+                 WHEN 'gamma' THEN mu*mu WHEN 'tweedie' THEN pow(mu,power) WHEN 'nbinom' THEN mu*(1.0+alpha*mu) END) AS Vmu,
+         (CASE family
+            WHEN 'logistic' THEN 2.0*((CASE WHEN y>0 THEN y*ln(y/mu) ELSE 0.0 END) + (CASE WHEN y<1 THEN (1.0-y)*ln((1.0-y)/(1.0-mu)) ELSE 0.0 END))
+            WHEN 'linear'   THEN (y-mu)*(y-mu)
+            WHEN 'poisson'  THEN 2.0*((CASE WHEN y>0 THEN y*ln(y/mu) ELSE 0.0 END) - (y-mu))
+            WHEN 'gamma'    THEN 2.0*(-ln(y/mu) + (y-mu)/mu)
+            WHEN 'tweedie'  THEN 2.0*((CASE WHEN y>0 THEN pow(y,2.0-power)/((1.0-power)*(2.0-power)) ELSE 0.0 END) - y*pow(mu,1.0-power)/(1.0-power) + pow(mu,2.0-power)/(2.0-power))
+            WHEN 'nbinom'   THEN 2.0*((CASE WHEN y>0 THEN y*ln(y/mu) ELSE 0.0 END) - (y+1.0/alpha)*ln((y+1.0/alpha)/(mu+1.0/alpha))) END) AS udev
+  FROM (SELECT rid, xs, wt, y,
+               CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
+                           WHEN 'linear' THEN eta ELSE exp(greatest(-700.0,least(eta,700.0))) END AS mu
+        FROM (SELECT rid, xs, wt, y, off + list_dot_product(xs, (SELECT bvec FROM beta)) AS eta FROM rows0))
+),
+dims AS (SELECT count(*)::INT AS n, (SELECT k FROM beta)+1 AS d FROM pr),
+idx AS (SELECT unnest(range(1, (SELECT d FROM dims)+1)) AS i),
+pairs AS (SELECT a.i AS a, b.i AS b FROM idx a, idx b),
+breadA AS (
+  SELECT list(rowlist ORDER BY a) AS A FROM (
+    SELECT a, list(val ORDER BY b) AS rowlist FROM (
+      SELECT p.a AS a, p.b AS b, sum(pr.hwt * pr.xs[p.a] * pr.xs[p.b]) AS val
+      FROM pr, pairs p GROUP BY p.a, p.b) GROUP BY a)
+),
+breadinv AS (
+  SELECT list_transform(RAinv, lambda row, i: list_transform(row, lambda v, j: v/(dscA[i]*dscA[j]))) AS Ainv
+  FROM (SELECT dscA, __reg_matinv(list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dscA[i]*dscA[j])))) AS RAinv
+        FROM (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dscA FROM breadA))
+),
+lev AS (
+  SELECT p.rid, p.hwt * list_sum(list_transform(p.xs, lambda xa, a: xa * list_dot_product(bi.Ainv[a], p.xs))) AS h
+  FROM pr p CROSS JOIN breadinv bi
+),
+disp AS (
+  SELECT CASE WHEN family IN ('linear','gamma','tweedie')
+              THEN (SELECT sum(wt*resid*resid/Vmu) FROM pr) / nullif((SELECT n-d FROM dims), 0) ELSE 1.0 END AS phi,
+         (SELECT d FROM dims) AS d
+),
+diag AS (
+  SELECT p.rid,
+         CASE WHEN isfinite(l.h) THEN l.h ELSE NULL END AS hat,  -- NULL (not NaN) on singular bread
+         p.resid * sqrt(p.wt) / sqrt(p.Vmu) AS pearson_resid,
+         sign(p.resid) * sqrt(p.wt * greatest(p.udev, 0.0)) AS deviance_resid,
+         CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN (p.resid*sqrt(p.wt)/sqrt(p.Vmu)) / sqrt(dp.phi*(1.0-l.h)) END AS std_resid,
+         CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN (p.resid*p.resid*p.wt/p.Vmu/dp.phi) * l.h / (dp.d*(1.0-l.h)*(1.0-l.h)) END AS cooks_distance
+  FROM pr p JOIN lev l ON l.rid = p.rid CROSS JOIN disp dp
+)
+SELECT n.* EXCLUDE (rid), d.hat, d.pearson_resid, d.deviance_resid, d.std_resid, d.cooks_distance
+FROM num n JOIN diag d ON d.rid = n.rid ORDER BY n.rid;
+
+CREATE OR REPLACE MACRO logit_influence(model, tbl, outcome, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_influence(model, tbl, outcome, 'logistic', 'logit_influence', offset_col, weights_col, NULL, NULL);
+CREATE OR REPLACE MACRO linreg_influence(model, tbl, outcome, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_influence(model, tbl, outcome, 'linear', 'linreg_influence', offset_col, weights_col, NULL, NULL);
+CREATE OR REPLACE MACRO poisson_influence(model, tbl, outcome, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_influence(model, tbl, outcome, 'poisson', 'poisson_influence', offset_col, weights_col, NULL, NULL);
+CREATE OR REPLACE MACRO gamma_influence(model, tbl, outcome, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_influence(model, tbl, outcome, 'gamma', 'gamma_influence', offset_col, weights_col, NULL, NULL);
+CREATE OR REPLACE MACRO tweedie_influence(model, tbl, outcome, power := 1.5, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_influence(model, tbl, outcome, 'tweedie', 'tweedie_influence', offset_col, weights_col, power, NULL);
+CREATE OR REPLACE MACRO nbinom_influence(model, tbl, outcome, alpha := 1.0, offset_col := NULL, weights_col := NULL) AS TABLE
+SELECT * FROM __reg_influence(model, tbl, outcome, 'nbinom', 'nbinom_influence', offset_col, weights_col, NULL, alpha);
+
 -- Multinomial (softmax) coefficient inference. Baseline-category Fisher
 -- information I[(c,j),(c',k)] = sum_i p_ic(delta_cc' - p_ic') x_ij x_ik over the
 -- K-1 non-reference classes; Cov = I^-1, dispersion fixed = 1, z inference.

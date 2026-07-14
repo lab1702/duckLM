@@ -1872,6 +1872,88 @@ class TestPredictionCI:
 
 
 # --------------------------------------------------------------------------- #
+# Influence diagnostics (*_influence)
+# --------------------------------------------------------------------------- #
+class TestInfluence:
+    SPEC = {
+        "logistic": ("logit_fit", "logit_influence", ""),
+        "linear": ("linreg_fit", "linreg_influence", ""),
+        "poisson": ("poisson_fit", "poisson_influence", ""),
+        "gamma": ("gamma_fit", "gamma_influence", ""),
+        "tweedie": ("tweedie_fit", "tweedie_influence", ", power := 1.5"),
+        "nbinom": ("nbinom_fit", "nbinom_influence", ", alpha := 0.5"),
+    }
+
+    def _ref(self, X, y, beta, family, alpha=0.5, power=1.5):
+        n, d = X.shape
+        if family == "logistic":
+            mu = 1 / (1 + np.exp(-X @ beta)); hw = mu * (1 - mu); V = hw
+            dev = 2 * (np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / mu), 0) + np.where(y < 1, (1 - y) * np.log((1 - y) / (1 - mu)), 0)); est = False
+        elif family == "linear":
+            mu = X @ beta; hw = np.ones(n); V = np.ones(n); dev = (y - mu) ** 2; est = True
+        else:
+            mu = np.exp(X @ beta)
+            if family == "poisson":
+                hw = mu; V = mu; dev = 2 * (np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / mu), 0) - (y - mu)); est = False
+            elif family == "gamma":
+                hw = y / mu; V = mu ** 2; dev = 2 * (-np.log(y / mu) + (y - mu) / mu); est = True
+            elif family == "tweedie":
+                hw = (2 - power) * mu ** (2 - power) + (power - 1) * y * mu ** (1 - power); V = mu ** power
+                dev = 2 * (np.where(y > 0, y ** (2 - power) / ((1 - power) * (2 - power)), 0) - y * mu ** (1 - power) / (1 - power) + mu ** (2 - power) / (2 - power)); est = True
+            else:
+                hw = mu * (1 + alpha * y) / (1 + alpha * mu) ** 2; V = mu * (1 + alpha * mu)
+                dev = 2 * (np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / mu), 0) - (y + 1 / alpha) * np.log((y + 1 / alpha) / (mu + 1 / alpha))); est = False
+        A = np.linalg.inv((X * hw[:, None]).T @ X); h = np.einsum("ij,jk,ik->i", X, A, X) * hw
+        rP = (y - mu) / np.sqrt(V); rD = np.sign(y - mu) * np.sqrt(np.maximum(dev, 0))
+        phi = np.sum(rP ** 2) / (n - d) if est else 1.0
+        return h, rP, rD, rP / np.sqrt(phi * (1 - h)), (rP ** 2 / phi) * h / (d * (1 - h) ** 2)
+
+    def _data(self, family, seed, n=600):
+        rng = np.random.default_rng(seed)
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        eta = 0.5 + 0.6 * x1 - 0.3 * x2
+        if family == "logistic": y = rng.binomial(1, 1 / (1 + np.exp(-eta))).astype(float)
+        elif family == "linear": y = 2 + 1.5 * x1 - 0.8 * x2 + rng.normal(0, 1.5, n)
+        elif family == "poisson": y = rng.poisson(np.exp(eta)).astype(float)
+        elif family == "gamma": y = rng.gamma(2.0, np.exp(eta) / 2.0)
+        elif family == "tweedie": y = np.where(rng.random(n) < 0.3, 0.0, rng.gamma(2.0, np.exp(eta) / 2.0))
+        else: y = rng.poisson(rng.gamma(1 / 0.5, np.exp(eta) * 0.5)).astype(float)
+        return x1, x2, y
+
+    @pytest.mark.parametrize("family", list(SPEC))
+    def test_influence_matches_reference(self, con, family):
+        fitm, im, extra = self.SPEC[family]
+        x1, x2, y = self._data(family, 500 + len(family))
+        _load(con, "idata", pd.DataFrame({"x1": x1, "x2": x2, "y": y}))
+        con.execute(f"CREATE OR REPLACE TABLE imodel AS SELECT * FROM {fitm}('idata','y'{extra})")
+        s = con.execute(f"SELECT hat, pearson_resid, deviance_resid, std_resid, cooks_distance "
+                        f"FROM {im}('imodel','idata','y'{extra})").df()
+        beta = dict(con.execute("SELECT feature, coefficient FROM imodel").fetchall())
+        X = np.column_stack([np.ones(len(y)), x1, x2]); b = np.array([beta["(Intercept)"], beta["x1"], beta["x2"]])
+        h, rP, rD, rPs, cook = self._ref(X, y, b, family)
+        assert s["hat"].values == pytest.approx(h, rel=1e-6, abs=1e-9), family
+        assert s["pearson_resid"].values == pytest.approx(rP, rel=1e-6, abs=1e-9), family
+        assert s["deviance_resid"].values == pytest.approx(rD, rel=1e-6, abs=1e-8), family
+        assert s["std_resid"].values == pytest.approx(rPs, rel=1e-6, abs=1e-9), family
+        assert s["cooks_distance"].values == pytest.approx(cook, rel=1e-6, abs=1e-12), family
+        assert s["hat"].sum() == pytest.approx(3.0, abs=1e-8)  # sum of leverages = d
+
+    def test_influence_passthrough_and_singular(self, con):
+        x1, x2, y = self._data("poisson", 33)
+        _load(con, "idata", pd.DataFrame({"label": np.arange(len(y)), "x1": x1, "x2": x2, "y": y}))
+        con.execute("CREATE OR REPLACE TABLE ifit AS SELECT x1, x2, y FROM idata")
+        con.execute("CREATE OR REPLACE TABLE imodel AS SELECT * FROM poisson_fit('ifit','y')")
+        r = con.execute("SELECT * FROM poisson_influence('imodel','idata','y')").df()
+        assert list(r.columns) == ["label", "x1", "x2", "y", "hat", "pearson_resid", "deviance_resid", "std_resid", "cooks_distance"]
+        # singular: residuals finite, hat/cooks NULL (not NaN)
+        _load(con, "idata2", pd.DataFrame({"x1": x1, "x2": x2, "x1dup": x1, "y": y}))
+        con.execute("CREATE OR REPLACE TABLE imodel2 AS SELECT * FROM poisson_fit('idata2','y')")
+        s = con.execute("SELECT hat, pearson_resid, cooks_distance FROM poisson_influence('imodel2','idata2','y')").df()
+        assert s["pearson_resid"].notna().all()
+        assert s["hat"].isna().all() and s["cooks_distance"].isna().all()
+
+
+# --------------------------------------------------------------------------- #
 # Multinomial (softmax) inference (multinom_summary)
 # --------------------------------------------------------------------------- #
 class TestMultinomInference:

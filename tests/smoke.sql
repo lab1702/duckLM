@@ -314,4 +314,19 @@ SELECT CASE
     ELSE error('SMOKE FAIL: predict_ci output invalid')
   END;
 
+-- Influence diagnostics: one row per observation; leverages lie in [0,1] and
+-- sum to the number of parameters (d = 3 here); residuals / Cook's D finite.
+CREATE TABLE infd AS SELECT (i%13-6)::DOUBLE AS x1, ((i*5)%9-4)::DOUBLE AS x2,
+  (i%6 + i%4)::DOUBLE AS y FROM range(300) g(i);
+CREATE TABLE infm AS SELECT * FROM poisson_fit('infd', 'y');
+SELECT CASE
+    WHEN (SELECT count(*) FROM poisson_influence('infm','infd','y')) = (SELECT count(*) FROM infd)
+     AND (SELECT bool_and(hat BETWEEN 0.0 AND 1.0 AND cooks_distance >= 0.0
+                          AND isfinite(pearson_resid) AND isfinite(deviance_resid))
+          FROM poisson_influence('infm','infd','y'))
+     AND abs((SELECT sum(hat) FROM poisson_influence('infm','infd','y')) - 3.0) < 1e-6
+    THEN 'PASS  *_influence returns leverages in [0,1] summing to d, with finite residuals'
+    ELSE error('SMOKE FAIL: influence output invalid')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;

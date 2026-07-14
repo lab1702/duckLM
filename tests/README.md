@@ -15,8 +15,9 @@ and Wald inference via `*_summary` — standard errors, z/t statistics, p-values
 and confidence intervals for all six single-outcome families plus multinomial
 (baseline-category Fisher information), robust HC0-HC3 and cluster-robust
 (sandwich) standard errors, prediction intervals (`*_predict_ci`, CI on the
-predicted mean), and the IRLS solver (`solver := 'irls'`), all
-checked against an independent numpy/scipy reference, plus the pure-SQL
+predicted mean), influence diagnostics (`*_influence`: leverage, Pearson/deviance
+residuals, studentized residuals, Cook's distance), and the IRLS solver
+(`solver := 'irls'`), all checked against an independent numpy/scipy reference, plus the pure-SQL
 `norm_cdf`/`norm_ppf`/`t_cdf`/`t_ppf` helpers vs SciPy),
 ridge/lasso/elastic-net with the documented sklearn equivalences
 (and KKT-optimality checks for L1 where sklearn has no reference), predict
