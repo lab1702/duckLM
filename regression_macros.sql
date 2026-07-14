@@ -1649,7 +1649,24 @@ CREATE OR REPLACE MACRO __reg_norm_ppf_halley(x0, p) AS (
   x0 - ((norm_cdf(x0)-p)*2.506628274631*exp(x0*x0/2.0))
        / (1.0 + x0*((norm_cdf(x0)-p)*2.506628274631*exp(x0*x0/2.0))/2.0)
 );
-CREATE OR REPLACE MACRO norm_ppf(p) AS ( __reg_norm_ppf_halley(__reg_norm_ppf_raw(p::DOUBLE), p::DOUBLE) );
+-- Macro expansion is textual: every reference to a parameter re-expands the
+-- caller's whole argument expression. __reg_norm_ppf_halley references x0 dozens
+-- of times (twice through norm_cdf, which itself references its argument ~15
+-- times per branch of __reg_norm_q), so writing this the obvious way --
+--   __reg_norm_ppf_halley(__reg_norm_ppf_raw(p), p)
+-- -- pastes the __reg_norm_ppf_raw tree in ~60 times and the caller's `p`
+-- expression hundreds of times. The binder is superlinear in expression-tree
+-- size, so with a compound argument that alone cost ~2.5s of query BINDING
+-- (before a single row is read), which is what made *_summary and *_predict_ci
+-- take seconds regardless of table size.
+-- A one-element list_transform gives a genuine local binding: the argument is
+-- evaluated once and the body refers to a cheap lambda variable. Same result to
+-- the last bit; binding drops to ~6ms.
+CREATE OR REPLACE MACRO norm_ppf(p) AS (
+  list_transform([p::DOUBLE], pp ->
+    list_transform([__reg_norm_ppf_raw(pp)], x0 -> __reg_norm_ppf_halley(x0, pp))[1]
+  )[1]
+);
 
 -- ---- Student-t CDF and quantile via regularized incomplete beta ------------
 CREATE OR REPLACE MACRO __reg_fpmin(z) AS (CASE WHEN abs(z) < 1e-30 THEN 1e-30 ELSE z END);
@@ -1709,11 +1726,19 @@ CREATE OR REPLACE MACRO __reg_t_pdf(t, df) AS (
   exp(lgamma((df+1.0)/2.0) - lgamma(df/2.0) - 0.5*ln(df * 3.141592653589793::DOUBLE))
   * pow(1.0 + t*t/df, -(df+1.0)/2.0)
 );
-CREATE OR REPLACE MACRO __reg_t_ppf(p, df) AS (        -- Newton from the normal quantile
+-- Newton from the normal quantile. p and df are bound to lambda variables for
+-- the same reason as in norm_ppf above: the Newton body expands __reg_t_sf and
+-- __reg_t_pdf, which reference df many times over, and each such reference would
+-- otherwise paste in the caller's whole `df` expression.
+CREATE OR REPLACE MACRO __reg_t_ppf(p, df) AS (
   CASE WHEN df = 1.0 THEN tan(3.141592653589793 * (p - 0.5))    -- Cauchy: exact
-       ELSE list_reduce(
-              [ norm_ppf(p) ] || list_transform(range(1, 13), lambda i: 0.0::DOUBLE),
-              (t, e) -> t - ((1.0 - __reg_t_sf(t, df)) - p) / __reg_t_pdf(t, df))
+       ELSE list_transform([p::DOUBLE], pp ->
+              list_transform([df::DOUBLE], dd ->
+                list_reduce(
+                  [ norm_ppf(pp) ] || list_transform(range(1, 13), lambda i: 0.0::DOUBLE),
+                  (t, e) -> t - ((1.0 - __reg_t_sf(t, dd)) - pp) / __reg_t_pdf(t, dd))
+              )[1]
+            )[1]
   END
 );
 CREATE OR REPLACE MACRO t_ppf(p, df) AS ( __reg_t_ppf(p::DOUBLE, df::DOUBLE) );
