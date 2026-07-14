@@ -150,6 +150,52 @@ CREATE OR REPLACE MACRO __reg_matinv(A) AS (
   )
 );
 
+-- One cyclic-coordinate-descent step: return `b` with coordinate j replaced by the
+-- soft-thresholded partial residual. A is the penalised Gram matrix X'WX + n*l2*D
+-- (ridge already on the diagonal, intercept excluded), bvec is X'Wz, and g is the L1
+-- amount on the SUM scale (n*l1). Because the ridge sits in the denominator A[j][j],
+-- this is the elastic-net update; the intercept (j = 1) is left unpenalised.
+--   b_j <- S(bvec_j - sum_{k!=j} A_jk b_k , g) / A_jj,  S(z,g) = sign(z)*max(|z|-g,0)
+-- Lambda variables are z-prefixed: this macro is expanded textually inside lambdas
+-- that already bind m, j, a, b, so a plain name here would shadow them.
+CREATE OR REPLACE MACRO __reg_cd_coord(A, bvec, b, j, g) AS (
+  list_transform(b, lambda zv, zk:
+    CASE WHEN zk != j THEN zv
+         WHEN j = 1
+           THEN (bvec[j] - (list_dot_product(A[j], b) - A[j][j] * b[j])) / A[j][j]
+         ELSE sign(bvec[j] - (list_dot_product(A[j], b) - A[j][j] * b[j]))
+              * greatest(abs(bvec[j] - (list_dot_product(A[j], b) - A[j][j] * b[j])) - g, 0.0)
+              / A[j][j]
+    END)
+);
+
+-- Cyclic coordinate descent on the penalised weighted least squares problem, run for
+-- a fixed number of sweeps and WARM-STARTED from b0. This is the inner solver of the
+-- proximal-Newton (glmnet) scheme: the outer IRLS iteration supplies A and bvec, and
+-- coordinate descent handles the L1 term that a matrix inverse cannot.
+--
+-- Two things are load-bearing:
+--   * The warm start is NOT optional. Seeded from zeros, the inner solve stops short
+--     and the outer loop can then see a small step and declare convergence while the
+--     coefficients are still far off -- silently wrong, not slow. Warm-started, the
+--     inner solve resumes where the last outer iteration left off.
+--   * list_reduce takes an initial value only of the LIST'S CHILD TYPE, so a DOUBLE[]
+--     accumulator cannot be folded over an integer range. Both folds are therefore
+--     seeded by making the accumulator the FIRST element of the folded list: the outer
+--     fold over sweeps carries the coefficient vector, and the inner fold over
+--     coordinates carries (vector, coordinate index) as a struct.
+CREATE OR REPLACE MACRO __reg_cd(A, bvec, b0, g, d1, sweeps) AS (
+  list_reduce(
+    [b0] || list_transform(range(1, sweeps + 1), lambda zs: []::DOUBLE[]),
+    (zbeta, zsw) ->
+      list_reduce(
+        [ struct_pack(b := zbeta, j := 0) ]
+          || list_transform(range(1, d1 + 1), lambda zjj: struct_pack(b := []::DOUBLE[], j := zjj)),
+        (zacc, zel) -> struct_pack(b := __reg_cd_coord(A, bvec, zacc.b, zel.j, g), j := zel.j)
+      ).b
+  )
+);
+
 CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1, alpha, solver) AS TABLE
 WITH RECURSIVE
 -- Every column cast to DOUBLE, with a synthetic row id.
@@ -387,8 +433,6 @@ __reg_cfg AS (
              WHEN l1 < 0 THEN error(caller || ': l1 must be >= 0, got ' || l1)
              WHEN solver NOT IN ('gd', 'irls', 'auto')
                THEN error(caller || ': solver must be ''auto'', ''gd'' or ''irls'', got ''' || solver || '''')
-             WHEN solver = 'irls' AND l1 > 0
-               THEN error(caller || ': the irls solver does not support L1 (lasso/elastic-net); use solver := ''gd'' for l1 > 0')
              -- Guaranteed-convergent steps: on standardized data the mean-loss
              -- gradient is L-Lipschitz with L <= (d+1)/4 (logistic, from the
              -- sigmoid derivative bound) or L <= d+1 (linear), plus l2 from the
@@ -422,20 +466,30 @@ __reg_irls(it, betas, move) AS (
     SELECT 0, list_transform(range(f.d + 1), lambda i: 0.0::DOUBLE), 1e308::DOUBLE
     FROM __reg_feats f, __reg_cfg c
     WHERE c.step IS NOT NULL
-      -- irls is the solver under solver := 'irls', and under the 'auto' default
-      -- whenever there is no L1 penalty (irls cannot do L1). Otherwise no seed
-      -- row is emitted and this recursion is inert.
-      AND (solver = 'irls' OR (solver = 'auto' AND l1 = 0.0))
+      -- irls is the solver under solver := 'irls' and under the 'auto' default.
+      -- L1 is handled inside the iteration by coordinate descent, so it no longer
+      -- disqualifies this path. Otherwise no seed row is emitted and this
+      -- recursion is inert.
+      AND solver IN ('irls', 'auto')
     UNION ALL
     SELECT it + 1, betas_new,
            list_aggregate(list_transform(betas_new, lambda v, j: abs(v - betas[j])), 'max')
     FROM (
-        SELECT it, betas, list_transform(inv, lambda invrow: list_dot_product(invrow, XWr)) AS betas_new
+        -- Without L1 the penalised normal equations are solved exactly by inverting
+        -- X'WX. With L1 no inverse exists, so the same normal equations go to
+        -- coordinate descent instead (proximal Newton / glmnet), warm-started from
+        -- the current iterate. The threshold is on the sum scale, matching the
+        -- mean-loss objective the gd path minimises.
+        SELECT it, betas,
+               CASE WHEN l1 = 0.0
+                    THEN list_transform(__reg_matinv(XWXpen), lambda invrow: list_dot_product(invrow, XWr))
+                    ELSE __reg_cd(XWXpen, XWr, betas, sumw * l1, len(betas), 100)
+               END AS betas_new
         FROM (
-            SELECT it, betas, XWr, __reg_matinv(XWXpen) AS inv
+            SELECT it, betas, XWr, XWXpen, sumw
             FROM (
                 -- ridge penalty on the diagonal (intercept at position 1 unpenalized)
-                SELECT it, betas, XWr,
+                SELECT it, betas, XWr, sumw,
                        list_transform(XWX, lambda row, a:
                            list_transform(row, lambda v, b:
                                CASE WHEN a = b AND a > 1 THEN v + sumw * l2 ELSE v END)) AS XWXpen
@@ -1345,14 +1399,16 @@ __reg_cv_cfg AS (
 -- normal equations B_m <- (X'W X + n_m*l2_m*D)^-1 X'W z per model, reaching the
 -- MLE in ~5-10 iterations where gradient descent needs ~1000. Rows held out of
 -- model m's training folds get zero weight, so they drop out of that model's
--- system. Inert (no seed row, hence no iterations) when any grid point carries an
--- L1 penalty, which irls cannot solve -- cv_l1 therefore stays on gradient descent.
+-- system.
+-- Models with an L1 penalty cannot be solved by inverting that matrix, so they take
+-- the same normal equations to __reg_cd instead (proximal Newton / glmnet): the
+-- outer loop here supplies X'WX and X'Wz, and coordinate descent handles the L1
+-- term. Both kinds of model iterate together in this one recursion.
 __reg_cv_irls(it, B, move) AS (
   SELECT 0,
          list_transform(range(c.M), lambda m: list_transform(range(c.D1), lambda j: 0.0::DOUBLE)),
          1e308::DOUBLE
-  FROM __reg_cv_cfg c, __reg_cv_marr ma
-  WHERE list_aggregate(ma.ml1, 'max') = 0.0
+  FROM __reg_cv_cfg c
   UNION ALL
   SELECT it + 1, Bnew,
          list_aggregate(list_transform(Bnew, lambda bm, m:
@@ -1360,18 +1416,25 @@ __reg_cv_irls(it, B, move) AS (
   FROM (
     SELECT it, B,
            list_transform(range(1, M + 1), lambda m:
-               list_transform(__reg_matinv(XWXpen[m]),
-                              lambda invrow: list_dot_product(invrow, XWr[m]))) AS Bnew
+               CASE WHEN ml1[m] = 0.0
+                    -- no L1: the exact solve, as before
+                    THEN list_transform(__reg_matinv(XWXpen[m]),
+                                        lambda invrow: list_dot_product(invrow, XWr[m]))
+                    -- L1: coordinate descent, warm-started from this model's current
+                    -- coefficients. The threshold is on the sum scale, matching the
+                    -- mean-loss objective the gd path minimises over mntrain[m] rows.
+                    ELSE __reg_cd(XWXpen[m], XWr[m], B[m], mntrain[m] * ml1[m], D1, 100)
+               END) AS Bnew
     FROM (
       -- ridge on the diagonal, intercept unpenalised. The gd path takes the mean
       -- loss over model m's mntrain rows, so its l2 scales the same way here.
-      SELECT it, B, M, XWr,
+      SELECT it, B, M, D1, XWr, ml1, mntrain,
              list_transform(range(1, M + 1), lambda m:
                  list_transform(XWX[m], lambda row, a:
                      list_transform(row, lambda v, b:
                          CASE WHEN a = b AND a > 1 THEN v + mntrain[m] * ml2[m] ELSE v END))) AS XWXpen
       FROM (
-        SELECT it, B, M, mntrain, ml2,
+        SELECT it, B, M, D1, mntrain, ml2, ml1,
                list_transform(range(1, M + 1), lambda m:
                    list_transform(range(1, D1 + 1), lambda a:
                        list_transform(range(1, D1 + 1), lambda b:
@@ -1383,7 +1446,7 @@ __reg_cv_irls(it, B, move) AS (
         FROM (
           -- per row and model: expected-information weight and working response,
           -- both zeroed on the rows held out of that model's training folds
-          SELECT it, B, M, D1, mntrain, ml2,
+          SELECT it, B, M, D1, mntrain, ml2, ml1,
                  list_transform(lps, lambda e: struct_pack(
                    xs := e.xs,
                    wirls := list_transform(e.lp, lambda l, m:
@@ -1422,7 +1485,7 @@ __reg_cv_irls(it, B, move) AS (
                         END) END)
                  )) AS res
           FROM (
-            SELECT g.it, g.B, c.M, c.D1, ma.mfold, ma.ml2, ma.mntrain, ma.mpow, ma.malp_int,
+            SELECT g.it, g.B, c.M, c.D1, ma.mfold, ma.ml2, ma.ml1, ma.mntrain, ma.mpow, ma.malp_int,
                    -- one dot product per (row, model); mu is derived from it below
                    list_transform(p.rows, lambda rw: struct_pack(
                        xs := rw.xs, yt := rw.yt, fold := rw.fold,

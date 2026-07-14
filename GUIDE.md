@@ -66,7 +66,7 @@ SELECT * FROM rev_model;
 | `l1` | `0.0` | lasso penalty `l1·Σ\|β\|` (feature selection); combine with `l2` for elastic net. Intercept unpenalized |
 | `offset_col` | `NULL` | name of a column holding a per-row **offset** added to the linear predictor `η = offset + xβ` with a fixed coefficient of 1 (not fit, not penalized) |
 | `weights_col` | `NULL` | name of a column of non-negative per-row **sample weights** — the loss (and internal standardization) are weighted by them |
-| `solver` | `'auto'` | `'auto'` = IRLS when it applies, gradient descent otherwise (see below); `'gd'` = force Nesterov gradient descent; `'irls'` = force Fisher-scoring IRLS (supports `l2`, offset, weights; not `l1`; needs full-rank features) |
+| `solver` | `'auto'` | `'auto'` = IRLS, falling back to gradient descent on a rank-deficient design (see below); `'gd'` = force Nesterov gradient descent; `'irls'` = force Fisher-scoring IRLS (supports `l2`, `l1`, offset, weights; needs full-rank features) |
 
 Coefficients are on the **original feature scale** (features — and for
 linear/Poisson/Gamma regression the outcome — are rescaled internally only
@@ -76,15 +76,18 @@ statsmodels, or unpenalized scikit-learn up to convergence tolerance.
 **Solver.** The single-outcome families default to `solver := 'auto'`, which
 picks the fastest solver that is valid for the problem:
 
-- **IRLS** (Fisher scoring / iteratively reweighted least squares) whenever
-  `l1 = 0`. It solves a weighted least-squares system each iteration (a pure-SQL
-  matrix inverse) and reaches the exact maximum-likelihood estimate in ~5–10
-  iterations rather than the ~1000 gradient descent needs — **3–10× faster** end
-  to end for the same answer, matching statsmodels to machine precision.
-- **Nesterov gradient descent** when `l1 > 0` (IRLS cannot do L1), and as an
-  automatic fallback when `XᵀWX` turns out to be singular — a constant or
-  perfectly collinear feature, or complete separation in logistic regression.
-  GD degrades gracefully on those inputs where IRLS cannot.
+- **IRLS** (Fisher scoring / iteratively reweighted least squares). It solves a
+  weighted least-squares system each iteration and reaches the exact maximum-
+  likelihood estimate in ~5–10 iterations rather than the ~1000 gradient descent
+  needs — **3–10× faster** end to end for the same answer, matching statsmodels to
+  machine precision. Without `l1` the system is solved by a pure-SQL matrix
+  inverse; with `l1` there is no inverse to take, so the same normal equations go
+  to **cyclic coordinate descent** with soft-thresholding instead (this is glmnet's
+  proximal-Newton scheme), which also makes lasso coefficients *exactly* zero
+  rather than merely small.
+- **Nesterov gradient descent** as an automatic fallback when `XᵀWX` turns out to
+  be singular — a constant or perfectly collinear feature, or complete separation
+  in logistic regression. GD degrades gracefully on those inputs where IRLS cannot.
 
 The fallback is free: each solver is a recursive CTE gated so that the one not in
 play emits no seed row and never iterates. So `'auto'` costs the same as IRLS on
@@ -400,11 +403,12 @@ a grid, returning one row per grid value with the mean held-out deviance
 
 All `k × |grid|` models are fit **together in a single pass over the data**, and
 — as with `*_fit` — by IRLS, so a sweep costs a handful of iterations rather than
-the thousands gradient descent needs. `cv_l1` is the exception: IRLS cannot solve
-an L1 penalty, so lasso sweeps stay on gradient descent and are correspondingly
-slower. A rank-deficient design (constant or perfectly collinear feature) sends
-the whole run back to gradient descent automatically, exactly as `solver := 'auto'`
-does for a single fit.
+the thousands gradient descent needs. That includes `cv_l1`: the penalised models
+are solved by coordinate descent inside the same iteration, and a grid mixing
+`l1 = 0` with penalised values simply solves each model by whichever method fits.
+A rank-deficient design (constant or perfectly collinear feature) sends the whole
+run back to gradient descent automatically, exactly as `solver := 'auto'` does for
+a single fit.
 
 | macro | tunes | families |
 |---|---|---|

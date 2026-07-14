@@ -2081,11 +2081,13 @@ class TestIRLS:
             assert ir[k] == pytest.approx(gd[k], rel=1e-5, abs=1e-6)
 
     def test_irls_validation_errors(self, con):
+        # note: irls + l1 is no longer an error -- coordinate descent inside the
+        # iteration handles the L1 term (see TestLassoVsSklearn)
         _load(con, "irtrain", self._gen("poisson", 7))
         for sql, msg in [
-            ("poisson_fit('irtrain','y', solver := 'irls', l1 := 0.1)", "does not support L1"),
             ("poisson_fit('irtrain','y', solver := 'badname')", "must be"),
             ("poisson_fit('irtrain','y', solver := 'irls', l2 := -1.0)", "l2 must be"),
+            ("poisson_fit('irtrain','y', solver := 'irls', l1 := -1.0)", "l1 must be"),
         ]:
             with pytest.raises(DuckDBError) as e:
                 con.execute(f"SELECT * FROM {sql}").fetchall()
@@ -2167,24 +2169,51 @@ class TestAutoSolver:
         for k in gd:
             assert au[k] == pytest.approx(gd[k], rel=1e-6, abs=1e-8), k
 
-    def test_auto_routes_l1_to_gd(self, con):
-        # IRLS cannot do L1, so 'auto' must use gd -- and must NOT raise the
-        # "irls does not support L1" error that an explicit solver := 'irls' does
+    def test_l1_agrees_across_solvers(self, con):
+        # L1 is now solved by irls + coordinate descent (proximal Newton) rather
+        # than by the gd proximal-gradient path. Both minimise the same objective,
+        # so they must land on the same optimum -- but only to gd's own tol (its
+        # stopping rule is a gradient step below 1e-10), not to machine precision.
         _load(con, "autrain", self._gen("poisson", 12))
         au = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('autrain','y', l1 := 0.05)").fetchall())
         gd = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('autrain','y', l1 := 0.05, solver := 'gd')").fetchall())
+        ir = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('autrain','y', l1 := 0.05, solver := 'irls')").fetchall())
         for k in gd:
-            assert au[k] == pytest.approx(gd[k], rel=1e-9, abs=1e-12), k
-        with pytest.raises(DuckDBError) as e:
-            con.execute("SELECT * FROM poisson_fit('autrain','y', l1 := 0.05, solver := 'irls')").fetchall()
-        assert "does not support L1" in str(e.value)
+            assert au[k] == pytest.approx(gd[k], rel=1e-6, abs=1e-8), k
+            # 'auto' with l1 IS the irls path: same solver, so they agree to ~1e-15
+            # (not bit-for-bit -- the two plans differ, which reorders the floating
+            # point aggregation by an ulp), far tighter than the gd gap above
+            assert au[k] == pytest.approx(ir[k], rel=1e-12, abs=1e-14), k
 
-    def test_auto_elastic_net_routes_to_gd(self, con):
+    def test_elastic_net_agrees_across_solvers(self, con):
         _load(con, "autrain", self._gen("logistic", 13))
         au = dict(con.execute("SELECT feature, coefficient FROM logit_fit('autrain','y', l1 := 0.02, l2 := 0.1)").fetchall())
         gd = dict(con.execute("SELECT feature, coefficient FROM logit_fit('autrain','y', l1 := 0.02, l2 := 0.1, solver := 'gd')").fetchall())
         for k in gd:
-            assert au[k] == pytest.approx(gd[k], rel=1e-9, abs=1e-12), k
+            assert au[k] == pytest.approx(gd[k], rel=1e-6, abs=1e-8), k
+
+    def test_irls_accepts_l1_now(self, con):
+        # solver := 'irls' with l1 > 0 used to be a hard error; coordinate descent
+        # inside the iteration means it is now supported
+        _load(con, "autrain", self._gen("logistic", 15))
+        r = con.execute("SELECT * FROM logit_fit('autrain','y', l1 := 0.05, solver := 'irls')").fetchall()
+        assert len(r) == 3          # intercept + x1 + x2
+        assert all(np.isfinite(c) for _, c in r)
+
+    def test_l1_produces_exact_zeros(self, con):
+        # the whole point of lasso: shrunk-out coefficients must be EXACTLY 0.0,
+        # not 1e-18. Coordinate descent's soft-threshold gives exact zeros; a
+        # gradient path that merely got close would not.
+        rng = np.random.default_rng(77)
+        n = 2000
+        x1 = rng.normal(size=n)
+        noise = {f"junk{j}": rng.normal(size=n) for j in range(4)}   # pure noise
+        y = rng.binomial(1, 1 / (1 + np.exp(-(0.3 + 1.4 * x1)))).astype(float)
+        _load(con, "autrain", pd.DataFrame({"x1": x1, **noise, "y": y}))
+        r = dict(con.execute("SELECT feature, coefficient FROM logit_fit('autrain','y', l1 := 0.15)").fetchall())
+        zeroed = [k for k, v in r.items() if v == 0.0]
+        assert len(zeroed) >= 3, r          # the noise features are driven out
+        assert all(r[k] == 0.0 for k in zeroed)   # exactly zero, not merely small
 
     def test_bad_solver_name_lists_auto(self, con):
         _load(con, "autrain", self._gen("poisson", 14))
@@ -2256,6 +2285,48 @@ class TestCvIRLS:
         _load(con, "cvt", df)
         r = con.execute("SELECT * FROM cv_l2('cvt','y','logistic',[0.0,0.1], k := 3) ORDER BY l2").fetchall()
         assert all(np.isfinite(d) and d > 0 for _, d in r), r
+
+    def test_cv_l1_grid_including_zero(self, con):
+        # a grid with l1 = 0 mixes an unpenalised model (solved exactly by the
+        # matrix inverse) with penalised ones (solved by coordinate descent) in the
+        # SAME recursion. The l1 = 0 point must equal the plain unpenalised fit.
+        _load(con, "cvt", self._gen(36))
+        r = dict(con.execute("SELECT l1, cv_deviance FROM cv_l1('cvt','y','logistic',[0.0,0.05], k := 4)").fetchall())
+        z = con.execute("SELECT cv_deviance FROM cv_l2('cvt','y','logistic',[0.0], k := 4)").fetchone()[0]
+        assert float(r[0.0]) == pytest.approx(z, rel=1e-9), (r, z)
+
+
+# --------------------------------------------------------------------------- #
+# L1 via coordinate descent, against sklearn
+# --------------------------------------------------------------------------- #
+class TestLassoVsSklearn:
+    @pytest.mark.parametrize("corr", [0.0, 0.99])
+    @pytest.mark.parametrize("l1", [0.05, 0.01])
+    def test_lasso_logistic_matches_sklearn(self, con, corr, l1):
+        # Correlated features are the case that breaks a naively-implemented
+        # coordinate descent: without warm-starting, the outer loop sees a small
+        # step and stops while the coefficients are still far off. corr = 0.99
+        # pins that. sklearn minimises C*sum(loss) + ||b||_1 and this library
+        # minimises (1/n)*sum(loss) + l1*||b||_1, so C = 1/(n*l1).
+        from sklearn.linear_model import LogisticRegression
+        rng = np.random.default_rng(101)
+        n, d = 3000, 6
+        X = rng.normal(size=(n, d))
+        if corr:
+            X[:, 3] = corr * X[:, 0] + np.sqrt(1 - corr ** 2) * rng.normal(size=n)
+        X = (X - X.mean(0)) / X.std(0)
+        beta = np.array([1.2, 0.0, -0.9, 0.5, 0.0, 0.3])
+        y = rng.binomial(1, 1 / (1 + np.exp(-(0.4 + X @ beta)))).astype(float)
+        df = pd.DataFrame({f"x{j}": X[:, j] for j in range(d)})
+        df["y"] = y
+        _load(con, "lz", df)
+
+        got = dict(con.execute("SELECT feature, coefficient FROM logit_fit('lz','y', l1 := %r)" % l1).fetchall())
+        ref = LogisticRegression(C=1.0 / (n * l1), l1_ratio=1, solver="saga",
+                                 tol=1e-11, max_iter=200_000, fit_intercept=True).fit(X, y)
+        exp = {"(Intercept)": ref.intercept_[0], **{f"x{j}": ref.coef_[0][j] for j in range(d)}}
+        for k, v in exp.items():
+            assert got[k] == pytest.approx(v, rel=2e-4, abs=2e-4), (corr, l1, k, got[k], v)
 
 
 # --------------------------------------------------------------------------- #

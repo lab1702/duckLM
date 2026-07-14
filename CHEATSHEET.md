@@ -37,10 +37,12 @@ SELECT * FROM poisson_influence('m', 'train', 'y');                  -- leverage
 Coefficients on the original scale; unpenalized ≙ R `glm`/`lm`, statsmodels.
 
 `solver := 'auto'` (default) runs IRLS — typically 3–10× faster than gradient
-descent for the same MLE — and falls back to `'gd'` automatically when `l1 > 0`
-or when `XᵀWX` is singular (constant or perfectly collinear feature, complete
-separation). `'gd'` and `'irls'` force one solver; forcing `'irls'` on a singular
-design raises an error instead of falling back.
+descent for the same MLE. `l1 > 0` is solved inside IRLS by coordinate descent
+(glmnet's proximal Newton), which also makes lasso coefficients *exactly* zero.
+It falls back to `'gd'` automatically when `XᵀWX` is singular (constant or
+perfectly collinear feature, complete separation). `'gd'` and `'irls'` force one
+solver; forcing `'irls'` on a singular design raises an error instead of falling
+back.
 
 ## Predict
 
