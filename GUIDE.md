@@ -59,34 +59,43 @@ SELECT * FROM rev_model;
 |---|---|---|
 | `tbl` | — | table/view name as a **string** (resolved via `query_table`; schema-qualified names work) |
 | `outcome` | — | column to predict, as a string; for `logit_fit` it must be 0/1 or boolean, for `poisson_fit` non-negative, for `gamma_fit` strictly positive |
-| `max_iter` | `50000` | hard cap on gradient iterations |
+| `max_iter` | `50000` | hard cap on solver iterations (only the `gd` path gets near it; IRLS converges in ~5–10) |
 | `learning_rate` | `NULL` | step size on the standardized scale; `NULL` auto-picks a convergent default (`4/(d+1+4·l2)` logistic, `1/(d+1+l2)` otherwise; Poisson/Gamma steps are additionally damped each iteration by the largest curvature weight, since theirs is unbounded) |
 | `tol` | `1e-10` | stop early when the gradient step is smaller than this |
 | `l2` | `0.0` | ridge penalty `(l2/2)·Σβ²` added to the mean loss of the internally standardized problem, intercept unpenalized |
 | `l1` | `0.0` | lasso penalty `l1·Σ\|β\|` (feature selection); combine with `l2` for elastic net. Intercept unpenalized |
 | `offset_col` | `NULL` | name of a column holding a per-row **offset** added to the linear predictor `η = offset + xβ` with a fixed coefficient of 1 (not fit, not penalized) |
 | `weights_col` | `NULL` | name of a column of non-negative per-row **sample weights** — the loss (and internal standardization) are weighted by them |
-| `solver` | `'gd'` | `'gd'` = Nesterov gradient descent (default); `'irls'` = Fisher-scoring IRLS — far fewer iterations to the exact MLE (supports `l2`, offset, weights; not `l1`; needs full-rank features) |
+| `solver` | `'auto'` | `'auto'` = IRLS when it applies, gradient descent otherwise (see below); `'gd'` = force Nesterov gradient descent; `'irls'` = force Fisher-scoring IRLS (supports `l2`, offset, weights; not `l1`; needs full-rank features) |
 
 Coefficients are on the **original feature scale** (features — and for
 linear/Poisson/Gamma regression the outcome — are rescaled internally only
 for optimizer conditioning), so unpenalized results match R's `glm()`/`lm()`,
 statsmodels, or unpenalized scikit-learn up to convergence tolerance.
 
-**Solver.** The single-outcome families fit by Nesterov gradient descent by
-default. Passing `solver := 'irls'` switches to **Fisher scoring / iteratively
-reweighted least squares**, which solves a weighted least-squares system each
-iteration (a pure-SQL matrix inverse) and reaches the exact maximum-likelihood
-estimate in ~5–10 iterations rather than thousands — typically **several times
-to ~30× faster** (most for the log-link families), and matching statsmodels to
-machine precision (tighter than the GD path's `tol`). IRLS supports ridge
-(`l2`), offsets and weights, but **not** L1/elastic-net (use `'gd'` there), and
-it needs a full-rank design: perfectly collinear features or complete separation
-make `XᵀWX` singular and raise a clear error, where the default `'gd'` solver
-degrades gracefully instead.
+**Solver.** The single-outcome families default to `solver := 'auto'`, which
+picks the fastest solver that is valid for the problem:
+
+- **IRLS** (Fisher scoring / iteratively reweighted least squares) whenever
+  `l1 = 0`. It solves a weighted least-squares system each iteration (a pure-SQL
+  matrix inverse) and reaches the exact maximum-likelihood estimate in ~5–10
+  iterations rather than the ~1000 gradient descent needs — **3–10× faster** end
+  to end for the same answer, matching statsmodels to machine precision.
+- **Nesterov gradient descent** when `l1 > 0` (IRLS cannot do L1), and as an
+  automatic fallback when `XᵀWX` turns out to be singular — a constant or
+  perfectly collinear feature, or complete separation in logistic regression.
+  GD degrades gracefully on those inputs where IRLS cannot.
+
+The fallback is free: each solver is a recursive CTE gated so that the one not in
+play emits no seed row and never iterates. So `'auto'` costs the same as IRLS on
+a well-conditioned fit, and the same as GD when it has to fall back.
+
+Force a solver with `'gd'` or `'irls'`. Forcing `'irls'` on a singular design
+raises a clear error rather than falling back — useful if you would rather hear
+about a rank-deficient design than have it silently absorbed.
 
 ```sql
--- identical coefficients to the default, far fewer iterations
+-- the default already uses IRLS here; this is just explicit
 SELECT * FROM poisson_fit('policies', 'n_claims', solver := 'irls');
 ```
 
@@ -486,20 +495,25 @@ that row is dropped by the fit (as R drops `NA`). `tbl` must be a table/view
 - Prediction returns `NULL` outputs for rows where a model feature is `NULL`
   or the column is missing entirely.
 - Zero-variance (constant) feature columns get coefficient `0`. A constant
-  *outcome* in `linreg_fit` is fine (intercept = mean, slopes 0).
-- Exactly collinear features (singular design) don't error in the `gd` solver:
-  the fit converges to one valid least-squares solution. Its *predictions* match
-  any other solver's; the individual coefficient split across the collinear
-  columns is arbitrary (as it is for every solver). The `irls` solver, `*_summary`,
-  `*_predict_ci`, and `*_influence` instead return a clear error / NULL because
-  the covariance is undefined there.
+  *outcome* in `linreg_fit` is fine (intercept = mean, slopes 0). A constant
+  column makes `XᵀWX` singular, so the default `'auto'` solver falls back to
+  gradient descent here.
+- Exactly collinear features (singular design) don't error under the default
+  `'auto'` solver: it detects the singular `XᵀWX`, falls back to `gd`, and
+  converges to one valid least-squares solution. Its *predictions* match any
+  other solver's; the individual coefficient split across the collinear columns
+  is arbitrary (as it is for every solver). Forcing `solver := 'irls'`, and
+  `*_summary` / `*_predict_ci` / `*_influence`, instead return a clear error /
+  NULL because the covariance is undefined there.
 - Data with no finite maximum-likelihood solution — perfectly separable
   logistic data, or an all-zero-count Poisson/all-constant Gamma outcome —
   still terminates with large coefficients rather than erroring, but only
-  after running all `max_iter` iterations. For **separable logistic** data a
-  positive `l2` gives a finite, fast solution (it penalizes the diverging
-  slopes). For an **all-zero Poisson** outcome it's the *intercept* that
-  diverges, and `l2` does not penalize the intercept (by design, matching
+  after running all `max_iter` iterations. (IRLS diverges to ~1e305 on separable
+  data, which the `'auto'` solver treats as a failure and falls back to `gd`, so
+  you get the same large-but-finite coefficients as before.) For **separable
+  logistic** data a positive `l2` gives a finite, fast solution (it penalizes the
+  diverging slopes). For an **all-zero Poisson** outcome it's the *intercept*
+  that diverges, and `l2` does not penalize the intercept (by design, matching
   glmnet/sklearn), so lower `max_iter` instead.
 - Guarded name collisions (clear errors, never silent misbehavior): column
   *and table* names beginning with `__reg_` are reserved everywhere, checked

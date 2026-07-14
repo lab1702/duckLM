@@ -10,8 +10,9 @@ and a fast IRLS solver. The single-outcome families take optional
 ridge/lasso/elastic-net regularization, an offset/exposure term, and sample
 weights.
 
-Everything runs inside DuckDB: training is Nesterov-accelerated gradient descent
-(or Fisher-scoring IRLS) implemented with a recursive CTE and list lambdas,
+Everything runs inside DuckDB: training is Fisher-scoring IRLS by default, with
+Nesterov-accelerated gradient descent for L1 and as an automatic fallback on a
+rank-deficient design — both implemented with a recursive CTE and list lambdas,
 sharing a single optimizer core across all families; even the coefficient
 covariance (matrix inversion) and the normal/Student-t distributions are
 computed in pure SQL. All outputs are verified against statsmodels / scikit-learn

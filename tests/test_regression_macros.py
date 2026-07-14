@@ -2045,9 +2045,11 @@ class TestIRLS:
         ("tweedie_fit", "tweedie", ", power := 1.5"), ("nbinom_fit", "nbinom", ", alpha := 0.5"),
     ])
     def test_irls_matches_gd(self, con, macro, family, extra):
-        # IRLS reaches the same MLE as the default gradient-descent solver
+        # IRLS reaches the same MLE as the gradient-descent solver. The gd
+        # baseline is requested explicitly: the default is 'auto', which would
+        # itself pick IRLS and make this comparison vacuous.
         _load(con, "irtrain", self._gen(family, 300 + len(macro)))
-        gd = dict(con.execute(f"SELECT feature, coefficient FROM {macro}('irtrain','y'{extra})").fetchall())
+        gd = dict(con.execute(f"SELECT feature, coefficient FROM {macro}('irtrain','y'{extra}, solver := 'gd')").fetchall())
         ir = dict(con.execute(f"SELECT feature, coefficient FROM {macro}('irtrain','y'{extra}, solver := 'irls')").fetchall())
         for k in gd:
             assert ir[k] == pytest.approx(gd[k], rel=1e-5, abs=1e-6), (macro, k)
@@ -2062,7 +2064,7 @@ class TestIRLS:
 
     def test_irls_ridge_matches_gd(self, con):
         _load(con, "irtrain", self._gen("poisson", 22))
-        gd = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('irtrain','y', l2 := 0.5)").fetchall())
+        gd = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('irtrain','y', l2 := 0.5, solver := 'gd')").fetchall())
         ir = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('irtrain','y', l2 := 0.5, solver := 'irls')").fetchall())
         for k in gd:
             assert ir[k] == pytest.approx(gd[k], rel=1e-5, abs=1e-6)
@@ -2073,7 +2075,7 @@ class TestIRLS:
         off, wt = rng.normal(0, 0.4, n), rng.uniform(0.5, 2, n)
         y = rng.poisson(np.exp(0.4 + 0.6 * x1 - 0.3 * x2 + off)).astype(float)
         _load(con, "irtrain", pd.DataFrame({"x1": x1, "x2": x2, "e": off, "w": wt, "y": y}))
-        gd = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('irtrain','y', offset_col := 'e', weights_col := 'w')").fetchall())
+        gd = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('irtrain','y', offset_col := 'e', weights_col := 'w', solver := 'gd')").fetchall())
         ir = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('irtrain','y', offset_col := 'e', weights_col := 'w', solver := 'irls')").fetchall())
         for k in gd:
             assert ir[k] == pytest.approx(gd[k], rel=1e-5, abs=1e-6)
@@ -2097,9 +2099,98 @@ class TestIRLS:
         with pytest.raises(DuckDBError) as e:
             con.execute("SELECT * FROM poisson_fit('irtrain','y', solver := 'irls')").fetchall()
         assert "did not converge" in str(e.value)
-        # the default gd solver still handles the same data without erroring
-        n = con.execute("SELECT count(*) FROM poisson_fit('irtrain','y', max_iter := 200)").fetchone()[0]
+        # the gd solver still handles the same data without erroring
+        n = con.execute("SELECT count(*) FROM poisson_fit('irtrain','y', solver := 'gd', max_iter := 200)").fetchone()[0]
         assert n == 4  # intercept + 3 features
+
+
+# --------------------------------------------------------------------------- #
+# solver := 'auto' (the default): IRLS where it is valid, gd everywhere else
+# --------------------------------------------------------------------------- #
+class TestAutoSolver:
+    def _gen(self, family, seed, n=1500):
+        return TestIRLS()._gen(family, seed, n)
+
+    @pytest.mark.parametrize("macro,family,extra", [
+        ("logit_fit", "logistic", ""), ("linreg_fit", "linear", ""),
+        ("poisson_fit", "poisson", ""), ("gamma_fit", "gamma", ""),
+        ("tweedie_fit", "tweedie", ", power := 1.5"), ("nbinom_fit", "nbinom", ", alpha := 0.5"),
+    ])
+    def test_auto_uses_irls_on_full_rank(self, con, macro, family, extra):
+        # On a well-conditioned design 'auto' must route to IRLS. It agrees with
+        # an explicit solver := 'irls' to ~1e-15 rather than bit-for-bit: the two
+        # plans differ (auto also carries the inert gd branch), which reorders the
+        # floating-point aggregation by an ulp or two. The tolerance below is
+        # still ~1000x tighter than the gd-vs-irls gap (~1e-9, since gd only
+        # converges to tol), so it genuinely proves the IRLS path was taken.
+        _load(con, "autrain", self._gen(family, 400 + len(macro)))
+        au = dict(con.execute(f"SELECT feature, coefficient FROM {macro}('autrain','y'{extra})").fetchall())
+        ir = dict(con.execute(f"SELECT feature, coefficient FROM {macro}('autrain','y'{extra}, solver := 'irls')").fetchall())
+        for k in au:
+            assert au[k] == pytest.approx(ir[k], rel=1e-12, abs=1e-14), (macro, k)
+
+    def test_auto_falls_back_to_gd_on_collinear(self, con):
+        # a duplicated feature makes X'WX singular: forcing irls errors, but the
+        # default must silently fall back to gd and return the gd coefficients
+        df = self._gen("poisson", 8); df["x1dup"] = df["x1"]
+        _load(con, "autrain", df)
+        with pytest.raises(DuckDBError):
+            con.execute("SELECT * FROM poisson_fit('autrain','y', solver := 'irls')").fetchall()
+        au = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('autrain','y', max_iter := 200)").fetchall())
+        gd = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('autrain','y', solver := 'gd', max_iter := 200)").fetchall())
+        assert au and au.keys() == gd.keys()
+        for k in gd:
+            assert au[k] == pytest.approx(gd[k], rel=1e-9, abs=1e-12), k
+
+    def test_auto_falls_back_to_gd_on_constant_column(self, con):
+        # a constant feature is also a singular design -- and one the library
+        # explicitly supports (coefficient pinned to 0), so it must not error
+        df = self._gen("logistic", 9); df["c"] = 4.2
+        _load(con, "autrain", df)
+        au = dict(con.execute("SELECT feature, coefficient FROM logit_fit('autrain','y')").fetchall())
+        gd = dict(con.execute("SELECT feature, coefficient FROM logit_fit('autrain','y', solver := 'gd')").fetchall())
+        assert au["c"] == pytest.approx(0.0, abs=1e-12)
+        for k in gd:
+            assert au[k] == pytest.approx(gd[k], rel=1e-9, abs=1e-12), k
+
+    def test_auto_falls_back_to_gd_on_separation(self, con):
+        # complete separation has no finite MLE: IRLS diverges to ~1e305, which
+        # 'auto' must reject (|beta| > 1e100) and fall back to gd for a finite fit
+        n = 400
+        x1 = np.linspace(-2, 2, n)
+        df = pd.DataFrame({"x1": x1, "x2": np.tile([0.0, 1.0, 2.0, 3.0], n // 4),
+                           "y": (x1 > 0).astype(float)})
+        _load(con, "autrain", df)
+        au = dict(con.execute("SELECT feature, coefficient FROM logit_fit('autrain','y', max_iter := 300)").fetchall())
+        assert all(np.isfinite(v) and abs(v) < 1e100 for v in au.values()), au
+        gd = dict(con.execute("SELECT feature, coefficient FROM logit_fit('autrain','y', solver := 'gd', max_iter := 300)").fetchall())
+        for k in gd:
+            assert au[k] == pytest.approx(gd[k], rel=1e-6, abs=1e-8), k
+
+    def test_auto_routes_l1_to_gd(self, con):
+        # IRLS cannot do L1, so 'auto' must use gd -- and must NOT raise the
+        # "irls does not support L1" error that an explicit solver := 'irls' does
+        _load(con, "autrain", self._gen("poisson", 12))
+        au = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('autrain','y', l1 := 0.05)").fetchall())
+        gd = dict(con.execute("SELECT feature, coefficient FROM poisson_fit('autrain','y', l1 := 0.05, solver := 'gd')").fetchall())
+        for k in gd:
+            assert au[k] == pytest.approx(gd[k], rel=1e-9, abs=1e-12), k
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM poisson_fit('autrain','y', l1 := 0.05, solver := 'irls')").fetchall()
+        assert "does not support L1" in str(e.value)
+
+    def test_auto_elastic_net_routes_to_gd(self, con):
+        _load(con, "autrain", self._gen("logistic", 13))
+        au = dict(con.execute("SELECT feature, coefficient FROM logit_fit('autrain','y', l1 := 0.02, l2 := 0.1)").fetchall())
+        gd = dict(con.execute("SELECT feature, coefficient FROM logit_fit('autrain','y', l1 := 0.02, l2 := 0.1, solver := 'gd')").fetchall())
+        for k in gd:
+            assert au[k] == pytest.approx(gd[k], rel=1e-9, abs=1e-12), k
+
+    def test_bad_solver_name_lists_auto(self, con):
+        _load(con, "autrain", self._gen("poisson", 14))
+        with pytest.raises(DuckDBError) as e:
+            con.execute("SELECT * FROM poisson_fit('autrain','y', solver := 'newton')").fetchall()
+        assert "auto" in str(e.value)
 
 
 # --------------------------------------------------------------------------- #

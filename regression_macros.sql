@@ -378,8 +378,8 @@ __reg_cfg AS (
                THEN error(caller || ': sample weights sum to zero')
              WHEN l2 < 0 THEN error(caller || ': l2 must be >= 0, got ' || l2)
              WHEN l1 < 0 THEN error(caller || ': l1 must be >= 0, got ' || l1)
-             WHEN solver NOT IN ('gd', 'irls')
-               THEN error(caller || ': solver must be ''gd'' or ''irls'', got ''' || solver || '''')
+             WHEN solver NOT IN ('gd', 'irls', 'auto')
+               THEN error(caller || ': solver must be ''auto'', ''gd'' or ''irls'', got ''' || solver || '''')
              WHEN solver = 'irls' AND l1 > 0
                THEN error(caller || ': the irls solver does not support L1 (lasso/elastic-net); use solver := ''gd'' for l1 > 0')
              -- Guaranteed-convergent steps: on standardized data the mean-loss
@@ -401,6 +401,105 @@ __reg_cfg AS (
     FROM __reg_feats f, __reg_packed p, __reg_ycheck y, __reg_namecheck nc
     WHERE y.ok AND nc.ok
 ),
+-- IRLS / Fisher scoring (solver := 'irls'): each iteration solves the weighted
+-- least squares beta <- (X'WX + sumw*l2*D)^-1 X'W z on the standardized data,
+-- where W is the expected-information working weight and z the working response.
+-- Converges to the exact (penalized) MLE in ~5-10 iterations; the matrix solve
+-- uses the __reg_matinv fold (a recursive-CTE inverse cannot nest here). D omits
+-- the intercept. Gated by solver = 'irls' so it is inert (base row only) under
+-- the default gradient-descent solver, and vice versa.
+__reg_irls(it, betas, move) AS (
+    -- cross-join __reg_cfg and touch c.step so ALL input validation (which lives
+    -- in the step CASE: l2/l1 sign, bad solver, l1-with-irls, missing offset/
+    -- weights) fires for the irls path too, not just gradient descent
+    SELECT 0, list_transform(range(f.d + 1), lambda i: 0.0::DOUBLE), 1e308::DOUBLE
+    FROM __reg_feats f, __reg_cfg c
+    WHERE c.step IS NOT NULL
+      -- irls is the solver under solver := 'irls', and under the 'auto' default
+      -- whenever there is no L1 penalty (irls cannot do L1). Otherwise no seed
+      -- row is emitted and this recursion is inert.
+      AND (solver = 'irls' OR (solver = 'auto' AND l1 = 0.0))
+    UNION ALL
+    SELECT it + 1, betas_new,
+           list_aggregate(list_transform(betas_new, lambda v, j: abs(v - betas[j])), 'max')
+    FROM (
+        SELECT it, betas, list_transform(inv, lambda invrow: list_dot_product(invrow, XWr)) AS betas_new
+        FROM (
+            SELECT it, betas, XWr, __reg_matinv(XWXpen) AS inv
+            FROM (
+                -- ridge penalty on the diagonal (intercept at position 1 unpenalized)
+                SELECT it, betas, XWr,
+                       list_transform(XWX, lambda row, a:
+                           list_transform(row, lambda v, b:
+                               CASE WHEN a = b AND a > 1 THEN v + sumw * l2 ELSE v END)) AS XWXpen
+                FROM (
+                    SELECT it, betas, sumw,
+                           list_transform(range(1, len(betas) + 1), lambda a:
+                               list_transform(range(1, len(betas) + 1), lambda b:
+                                   list_sum(list_transform(res, lambda ob: ob.wirls * ob.xs[a] * ob.xs[b])))) AS XWX,
+                           list_transform(range(1, len(betas) + 1), lambda a:
+                               list_sum(list_transform(res, lambda ob: ob.wr * ob.xs[a]))) AS XWr
+                    FROM (
+                        -- per row: expected-info weight wirls, and wr = wirls*(xs.beta) + w*residual
+                        SELECT it, betas, sumw,
+                               list_transform(mus, lambda e: struct_pack(
+                                   xs := e.xs,
+                                   wirls := e.w * (CASE family
+                                              WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
+                                              WHEN 'linear'   THEN 1.0
+                                              WHEN 'poisson'  THEN e.mu
+                                              WHEN 'gamma'    THEN 1.0
+                                              WHEN 'tweedie'  THEN pow(e.mu, 2.0 - power)
+                                              WHEN 'nbinom'   THEN e.mu / (1.0 + alpha_int * e.mu) END),
+                                   wr := e.w * ((CASE family
+                                              WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
+                                              WHEN 'linear'   THEN 1.0
+                                              WHEN 'poisson'  THEN e.mu
+                                              WHEN 'gamma'    THEN 1.0
+                                              WHEN 'tweedie'  THEN pow(e.mu, 2.0 - power)
+                                              WHEN 'nbinom'   THEN e.mu / (1.0 + alpha_int * e.mu) END) * e.linpred
+                                          + (CASE family
+                                              WHEN 'gamma'    THEN e.y / e.mu - 1.0
+                                              WHEN 'tweedie'  THEN (e.y - e.mu) * pow(e.mu, 1.0 - power)
+                                              WHEN 'nbinom'   THEN (e.y - e.mu) / (1.0 + alpha_int * e.mu)
+                                              ELSE e.y - e.mu END))
+                                   )) AS res
+                        FROM (
+                            SELECT g.it, g.betas, p.sumw, c.alpha_int AS alpha_int,
+                                   list_transform(p.rows, lambda rw: struct_pack(
+                                       xs := rw.xs, w := rw.w, y := rw.y,
+                                       linpred := list_dot_product(rw.xs, g.betas),
+                                       mu := CASE family
+                                               WHEN 'logistic' THEN 1.0 / (1.0 + exp(-greatest(least(list_dot_product(rw.xs, g.betas) + rw.o, 700.0), -700.0)))
+                                               WHEN 'linear'   THEN list_dot_product(rw.xs, g.betas) + rw.o
+                                               ELSE exp(greatest(least(list_dot_product(rw.xs, g.betas) + rw.o, 700.0), -700.0)) END
+                                       )) AS mus
+                            FROM __reg_irls g, __reg_packed p, __reg_cfg c
+                            -- isfinite() stops promptly on a singular step (NaN move),
+                            -- since NaN >= tol is TRUE in DuckDB and would otherwise loop
+                            WHERE g.it < max_iter AND g.move >= tol AND isfinite(g.move)
+                        )
+                    )
+                )
+            )
+        )
+    )
+),
+-- Last irls iterate, and whether it can be trusted. A singular X'WX (a constant
+-- or perfectly collinear feature) drives the coefficients to NaN; complete
+-- separation drives them to ~1e305. Both are rejected here, which is what makes
+-- solver := 'auto' fall back to gradient descent instead of returning garbage.
+-- Empty (=> ok false) when irls did not run at all, which is exactly the gate gd
+-- wants: solver := 'gd' and the l1 > 0 path both need gd to run.
+__reg_irls_beta AS (SELECT betas FROM __reg_irls ORDER BY it DESC LIMIT 1),
+__reg_irls_ok AS (
+    SELECT coalesce(
+             (SELECT list_aggregate(
+                        list_transform(betas, lambda v: isfinite(v) AND abs(v) < 1e100),
+                        'bool_and')
+              FROM __reg_irls_beta),
+             false) AS ok
+),
 -- Nesterov-accelerated gradient descent on the mean loss (negative
 -- log-likelihood for logistic, squared error / 2 for linear).
 -- The early-stop criterion is the size of the pure gradient step,
@@ -408,12 +507,18 @@ __reg_cfg AS (
 -- momentum can make two consecutive iterates coincide exactly at a
 -- non-stationary point (deterministically so for exactly collinear features),
 -- while the gradient step is zero only at a true stationary point.
+-- Gated so that it produces NO rows (not even the seed) when gradient descent is
+-- not the solver in play: solver := 'gd' always runs it, solver := 'auto' runs it
+-- only as the fallback when irls came back singular/divergent, and solver := 'irls'
+-- never does. With no seed row the recursion terminates immediately, so the
+-- unused solver costs nothing.
 __reg_gd AS (
     SELECT 0 AS it,
            list_transform(range(f.d + 1), lambda i: 0.0::DOUBLE) AS betas,
            list_transform(range(f.d + 1), lambda i: 0.0::DOUBLE) AS prev,
            1e308::DOUBLE AS move
     FROM __reg_feats f
+    WHERE solver = 'gd' OR (solver = 'auto' AND NOT (SELECT ok FROM __reg_irls_ok))
     UNION ALL
     SELECT it + 1,
            newbetas,
@@ -500,105 +605,28 @@ __reg_gd AS (
                            list_transform(g.betas, lambda b, j:
                                b + (g.it::DOUBLE / (g.it + 3)) * (b - g.prev[j])) AS look
                     FROM __reg_gd g, __reg_packed p, __reg_cfg c
-                    WHERE g.it < max_iter AND g.move >= tol AND solver != 'irls'
+                    WHERE g.it < max_iter AND g.move >= tol
                 )
             )
         )
         )
     )
 ),
--- IRLS / Fisher scoring (solver := 'irls'): each iteration solves the weighted
--- least squares beta <- (X'WX + sumw*l2*D)^-1 X'W z on the standardized data,
--- where W is the expected-information working weight and z the working response.
--- Converges to the exact (penalized) MLE in ~5-10 iterations; the matrix solve
--- uses the __reg_matinv fold (a recursive-CTE inverse cannot nest here). D omits
--- the intercept. Gated by solver = 'irls' so it is inert (base row only) under
--- the default gradient-descent solver, and vice versa.
-__reg_irls(it, betas, move) AS (
-    -- cross-join __reg_cfg and touch c.step so ALL input validation (which lives
-    -- in the step CASE: l2/l1 sign, bad solver, l1-with-irls, missing offset/
-    -- weights) fires for the irls path too, not just gradient descent
-    SELECT 0, list_transform(range(f.d + 1), lambda i: 0.0::DOUBLE), 1e308::DOUBLE
-    FROM __reg_feats f, __reg_cfg c
-    WHERE c.step IS NOT NULL
-    UNION ALL
-    SELECT it + 1, betas_new,
-           list_aggregate(list_transform(betas_new, lambda v, j: abs(v - betas[j])), 'max')
-    FROM (
-        SELECT it, betas, list_transform(inv, lambda invrow: list_dot_product(invrow, XWr)) AS betas_new
-        FROM (
-            SELECT it, betas, XWr, __reg_matinv(XWXpen) AS inv
-            FROM (
-                -- ridge penalty on the diagonal (intercept at position 1 unpenalized)
-                SELECT it, betas, XWr,
-                       list_transform(XWX, lambda row, a:
-                           list_transform(row, lambda v, b:
-                               CASE WHEN a = b AND a > 1 THEN v + sumw * l2 ELSE v END)) AS XWXpen
-                FROM (
-                    SELECT it, betas, sumw,
-                           list_transform(range(1, len(betas) + 1), lambda a:
-                               list_transform(range(1, len(betas) + 1), lambda b:
-                                   list_sum(list_transform(res, lambda ob: ob.wirls * ob.xs[a] * ob.xs[b])))) AS XWX,
-                           list_transform(range(1, len(betas) + 1), lambda a:
-                               list_sum(list_transform(res, lambda ob: ob.wr * ob.xs[a]))) AS XWr
-                    FROM (
-                        -- per row: expected-info weight wirls, and wr = wirls*(xs.beta) + w*residual
-                        SELECT it, betas, sumw,
-                               list_transform(mus, lambda e: struct_pack(
-                                   xs := e.xs,
-                                   wirls := e.w * (CASE family
-                                              WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
-                                              WHEN 'linear'   THEN 1.0
-                                              WHEN 'poisson'  THEN e.mu
-                                              WHEN 'gamma'    THEN 1.0
-                                              WHEN 'tweedie'  THEN pow(e.mu, 2.0 - power)
-                                              WHEN 'nbinom'   THEN e.mu / (1.0 + alpha_int * e.mu) END),
-                                   wr := e.w * ((CASE family
-                                              WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
-                                              WHEN 'linear'   THEN 1.0
-                                              WHEN 'poisson'  THEN e.mu
-                                              WHEN 'gamma'    THEN 1.0
-                                              WHEN 'tweedie'  THEN pow(e.mu, 2.0 - power)
-                                              WHEN 'nbinom'   THEN e.mu / (1.0 + alpha_int * e.mu) END) * e.linpred
-                                          + (CASE family
-                                              WHEN 'gamma'    THEN e.y / e.mu - 1.0
-                                              WHEN 'tweedie'  THEN (e.y - e.mu) * pow(e.mu, 1.0 - power)
-                                              WHEN 'nbinom'   THEN (e.y - e.mu) / (1.0 + alpha_int * e.mu)
-                                              ELSE e.y - e.mu END))
-                                   )) AS res
-                        FROM (
-                            SELECT g.it, g.betas, p.sumw, c.alpha_int AS alpha_int,
-                                   list_transform(p.rows, lambda rw: struct_pack(
-                                       xs := rw.xs, w := rw.w, y := rw.y,
-                                       linpred := list_dot_product(rw.xs, g.betas),
-                                       mu := CASE family
-                                               WHEN 'logistic' THEN 1.0 / (1.0 + exp(-greatest(least(list_dot_product(rw.xs, g.betas) + rw.o, 700.0), -700.0)))
-                                               WHEN 'linear'   THEN list_dot_product(rw.xs, g.betas) + rw.o
-                                               ELSE exp(greatest(least(list_dot_product(rw.xs, g.betas) + rw.o, 700.0), -700.0)) END
-                                       )) AS mus
-                            FROM __reg_irls g, __reg_packed p, __reg_cfg c
-                            -- isfinite() stops promptly on a singular step (NaN move),
-                            -- since NaN >= tol is TRUE in DuckDB and would otherwise loop
-                            WHERE g.it < max_iter AND g.move >= tol AND isfinite(g.move) AND solver = 'irls'
-                        )
-                    )
-                )
-            )
-        )
-    )
-),
+__reg_gd_beta AS (SELECT betas FROM __reg_gd ORDER BY it DESC LIMIT 1),
 __reg_sol AS (
-    -- IRLS produces non-finite coefficients on a singular X'WX (perfectly
-    -- collinear features or complete separation); fail clearly rather than
-    -- return NaN. The default gradient-descent solver stays finite, so this
-    -- only ever fires for solver := 'irls'.
-    SELECT CASE WHEN list_aggregate(list_transform(b.betas, lambda v: isfinite(v)), 'bool_and')
-                THEN b.betas
-                ELSE error(caller || ': the irls solver did not converge -- X''WX is singular '
-                           || '(perfectly collinear features, or complete separation for logistic). '
-                           || 'Use the default solver := ''gd'', or add l2 ridge.') END AS betas
-    FROM (SELECT betas FROM (SELECT it, betas FROM __reg_gd UNION ALL SELECT it, betas FROM __reg_irls)
-          ORDER BY it DESC LIMIT 1) b
+    -- Exactly one solver produced a seed row (see the gates above), except under
+    -- solver := 'auto' with a singular X'WX, where irls ran, was rejected, and gd
+    -- ran as the fallback -- so gd's answer wins whenever gd produced one.
+    SELECT CASE
+             WHEN (SELECT count(*) FROM __reg_gd_beta) > 0
+               THEN (SELECT betas FROM __reg_gd_beta)
+             WHEN (SELECT ok FROM __reg_irls_ok)
+               THEN (SELECT betas FROM __reg_irls_beta)
+             -- Only reachable for an explicit solver := 'irls'; 'auto' falls back.
+             ELSE error(caller || ': the irls solver did not converge -- X''WX is singular '
+                        || '(perfectly collinear features, or complete separation for logistic). '
+                        || 'Use solver := ''auto'' (the default) or solver := ''gd'', or add l2 ridge.')
+           END AS betas
 )
 -- Map standardized-scale coefficients back to the original scales of x and y.
 -- Linear/logistic: the outcome scaling multiplies the whole linear predictor,
@@ -706,10 +734,10 @@ LEFT JOIN __reg_offset o ON o.rid = n.__reg_rid__;
 -- Public wrappers
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE MACRO logit_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'gd') AS TABLE
+CREATE OR REPLACE MACRO logit_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'auto') AS TABLE
 SELECT * FROM __reg_fit(tbl, outcome, 'logistic', 'logit_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL, solver);
 
-CREATE OR REPLACE MACRO linreg_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'gd') AS TABLE
+CREATE OR REPLACE MACRO linreg_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'auto') AS TABLE
 SELECT * FROM __reg_fit(tbl, outcome, 'linear', 'linreg_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL, solver);
 
 CREATE OR REPLACE MACRO logit_predict(model, tbl, threshold := 0.5, offset_col := NULL) AS TABLE
@@ -725,7 +753,7 @@ SELECT * EXCLUDE (__reg_rid__, __reg_score__),
 FROM __reg_score(model, tbl, 'linreg_predict', offset_col)
 ORDER BY __reg_rid__;
 
-CREATE OR REPLACE MACRO poisson_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'gd') AS TABLE
+CREATE OR REPLACE MACRO poisson_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'auto') AS TABLE
 SELECT * FROM __reg_fit(tbl, outcome, 'poisson', 'poisson_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL, solver);
 
 CREATE OR REPLACE MACRO poisson_predict(model, tbl, offset_col := NULL) AS TABLE
@@ -734,7 +762,7 @@ SELECT * EXCLUDE (__reg_rid__, __reg_score__),
 FROM __reg_score(model, tbl, 'poisson_predict', offset_col)
 ORDER BY __reg_rid__;
 
-CREATE OR REPLACE MACRO gamma_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'gd') AS TABLE
+CREATE OR REPLACE MACRO gamma_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'auto') AS TABLE
 SELECT * FROM __reg_fit(tbl, outcome, 'gamma', 'gamma_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, NULL, solver);
 
 CREATE OR REPLACE MACRO gamma_predict(model, tbl, offset_col := NULL) AS TABLE
@@ -747,7 +775,7 @@ ORDER BY __reg_rid__;
 -- Poisson (p=1) and Gamma (p=2); 1<p<2 is the compound Poisson-Gamma that
 -- admits exact zeros alongside positive values (e.g. insurance pure premium).
 -- Matches sklearn TweedieRegressor(power=p, alpha=0, link='log').
-CREATE OR REPLACE MACRO tweedie_fit(tbl, outcome, power := 1.5, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'gd') AS TABLE
+CREATE OR REPLACE MACRO tweedie_fit(tbl, outcome, power := 1.5, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'auto') AS TABLE
 SELECT * FROM __reg_fit(tbl, outcome, 'tweedie', 'tweedie_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1, NULL, solver);
 
 CREATE OR REPLACE MACRO tweedie_predict(model, tbl, offset_col := NULL) AS TABLE
@@ -760,7 +788,7 @@ ORDER BY __reg_rid__;
 -- fixed dispersion (variance = mu + alpha*mu^2); alpha -> 0 recovers Poisson.
 -- Matches statsmodels GLM NegativeBinomial(alpha=alpha) (fixed dispersion);
 -- alpha is a hyperparameter here, not estimated.
-CREATE OR REPLACE MACRO nbinom_fit(tbl, outcome, alpha := 1.0, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'gd') AS TABLE
+CREATE OR REPLACE MACRO nbinom_fit(tbl, outcome, alpha := 1.0, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'auto') AS TABLE
 SELECT * FROM __reg_fit(tbl, outcome, 'nbinom', 'nbinom_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, NULL, l1, alpha, solver);
 
 CREATE OR REPLACE MACRO nbinom_predict(model, tbl, offset_col := NULL) AS TABLE
@@ -1633,32 +1661,48 @@ CREATE OR REPLACE MACRO __reg_bcf_aa(a, b, x, j) AS (   -- j-th continued-fracti
              / ((a + 2.0*((j+1)//2)::DOUBLE) * (a + 1.0 + 2.0*((j+1)//2)::DOUBLE))
   END
 );
-CREATE OR REPLACE MACRO __reg_betacf(a, b, x) AS (      -- modified-Lentz CF (400 terms)
+-- Modified-Lentz CF (400 terms). The j-th CF coefficient is precomputed into the
+-- term list (aa) rather than recomputed inside the fold: DuckDB does not
+-- common-subexpression-eliminate inside a lambda body, so the four textual
+-- __reg_bcf_aa(...) uses below would otherwise each be evaluated per term.
+CREATE OR REPLACE MACRO __reg_betacf(a, b, x) AS (
   list_reduce(
     [ struct_pack(c := 1.0::DOUBLE,
                   d := 1.0 / __reg_fpmin(1.0 - (a+b)*x/(a+1.0)),
-                  h := 1.0 / __reg_fpmin(1.0 - (a+b)*x/(a+1.0)), j := 0) ]
+                  h := 1.0 / __reg_fpmin(1.0 - (a+b)*x/(a+1.0)), aa := 0.0::DOUBLE) ]
     || list_transform(range(1, 401),
-         lambda i: struct_pack(c := 0.0::DOUBLE, d := 0.0::DOUBLE, h := 0.0::DOUBLE, j := i)),
+         lambda i: struct_pack(c := 0.0::DOUBLE, d := 0.0::DOUBLE, h := 0.0::DOUBLE,
+                               aa := __reg_bcf_aa(a,b,x,i)::DOUBLE)),
     (acc, e) -> struct_pack(
-       c := __reg_fpmin(1.0 + __reg_bcf_aa(a,b,x,e.j) / acc.c),
-       d := 1.0 / __reg_fpmin(1.0 + __reg_bcf_aa(a,b,x,e.j) * acc.d),
-       h := acc.h * (1.0 / __reg_fpmin(1.0 + __reg_bcf_aa(a,b,x,e.j) * acc.d))
-                  * __reg_fpmin(1.0 + __reg_bcf_aa(a,b,x,e.j) / acc.c),
-       j := e.j)
+       c  := __reg_fpmin(1.0 + e.aa / acc.c),
+       d  := 1.0 / __reg_fpmin(1.0 + e.aa * acc.d),
+       h  := acc.h * (1.0 / __reg_fpmin(1.0 + e.aa * acc.d))
+                   * __reg_fpmin(1.0 + e.aa / acc.c),
+       aa := e.aa)
   ).h
 );
-CREATE OR REPLACE MACRO __reg_betai(a, b, x) AS (       -- regularized incomplete beta I_x(a,b)
+-- Regularized incomplete beta I_x(a,b). Macro expansion is textual, so a
+-- __reg_betacf call in each CASE branch would put two copies of the 400-term
+-- fold in the plan. The prefactor is symmetric under (a,b,x) -> (b,a,1-x), so
+-- only the arguments and the sign flip: one expansion covers both branches.
+CREATE OR REPLACE MACRO __reg_betai(a, b, x) AS (
   CASE WHEN x <= 0.0 THEN 0.0
        WHEN x >= 1.0 THEN 1.0
-       WHEN x < (a+1.0)/(a+b+2.0)
-         THEN exp(lgamma(a+b)-lgamma(a)-lgamma(b)+a*ln(x)+b*ln(1.0-x)) * __reg_betacf(a,b,x)/a
-       ELSE 1.0 - exp(lgamma(a+b)-lgamma(a)-lgamma(b)+a*ln(x)+b*ln(1.0-x)) * __reg_betacf(b,a,1.0-x)/b
+       ELSE (CASE WHEN x < (a+1.0)/(a+b+2.0) THEN 0.0 ELSE 1.0 END)
+          + (CASE WHEN x < (a+1.0)/(a+b+2.0) THEN 1.0 ELSE -1.0 END)
+          * exp(lgamma(a+b)-lgamma(a)-lgamma(b)+a*ln(x)+b*ln(1.0-x))
+          * __reg_betacf(CASE WHEN x < (a+1.0)/(a+b+2.0) THEN a ELSE b END,
+                         CASE WHEN x < (a+1.0)/(a+b+2.0) THEN b ELSE a END,
+                         CASE WHEN x < (a+1.0)/(a+b+2.0) THEN x ELSE 1.0-x END)
+          / (CASE WHEN x < (a+1.0)/(a+b+2.0) THEN a ELSE b END)
   END
 );
-CREATE OR REPLACE MACRO __reg_t_sf(t, df) AS (          -- P(T>t), cancellation-free tail
-  CASE WHEN t >= 0.0 THEN 0.5 * __reg_betai(df/2.0, 0.5, df/(df + t*t))
-       ELSE 1.0 - 0.5 * __reg_betai(df/2.0, 0.5, df/(df + t*t)) END
+-- P(T>t), cancellation-free tail. Likewise folded to a single __reg_betai
+-- expansion (t_ppf runs 13 Newton steps, each expanding this macro).
+CREATE OR REPLACE MACRO __reg_t_sf(t, df) AS (
+  (CASE WHEN t >= 0.0 THEN 0.0 ELSE 1.0 END)
+  + (CASE WHEN t >= 0.0 THEN 0.5 ELSE -0.5 END)
+    * __reg_betai(df/2.0, 0.5, df/(df + t*t))
 );
 CREATE OR REPLACE MACRO t_cdf(t, df) AS ( 1.0 - __reg_t_sf(t::DOUBLE, df::DOUBLE) );
 CREATE OR REPLACE MACRO __reg_t_pdf(t, df) AS (

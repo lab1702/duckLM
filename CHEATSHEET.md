@@ -30,12 +30,17 @@ SELECT * FROM poisson_influence('m', 'train', 'y');                  -- leverage
           , l1 := 0.0           -- lasso / elastic-net with l2
           , offset_col := NULL  -- +offset in eta, coef fixed at 1
           , weights_col := NULL -- per-row sample weights
-          , solver := 'gd')     -- 'gd' | 'irls' (exact MLE, no l1, full-rank)
+          , solver := 'auto')    -- 'auto' | 'gd' | 'irls'
    -> (feature VARCHAR, coefficient DOUBLE)
 ```
 
 Coefficients on the original scale; unpenalized ≙ R `glm`/`lm`, statsmodels.
-`solver := 'irls'` is ~5–30× faster to the exact MLE.
+
+`solver := 'auto'` (default) runs IRLS — typically 3–10× faster than gradient
+descent for the same MLE — and falls back to `'gd'` automatically when `l1 > 0`
+or when `XᵀWX` is singular (constant or perfectly collinear feature, complete
+separation). `'gd'` and `'irls'` force one solver; forcing `'irls'` on a singular
+design raises an error instead of falling back.
 
 ## Predict
 
