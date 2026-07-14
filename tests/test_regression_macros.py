@@ -1626,6 +1626,70 @@ class TestInference:
 
 
 # --------------------------------------------------------------------------- #
+# Multinomial (softmax) inference (multinom_summary)
+# --------------------------------------------------------------------------- #
+class TestMultinomInference:
+    def _ref_se(self, X, Bhat):
+        # SE from the baseline-category multinomial Fisher information at Bhat
+        K1, d = Bhat.shape
+        eta = X @ np.vstack([np.zeros(d), Bhat]).T
+        P = np.exp(eta); P /= P.sum(1, keepdims=True); pnr = P[:, 1:]
+        I = np.zeros((K1 * d, K1 * d))
+        for c in range(K1):
+            for cp in range(K1):
+                w = pnr[:, c] * ((1.0 if c == cp else 0.0) - pnr[:, cp])
+                I[c * d:(c + 1) * d, cp * d:(cp + 1) * d] = X.T @ (w[:, None] * X)
+        return np.sqrt(np.diag(np.linalg.inv(I)))
+
+    @pytest.mark.parametrize("K", [3, 4])
+    def test_se_matches_info_matrix(self, con, K):
+        from scipy import stats as st
+        rng = np.random.default_rng(20 + K); n, P = 3000, 3
+        Xf = rng.normal(0, 1, (n, P)); X = np.column_stack([np.ones(n), *Xf.T]); d = P + 1
+        Btrue = np.vstack([np.zeros(d), rng.normal(0, 0.6, (K - 1, d))])
+        PP = np.exp(X @ Btrue.T); PP /= PP.sum(1, keepdims=True)
+        y = np.array([rng.choice(K, p=PP[i]) for i in range(n)])
+        _load(con, "mtrain", pd.DataFrame({**{f"x{j+1}": Xf[:, j] for j in range(P)}, "y": [str(v) for v in y]}))
+        con.execute("CREATE OR REPLACE TABLE mmodel AS SELECT * FROM multinom_fit('mtrain','y')")
+        s = con.execute("SELECT * FROM multinom_summary('mmodel','mtrain','y', conf_level := 0.99)").df()
+        assert len(s) == (K - 1) * d  # reference class excluded
+        classes = sorted(s["class"].unique()); feats = ["(Intercept)"] + [f"x{j+1}" for j in range(P)]
+        piv = s.set_index(["class", "feature"])
+        Bhat = np.array([[piv.loc[(c, f), "coefficient"] for f in feats] for c in classes])
+        se = self._ref_se(X, Bhat); coef = Bhat.flatten()
+        stat = coef / se; pv = 2 * st.norm.sf(np.abs(stat)); q = st.norm.ppf(0.995)
+        got = piv.loc[[(c, f) for c in classes for f in feats]]
+        assert got["std_error"].values == pytest.approx(se, rel=1e-6, abs=1e-9)
+        assert got["statistic"].values == pytest.approx(stat, rel=1e-6, abs=1e-9)
+        assert got["p_value"].values == pytest.approx(pv, rel=1e-5, abs=1e-12)
+        assert got["conf_low"].values == pytest.approx(coef - q * se, rel=1e-6, abs=1e-9)
+        assert got["conf_high"].values == pytest.approx(coef + q * se, rel=1e-6, abs=1e-9)
+
+    def test_k2_multinom_matches_logistic(self, con):
+        # a 2-class softmax reduces to logistic regression, so the SEs must agree
+        rng = np.random.default_rng(3); n = 2000
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        y = rng.binomial(1, 1 / (1 + np.exp(-(0.4 + 0.7 * x1 - 0.5 * x2)))).astype(int)
+        _load(con, "mtrain", pd.DataFrame({"x1": x1, "x2": x2, "y": [str(v) for v in y]}))
+        con.execute("CREATE OR REPLACE TABLE mmodel AS SELECT * FROM multinom_fit('mtrain','y')")
+        sm = con.execute("SELECT feature, std_error FROM multinom_summary('mmodel','mtrain','y')").df().set_index("feature")
+        _load(con, "btrain", pd.DataFrame({"x1": x1, "x2": x2, "yb": y}))
+        con.execute("CREATE OR REPLACE TABLE bmodel AS SELECT * FROM logit_fit('btrain','yb')")
+        sl = con.execute("SELECT feature, std_error FROM logit_summary('bmodel','btrain','yb')").df().set_index("feature")
+        assert sm.loc[sl.index, "std_error"].values == pytest.approx(sl["std_error"].values, rel=1e-3)
+
+    def test_multinom_singular_null(self, con):
+        rng = np.random.default_rng(7); n = 1500
+        x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        y = rng.integers(0, 3, n)
+        _load(con, "mtrain", pd.DataFrame({"x1": x1, "x2": x2, "x1dup": x1, "y": [str(v) for v in y]}))
+        con.execute("CREATE OR REPLACE TABLE mmodel AS SELECT * FROM multinom_fit('mtrain','y')")
+        s = con.execute("SELECT * FROM multinom_summary('mmodel','mtrain','y')").df()
+        assert len(s) == 2 * 4  # 2 non-reference classes x 4 features (incl. the duplicate)
+        assert s["std_error"].isna().all() and s["coefficient"].notna().all()
+
+
+# --------------------------------------------------------------------------- #
 # Error handling & reserved names
 # --------------------------------------------------------------------------- #
 class TestErrors:

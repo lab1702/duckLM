@@ -208,7 +208,7 @@ and `bic` use *k* = number of model coefficients (intercept included). Gamma's
 log-likelihood/AIC depend on the dispersion parameter, so it reports deviance,
 deviance-based pseudo-R², and the Pearson `dispersion` instead.
 
-## Inference: `logit_summary` / `linreg_summary` / `poisson_summary` / `gamma_summary` / `tweedie_summary` / `nbinom_summary`
+## Inference: `logit_summary` / `linreg_summary` / `poisson_summary` / `gamma_summary` / `tweedie_summary` / `nbinom_summary` / `multinom_summary`
 
 A **coefficient table** with standard errors, test statistics, p-values and
 confidence intervals — the equivalent of R's `summary(glm(...))` or statsmodels
@@ -256,8 +256,21 @@ penalty). Collinear, constant, or severely ill-conditioned features make `XᵀWX
 singular/indefinite, so every `std_error`/`statistic`/`p_value`/CI is returned
 as **NULL** rather than a fabricated value (the `coefficient` column is still
 reported); the same happens for the estimated-dispersion families when residual
-df `n − d ≤ 0`. Degenerate inputs return NULL, never an error. Multinomial
-standard errors are not yet provided.
+df `n − d ≤ 0`. Degenerate inputs return NULL, never an error.
+
+**Multinomial** inference is `multinom_summary(model, tbl, outcome, conf_level := 0.95)`.
+It inverts the baseline-category softmax Fisher information (the block matrix
+`I[(c,j),(c',k)] = Σᵢ pᵢ_c(δ_cc' − pᵢ_c')·xᵢⱼxᵢₖ`, dispersion fixed at 1, so
+z inference like logistic) and returns one row per estimated `(class, feature)`
+for the `K − 1` non-reference classes — matching statsmodels `MNLogit` to machine
+precision (and, for two classes, exactly reproducing `logit_summary`). The
+reference class (alphabetical-minimum label) is the fixed baseline and is not
+reported.
+
+```sql
+CREATE TABLE model AS SELECT * FROM multinom_fit('iris', 'species');
+SELECT * FROM multinom_summary('model', 'iris', 'species');
+```
 
 ## Multiclass: `multinom_fit` / `multinom_predict` / `multinom_evaluate`
 

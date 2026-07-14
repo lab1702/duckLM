@@ -1726,3 +1726,127 @@ CREATE OR REPLACE MACRO tweedie_summary(model, tbl, outcome, power := 1.5, conf_
 SELECT * FROM __reg_summary(model, tbl, outcome, 'tweedie', 'tweedie_summary', conf_level, offset_col, weights_col, power, NULL);
 CREATE OR REPLACE MACRO nbinom_summary(model, tbl, outcome, alpha := 1.0, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
 SELECT * FROM __reg_summary(model, tbl, outcome, 'nbinom', 'nbinom_summary', conf_level, offset_col, weights_col, NULL, alpha);
+
+-- Multinomial (softmax) coefficient inference. Baseline-category Fisher
+-- information I[(c,j),(c',k)] = sum_i p_ic(delta_cc' - p_ic') x_ij x_ik over the
+-- K-1 non-reference classes; Cov = I^-1, dispersion fixed = 1, z inference.
+-- Returns one row per estimated (class, feature); the reference (alphabetical-
+-- min) class is the fixed baseline and is not reported.
+CREATE OR REPLACE MACRO multinom_summary(model, tbl, outcome, conf_level := 0.95) AS TABLE
+WITH RECURSIVE
+mdl AS (SELECT class, feature, coefficient FROM query_table(model)),
+refc AS (SELECT min(class) AS ref FROM mdl),
+featnames AS (
+  SELECT [ '(Intercept)' ] || list(DISTINCT feature ORDER BY feature) FILTER (WHERE feature != '(Intercept)') AS fn
+  FROM mdl
+),
+-- beta vector per class ([intercept, features sorted]); non-reference classes ordered
+bpc AS (
+  SELECT class,
+         [ coalesce(max(coefficient) FILTER (WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
+         || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)') AS bvec
+  FROM mdl GROUP BY class
+),
+Bmat AS (
+  SELECT list(bvec ORDER BY class) AS B, list(class ORDER BY class) AS cls
+  FROM bpc WHERE class != (SELECT ref FROM refc)
+),
+num AS (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
+alllong AS (
+  SELECT rid, name AS col, value AS v
+  FROM (UNPIVOT (SELECT rid, TRY_CAST(COLUMNS(* EXCLUDE (rid)) AS DOUBLE) FROM num)
+        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE value)
+),
+kfeat AS (SELECT count(DISTINCT feature) FILTER (WHERE feature != '(Intercept)') AS k FROM mdl),
+feat AS (
+  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY l.col) AS xs, count(*)::INT AS nf
+  FROM alllong l JOIN (SELECT DISTINCT feature FROM mdl WHERE feature != '(Intercept)') m ON m.feature = l.col
+  GROUP BY l.rid
+),
+-- per-row softmax probabilities for the non-reference classes
+probs AS (
+  SELECT rid, xs, list_transform(ee, lambda e: e/(1.0 + list_sum(ee))) AS p
+  FROM (
+    SELECT f.rid, f.xs,
+           list_transform((SELECT B FROM Bmat), lambda bc: exp(least(list_dot_product(f.xs, bc), 700.0))) AS ee
+    FROM feat f, kfeat WHERE f.nf = kfeat.k
+  )
+),
+dims AS (
+  SELECT (SELECT len(B) FROM Bmat) AS km1,
+         (SELECT k FROM kfeat) + 1 AS d,
+         ((SELECT len(B) FROM Bmat)) * ((SELECT k FROM kfeat) + 1) AS M
+),
+-- block-structured information matrix via flat index pairs
+idx AS (SELECT unnest(range(1, (SELECT M FROM dims)+1)) AS i),
+pairs AS (
+  SELECT a.i AS a, b.i AS b,
+         (a.i-1)//(SELECT d FROM dims) AS ca, (a.i-1)%(SELECT d FROM dims) AS ja,
+         (b.i-1)//(SELECT d FROM dims) AS cb, (b.i-1)%(SELECT d FROM dims) AS kb
+  FROM idx a, idx b
+),
+info AS (
+  SELECT list(rowlist ORDER BY a) AS A FROM (
+    SELECT a, list(val ORDER BY b) AS rowlist FROM (
+      SELECT p.a AS a, p.b AS b,
+             sum(pr.p[p.ca+1] * ((CASE WHEN p.ca = p.cb THEN 1.0 ELSE 0.0 END) - pr.p[p.cb+1])
+                 * pr.xs[p.ja+1] * pr.xs[p.kb+1]) AS val
+      FROM probs pr, pairs p GROUP BY p.a, p.b
+    ) GROUP BY a
+  )
+),
+-- diagonal scaling -> unit-diagonal correlation form
+scal AS (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc FROM info),
+rscaled AS (SELECT dsc, list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dsc[i]*dsc[j]))) AS R FROM scal),
+gj(k, d, sing, M) AS (
+  SELECT 0, len(R), false,
+         list_transform(R, lambda row, i:
+             list_concat(list_transform(row, lambda v, j: v::DOUBLE),
+                         list_transform(row, lambda v, j: CASE WHEN j = i THEN 1.0 ELSE 0.0 END)))
+  FROM rscaled
+  UNION ALL
+  SELECT col, d, sing OR abs(piv) < 1e-12,
+         CASE WHEN abs(piv) < 1e-12 THEN Mswap
+              ELSE list_transform(Mswap, lambda row, i:
+                       CASE WHEN i = col THEN normpivot
+                            ELSE list_transform(row, lambda v, j: v - row[col]*normpivot[j]) END) END
+  FROM (
+    SELECT col, d, sing, Mswap, Mswap[col][col] AS piv,
+           list_transform(Mswap[col], lambda v, j: v / Mswap[col][col]) AS normpivot
+    FROM (
+      SELECT col, d, sing,
+             list_transform(M, lambda row, i:
+                 CASE WHEN i = col THEN M[p] WHEN i = p THEN M[col] ELSE row END) AS Mswap
+      FROM (
+        SELECT col, d, sing, M, list_position(pcol, list_aggregate(pcol, 'max')) AS p
+        FROM (
+          SELECT k, k+1 AS col, d, sing, M,
+                 list_transform(M, lambda row, i: CASE WHEN i >= k+1 THEN abs(row[k+1]) ELSE -1e308 END) AS pcol
+          FROM gj WHERE k < d
+        )
+      )
+    )
+  )
+),
+covinv AS (
+  SELECT CASE WHEN sing THEN NULL ELSE list_transform(M, lambda row, i: list_slice(row, d+1, 2*d)) END AS Rinv
+  FROM gj WHERE k = d
+),
+final AS (
+  SELECT bm.B AS B, bm.cls AS cls, fn.fn AS fn, c.Rinv AS Rinv, s.dsc AS dsc,
+         dm.d AS d, norm_ppf(1.0-(1.0-conf_level)/2.0) AS crit
+  FROM Bmat bm CROSS JOIN featnames fn CROSS JOIN covinv c CROSS JOIN scal s CROSS JOIN dims dm
+),
+percoef AS (
+  SELECT gs.a AS a, cls[(gs.a-1)//d + 1] AS class, fn[(gs.a-1)%d + 1] AS feature,
+         B[(gs.a-1)//d + 1][(gs.a-1)%d + 1] AS coefficient, crit,
+         CASE WHEN Rinv IS NOT NULL AND isfinite(Rinv[gs.a][gs.a]) AND Rinv[gs.a][gs.a] > 0.0
+              THEN sqrt(Rinv[gs.a][gs.a]) / dsc[gs.a] ELSE NULL END AS std_error
+  FROM final, unnest(range(1, len(B)*d + 1)) AS gs(a)
+)
+SELECT class, feature, coefficient, std_error,
+       coefficient / std_error AS statistic,
+       CASE WHEN std_error IS NULL THEN NULL ELSE 2.0 * norm_cdf(-abs(coefficient / std_error)) END AS p_value,
+       coefficient - crit * std_error AS conf_low,
+       coefficient + crit * std_error AS conf_high
+FROM percoef ORDER BY class, a;

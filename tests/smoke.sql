@@ -247,4 +247,22 @@ SELECT CASE
     ELSE error('SMOKE FAIL: inference output invalid')
   END;
 
+-- Multinomial inference: multinom_summary returns one z-based row per estimated
+-- (class, feature) for the K-1 non-reference classes, with finite SE and a CI
+-- that brackets the coefficient.
+CREATE TABLE mns AS SELECT (i%21-10)::DOUBLE AS x1, ((i*7)%13)::DOUBLE AS x2,
+  CASE WHEN (i*3+i%5) % 3 = 0 THEN 'a' WHEN (i*3+i%5) % 3 = 1 THEN 'b' ELSE 'c' END AS y
+  FROM range(800) g(i);
+CREATE TABLE mns_m AS SELECT * FROM multinom_fit('mns', 'y');
+SELECT CASE
+    WHEN (SELECT count(*) FROM multinom_summary('mns_m', 'mns', 'y')) = 6           -- 2 classes x 3 coefs
+     AND (SELECT count(DISTINCT class) FROM multinom_summary('mns_m', 'mns', 'y')) = 2  -- reference 'a' excluded
+     AND (SELECT bool_and(std_error > 0 AND p_value BETWEEN 0.0 AND 1.0
+                          AND conf_low < coefficient AND coefficient < conf_high
+                          AND abs((conf_high - coefficient)/std_error - 1.959963984540054) < 1e-6)
+          FROM multinom_summary('mns_m', 'mns', 'y'))
+    THEN 'PASS  multinom_summary gives valid per-class SE/stat/p/CI (z, reference excluded)'
+    ELSE error('SMOKE FAIL: multinom_summary output invalid')
+  END;
+
 SELECT 'ALL SMOKE CHECKS PASSED' AS result;
