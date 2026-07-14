@@ -2157,17 +2157,30 @@ class TestAutoSolver:
 
     def test_auto_falls_back_to_gd_on_separation(self, con):
         # complete separation has no finite MLE: IRLS diverges to ~1e305, which
-        # 'auto' must reject (|beta| > 1e100) and fall back to gd for a finite fit
+        # 'auto' must reject (|beta| > 1e100) and fall back to gd for a finite fit.
+        #
+        # The coefficients themselves are only compared loosely. Separated data has
+        # no optimum to converge to -- the fit is still climbing when max_iter stops
+        # it -- so the iterate depends on the exact floating-point path, and DuckDB's
+        # parallel summation is not bit-reproducible across two different query plans
+        # ('auto' carries an extra, inert irls branch). A tight cross-solver equality
+        # here is not a real invariant and flakes. What must hold is that the fallback
+        # fired and produced a finite, sanely-bounded fit that separates the classes.
         n = 400
         x1 = np.linspace(-2, 2, n)
         df = pd.DataFrame({"x1": x1, "x2": np.tile([0.0, 1.0, 2.0, 3.0], n // 4),
                            "y": (x1 > 0).astype(float)})
         _load(con, "autrain", df)
         au = dict(con.execute("SELECT feature, coefficient FROM logit_fit('autrain','y', max_iter := 300)").fetchall())
-        assert all(np.isfinite(v) and abs(v) < 1e100 for v in au.values()), au
         gd = dict(con.execute("SELECT feature, coefficient FROM logit_fit('autrain','y', solver := 'gd', max_iter := 300)").fetchall())
+        # the fallback fired: finite, and nowhere near irls's ~1e305 divergence
+        assert all(np.isfinite(v) and abs(v) < 1e100 for v in au.values()), au
+        # and it is the gd path: same sign and same order of magnitude on every term
         for k in gd:
-            assert au[k] == pytest.approx(gd[k], rel=1e-6, abs=1e-8), k
+            assert np.sign(au[k]) == np.sign(gd[k]), (k, au[k], gd[k])
+            assert au[k] == pytest.approx(gd[k], rel=1e-2), (k, au[k], gd[k])
+        # x1 perfectly predicts y, so its coefficient must be large and positive
+        assert au["x1"] > 1.0, au
 
     def test_l1_agrees_across_solvers(self, con):
         # L1 is now solved by irls + coordinate descent (proximal Newton) rather

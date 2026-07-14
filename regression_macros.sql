@@ -376,9 +376,16 @@ __reg_packed AS MATERIALIZED (
            count(*)::DOUBLE AS n,
            sum(w) AS sumw
     FROM (
+        -- The feature vector must come out in name order (j). Writing that as an
+        -- ORDERED aggregate -- list(... ORDER BY s.j) -- makes DuckDB carry the sort
+        -- key alongside every one of the n*d values and push them all through its
+        -- aggregate sort machinery, which dominated these macros and peaked at
+        -- several GB. The sort we actually need is tiny: d elements, per row. So
+        -- collect unordered and sort the little list in list-land. list_sort orders
+        -- a struct list lexicographically by field, hence j first.
         SELECT x.rid,
                (any_value(yv.v) - any_value(ys.mu_y)) / any_value(ys.sd_y) AS y,
-               [1.0::DOUBLE] || list((x.v - s.mu) / s.sigma ORDER BY s.j) AS xs,
+               [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := (x.v - s.mu) / s.sigma))), zp -> zp.v) AS xs,
                coalesce(any_value(ov.v), 0.0)
                  / (CASE WHEN family = 'linear' THEN any_value(ys.sd_y) ELSE 1.0 END) AS o,
                any_value(wt.w) AS w
@@ -1157,7 +1164,7 @@ __reg_mpacked AS MATERIALIZED (
          any_value(len(yv)) AS K1, any_value(len(xs)) AS D1
   FROM (
     SELECT x.rid,
-           [1.0::DOUBLE] || list((x.v - s.mu) / s.sigma ORDER BY s.j) AS xs,
+           [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := (x.v - s.mu) / s.sigma))), zp -> zp.v) AS xs,
            list_transform(any_value(nr.nrf),
              lambda cl: CASE WHEN any_value(yl.lab) = cl THEN 1.0 ELSE 0.0 END) AS yv
     FROM __reg_mflong x
@@ -1382,7 +1389,7 @@ __reg_cv_marr AS (
 __reg_cv_rows AS MATERIALIZED (
   SELECT x.rid, any_value(yr.fold) AS fold, any_value(yr.y) AS y,
          (any_value(yr.y) - any_value(ys.mu_y)) / any_value(ys.sd_y) AS yt,
-         [1.0::DOUBLE] || list((x.v - s.mu)/s.sigma ORDER BY s.j) AS xs
+         [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := (x.v - s.mu)/s.sigma))), zp -> zp.v) AS xs
   FROM __reg_cv_flong x JOIN __reg_cv_stats s ON s.col=x.col JOIN __reg_cv_yraw yr ON yr.rid=x.rid
   CROSS JOIN __reg_cv_ys ys GROUP BY x.rid
 ),
@@ -1680,7 +1687,7 @@ __reg_nbd_marr AS (
 ),
 __reg_nbd_rows AS MATERIALIZED (
   SELECT x.rid, any_value(yr.y) AS y, any_value(yr.y) / any_value(ys.sd_y) AS yt,
-         [1.0::DOUBLE] || list((x.v - s.mu)/s.sigma ORDER BY s.j) AS xs
+         [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := (x.v - s.mu)/s.sigma))), zp -> zp.v) AS xs
   FROM __reg_nbd_flong x JOIN __reg_nbd_stats s ON s.col=x.col JOIN __reg_nbd_yraw yr ON yr.rid=x.rid
   CROSS JOIN __reg_nbd_ys ys GROUP BY x.rid
 ),
@@ -1986,7 +1993,7 @@ ov AS (SELECT rid, v AS o  FROM alllong WHERE col = offset_col),
 wv AS (SELECT rid, v AS wt FROM alllong WHERE col = weights_col),
 clv AS (SELECT rid, v AS cl FROM alllong WHERE col = cluster_col),
 feat AS (
-  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY m.j) AS xs, count(*)::INT AS nf
+  SELECT l.rid, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
   FROM alllong l JOIN mdlj m ON m.feature = l.col
   GROUP BY l.rid
 ),
@@ -2241,7 +2248,7 @@ yv AS (SELECT rid, v AS y  FROM alllong WHERE col = outcome),
 ov AS (SELECT rid, v AS o  FROM alllong WHERE col = offset_col),
 wv AS (SELECT rid, v AS wt FROM alllong WHERE col = weights_col),
 feat AS (
-  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY m.j) AS xs, count(*)::INT AS nf
+  SELECT l.rid, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
   FROM alllong l JOIN mdlj m ON m.feature = l.col
   GROUP BY l.rid
 ),
@@ -2318,7 +2325,7 @@ salllong AS (
 ),
 soff AS (SELECT srid, v AS o FROM salllong WHERE col = offset_col),
 sfeat AS (
-  SELECT l.srid, [1.0::DOUBLE] || list(l.v ORDER BY m.j) AS xs, count(*)::INT AS nf
+  SELECT l.srid, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
   FROM salllong l JOIN mdlj m ON m.feature = l.col
   GROUP BY l.srid
 ),
@@ -2395,7 +2402,7 @@ yv AS (SELECT rid, v AS y  FROM alllong WHERE col = outcome),
 ov AS (SELECT rid, v AS o  FROM alllong WHERE col = offset_col),
 wv AS (SELECT rid, v AS wt FROM alllong WHERE col = weights_col),
 feat AS (
-  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY m.j) AS xs, count(*)::INT AS nf
+  SELECT l.rid, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
   FROM alllong l JOIN mdlj m ON m.feature = l.col GROUP BY l.rid
 ),
 rows0 AS (
@@ -2512,7 +2519,7 @@ mdlj AS (
   FROM (SELECT DISTINCT feature FROM mdl WHERE feature != '(Intercept)')
 ),
 feat AS (
-  SELECT l.rid, [1.0::DOUBLE] || list(l.v ORDER BY m.j) AS xs, count(*)::INT AS nf
+  SELECT l.rid, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
   FROM alllong l JOIN mdlj m ON m.feature = l.col
   GROUP BY l.rid
 ),
