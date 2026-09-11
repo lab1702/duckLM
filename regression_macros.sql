@@ -1565,8 +1565,11 @@ __reg_cv_rows AS MATERIALIZED (
 __reg_cv_packed AS MATERIALIZED (SELECT list(struct_pack(xs := xs, yt := yt, fold := fold)) AS rows FROM __reg_cv_rows),
 __reg_cv_cfg AS (
   SELECT coalesce(learning_rate,
-           CASE WHEN family='logistic' THEN 4.0/(f.d+1+4.0*list_aggregate(ma.ml2,'max'))
-                ELSE 1.0/(f.d+1+list_aggregate(ma.ml2,'max')) END) AS step,
+           -- Global standardization bounds the full-data squared design norm
+           -- by n*(d+1). Divide by the smallest training-fold count to bound
+           -- every fold's curvature, including singular-design GD fallbacks.
+           CASE WHEN family='logistic' THEN 4.0/((f.d+1)*(SELECT n FROM __reg_cv_n)/list_aggregate(ma.mntrain,'min')+4.0*list_aggregate(ma.ml2,'max'))
+                ELSE 1.0/((f.d+1)*(SELECT n FROM __reg_cv_n)/list_aggregate(ma.mntrain,'min')+list_aggregate(ma.ml2,'max')) END) AS step,
          f.d + 1 AS D1, ma.M AS M
   FROM __reg_cv_feats f, __reg_cv_marr ma, __reg_cv_chk chk WHERE chk.ok
 ),
@@ -1943,7 +1946,8 @@ __reg_nbd_gd AS (
   )
 ),
 __reg_nbd_sol AS (SELECT B FROM __reg_nbd_gd ORDER BY it DESC LIMIT 1),
--- profile NB2 log-likelihood per grid alpha (r = 1/alpha), mu = mean(y)*exp(eta)
+-- Profile NB2 log-likelihood per grid alpha (r = 1/alpha), mu = mean(y)*exp(eta).
+-- Average duplicate candidate copies so repeated grid entries do not alter scores.
 __reg_nbd_ll AS (
   SELECT gg.g AS g, r.y AS y, alpha_grid[gg.g] AS alpha,
          ys.sd_y * exp(list_dot_product(r.xs, s.B[gg.g])) AS mu
@@ -1952,7 +1956,7 @@ __reg_nbd_ll AS (
 SELECT alpha,
        sum(lgamma(y + 1.0/alpha) - lgamma(1.0/alpha) - lgamma(y + 1)
            + (1.0/alpha) * ln((1.0/alpha)/(1.0/alpha + mu))
-           + y * ln(mu/(1.0/alpha + mu))) AS loglik
+           + y * ln(mu/(1.0/alpha + mu))) / count(DISTINCT g) AS loglik
 FROM __reg_nbd_ll
 GROUP BY alpha
 ORDER BY alpha;
@@ -2347,7 +2351,7 @@ __reg_gj(k, d, sing, M) AS (
 __reg_covinv AS (
   SELECT CASE WHEN sing THEN NULL
               ELSE list_transform(M, lambda row, i: list_slice(row, d+1, 2*d)) END AS Rinv
-  FROM __reg_gj WHERE k = d
+  FROM __reg_gj WHERE k = d OR d IS NULL
 ),
 __reg_disp AS (
   SELECT CASE WHEN family IN ('linear','gamma','tweedie')
@@ -2599,7 +2603,7 @@ __reg_gj(k, d, sing, M) AS (
                                    CASE WHEN i >= k+1 THEN abs(row[k+1]) ELSE -1e308 END) AS pcol
                           FROM __reg_gj WHERE k < d))))
 ),
-__reg_covinv AS (SELECT CASE WHEN sing THEN NULL ELSE list_transform(M, lambda row, i: list_slice(row, d+1, 2*d)) END AS Rinv FROM __reg_gj WHERE k = d),
+__reg_covinv AS (SELECT CASE WHEN sing THEN NULL ELSE list_transform(M, lambda row, i: list_slice(row, d+1, 2*d)) END AS Rinv FROM __reg_gj WHERE k = d OR d IS NULL),
 __reg_disp AS (
   SELECT CASE WHEN family IN ('linear','gamma','tweedie')
               THEN (SELECT sum(pearson) FROM __reg_rww) / nullif((SELECT n-d FROM __reg_dims), 0) ELSE 1.0 END AS phi,
@@ -2941,7 +2945,7 @@ __reg_gj(k, d, sing, M) AS (
 ),
 __reg_covinv AS (
   SELECT CASE WHEN sing THEN NULL ELSE list_transform(M, lambda row, i: list_slice(row, d+1, 2*d)) END AS Rinv
-  FROM __reg_gj WHERE k = d
+  FROM __reg_gj WHERE k = d OR d IS NULL
 ),
 __reg_final AS (
   SELECT bm.B AS B, bm.cls AS cls, fn.fn AS fn, c.Rinv AS Rinv, s.dsc AS dsc,

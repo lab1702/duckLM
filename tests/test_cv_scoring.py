@@ -60,3 +60,11 @@ def test_cv_rejects_invalid_family_outcomes(con,call,outcome):
     con.execute(f'CREATE TABLE bad_domain AS SELECT i::DOUBLE x,({outcome})::DOUBLE y FROM range(12)t(i)')
     with pytest.raises(duckdb.Error,match='cv: outcome must'):
         con.execute(f'SELECT * FROM {call}').fetchall()
+
+
+def test_duplicate_dispersion_candidates_preserve_likelihood(con):
+    con.execute('CREATE TABLE dispersion_counts AS SELECT i::DOUBLE x,i%7+1.0 y FROM range(30)t(i)')
+    unique=con.execute("SELECT * FROM nbinom_dispersion('dispersion_counts','y',[.5,1.])").fetchall()
+    repeated=con.execute("SELECT * FROM nbinom_dispersion('dispersion_counts','y',[.5,.5,1.])").fetchall()
+    assert len(repeated)==len(unique)==2
+    np.testing.assert_allclose(np.asarray(repeated,dtype=float),np.asarray(unique,dtype=float),rtol=1e-12)

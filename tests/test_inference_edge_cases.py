@@ -327,3 +327,22 @@ def test_multinomial_intercept_only_summary(con):
     assert len(rows)==1
     assert rows[0][:2]==('b','(Intercept)')
     assert rows[0][2]==pytest.approx(np.sqrt(.4))
+
+
+@pytest.mark.parametrize('family',['linreg','logit','poisson','gamma','tweedie','nbinom'])
+@pytest.mark.parametrize('missing_rows',[False,True])
+def test_inference_preserves_model_and_predictions_without_training_rows(con,family,missing_rows):
+    con.execute("CREATE TABLE empty_training_model AS SELECT * FROM (VALUES ('(Intercept)',1.),('x',2.))t(feature,coefficient)")
+    con.execute('CREATE TABLE empty_training(x DOUBLE,y DOUBLE)')
+    if missing_rows:
+        con.execute('INSERT INTO empty_training VALUES (NULL,1),(1,NULL)')
+    con.execute('CREATE TABLE prediction_rows AS SELECT 2.0 x')
+    summary=con.execute(f"SELECT * FROM {family}_summary('empty_training_model','empty_training','y')").fetchall()
+    assert len(summary)==2
+    assert [row[:2] for row in summary]==[('(Intercept)',1.0),('x',2.0)]
+    assert all(all(value is None for value in row[2:]) for row in summary)
+    prediction=con.execute(f"SELECT prediction,conf_low,conf_high FROM {family}_predict_ci('empty_training_model','empty_training','y',newdata:='prediction_rows')").fetchall()
+    expected=5.0 if family=='linreg' else 1/(1+np.exp(-5.0)) if family=='logit' else np.exp(5.0)
+    assert len(prediction)==1
+    assert prediction[0][0]==pytest.approx(expected)
+    assert prediction[0][1:]==(None,None)

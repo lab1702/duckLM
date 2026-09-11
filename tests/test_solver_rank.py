@@ -126,3 +126,15 @@ def test_auto_rejects_finite_unconverged_gamma_irls(con):
         con.execute("""
             SELECT * FROM gamma_fit('overshoot','y',offset_col:='expo',max_iter:=100,solver:='irls')
         """).fetchall()
+
+
+def test_cv_gd_step_accounts_for_training_fold_curvature(con):
+    con.execute('''
+        CREATE OR REPLACE TABLE fold_curvature AS
+        SELECT x,x AS x2,x AS x3,x AS y FROM (
+          SELECT CASE WHEN i%2=0 THEN 1.0 ELSE .1 END
+               * CASE WHEN i%4<2 THEN -1 ELSE 1 END AS x FROM range(40)t(i))
+    ''')
+    deviance=con.execute("SELECT cv_deviance FROM cv_l2('fold_curvature','y','linear',[0.0],k:=2)").fetchone()[0]
+    assert np.isfinite(deviance)
+    assert deviance < 1e-9
