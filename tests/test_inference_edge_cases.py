@@ -638,6 +638,47 @@ def test_multinomial_information_matches_binary_logistic_at_saturation(con,extre
     np.testing.assert_allclose(multi,binary,rtol=1e-10)
 
 
+@pytest.mark.parametrize('family', ['linreg','logit','poisson','gamma','tweedie','nbinom'])
+@pytest.mark.parametrize('offset_kind', ['null','absent','invalid'])
+def test_prediction_intervals_require_usable_scoring_offsets(con, family, offset_kind):
+    con.execute("CREATE TABLE offset_model AS SELECT * FROM (VALUES ('(Intercept)',1.),('x',.25))t(feature,coefficient)")
+    outcome = 'i%2' if family == 'logit' else '1+i%3'
+    con.execute(f'CREATE TABLE offset_train AS SELECT i/10.0 x,{outcome} y,0.0 expo FROM range(10)t(i)')
+    offset = {'null': ',CASE WHEN i<2 THEN NULL ELSE 0.0 END expo',
+              'absent': '',
+              'invalid': ",CASE WHEN i<2 THEN 'invalid' ELSE '0' END expo"}[offset_kind]
+    con.execute(f'CREATE TABLE offset_score AS SELECT i/10.0 x{offset} FROM range(3)t(i)')
+    rows = con.execute(f"SELECT prediction,conf_low,conf_high FROM {family}_predict_ci('offset_model','offset_train','y',newdata:='offset_score',offset_col:='expo') ORDER BY x").fetchall()
+    assert rows[:2] == [(None,None,None)]*2
+    if offset_kind == 'absent':
+        assert rows[2] == (None,None,None)
+    else:
+        assert np.isfinite(rows[2]).all()
+        assert rows[2][1] <= rows[2][0] <= rows[2][2]
+
+
+@pytest.mark.parametrize('logit', [800.,1200.])
+@pytest.mark.parametrize('feature_scale', [1e100,1e200,1e300])
+@pytest.mark.parametrize('classes', [2,3])
+def test_multinomial_information_combines_underflowed_probabilities_with_features(con, logit, feature_scale, classes):
+    con.execute('CREATE TABLE extreme_classes(x DOUBLE,y VARCHAR)')
+    con.executemany('INSERT INTO extreme_classes VALUES (?,?)',
+                    [(-feature_scale,'0'),(feature_scale,'1')]+[(0.,str(i)) for i in range(classes)])
+    con.execute('CREATE TABLE extreme_model(class VARCHAR,feature VARCHAR,coefficient DOUBLE)')
+    coefficients = [('0','(Intercept)',0.),('0','x',0.),('1','(Intercept)',0.),('1','x',logit/feature_scale)]
+    if classes == 3:
+        coefficients += [('2','(Intercept)',0.),('2','x',-logit/feature_scale)]
+    con.executemany('INSERT INTO extreme_model VALUES (?,?,?)',coefficients)
+    rows = con.execute("SELECT class,feature,std_error FROM multinom_summary('extreme_model','extreme_classes','y')").fetchall()
+    # Central rows identify intercepts; the extreme rows retain slope
+    # information proportional to exp(-logit)*feature_scale**2.
+    expected_slope = np.exp(logit/2-np.log(feature_scale))/np.sqrt(2 if classes == 2 else 1)
+    for _,feature,error in rows:
+        expected = np.sqrt(2) if feature == '(Intercept)' else expected_slope
+        assert error is not None and np.isfinite(error)
+        assert error/expected == pytest.approx(1.,rel=1e-10)
+
+
 def test_multinomial_information_preserves_large_logit_differences(con):
     from scipy.special import softmax
     xs=np.array([-1.,0.,1.,1000.])

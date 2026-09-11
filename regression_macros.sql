@@ -3354,11 +3354,11 @@ __reg_serrors AS (
 )
 SELECT sn.* EXCLUDE (__reg_srid__),
        CASE family WHEN 'logistic' THEN __reg_sigmoid(s.eta) WHEN 'linear' THEN s.eta ELSE exp(s.eta) END AS prediction,
-       CASE WHEN s.unit_se IS NULL OR NOT isfinite(s.unit_se) THEN NULL
+       CASE WHEN s.eta IS NULL OR s.unit_se IS NULL OR NOT isfinite(s.unit_se) THEN NULL
             ELSE (CASE family WHEN 'logistic' THEN __reg_sigmoid(s.eta - s.crit*s.unit_se)
                               WHEN 'linear' THEN __reg_dot([s.eta,-s.crit],[1.0,s.unit_se])
                               ELSE exp(s.eta - s.crit*s.unit_se) END) END AS conf_low,
-       CASE WHEN s.unit_se IS NULL OR NOT isfinite(s.unit_se) THEN NULL
+       CASE WHEN s.eta IS NULL OR s.unit_se IS NULL OR NOT isfinite(s.unit_se) THEN NULL
             ELSE (CASE family WHEN 'logistic' THEN __reg_sigmoid(s.eta + s.crit*s.unit_se)
                               WHEN 'linear' THEN __reg_dot([s.eta,s.crit],[1.0,s.unit_se])
                               ELSE exp(s.eta + s.crit*s.unit_se) END) END AS conf_high
@@ -3604,6 +3604,10 @@ SELECT * FROM __reg_influence(model, tbl, outcome, 'nbinom', 'nbinom_influence',
 -- K-1 non-reference classes; Cov = I^-1, dispersion fixed = 1, z inference.
 -- Returns one row per estimated (class, feature); the reference (alphabetical-
 -- min) class is the fixed baseline and is not reported.
+CREATE OR REPLACE MACRO __reg_logsumexp(values_) AS (
+  CASE WHEN list_max(values_)='-Infinity'::DOUBLE THEN '-Infinity'::DOUBLE
+       ELSE list_max(values_)+ln(list_sum(list_transform(values_,lambda v: exp(v-list_max(values_))))) END
+);
 CREATE OR REPLACE MACRO multinom_summary(model, tbl, outcome, conf_level := 0.95) AS TABLE
 WITH RECURSIVE
 __reg_cols AS (
@@ -3664,29 +3668,25 @@ __reg_feat AS (
   SELECT __reg_rid__, [1.0::DOUBLE], 0::INT FROM __reg_num
   WHERE NOT EXISTS (SELECT 1 FROM __reg_mdlj)
 ),
--- Shift logits before exponentiating and retain the reference probability
--- last, so diagonal information can sum the other classes without 1-p.
+-- Keep both class and complementary probabilities in logs. Information can
+-- be representable after multiplication by features even when p underflows.
 __reg_probsraw AS (
-  SELECT __reg_rid__, xs, list_transform(ee, lambda e: e/list_sum(ee)) AS p
+  SELECT __reg_rid__, xs,
+         list_transform(eta,lambda v: v-denom) AS lp,
+         list_transform(eta,lambda v,j:
+           __reg_logsumexp(list_filter(eta,lambda other,k: k!=j))-denom) AS lq
   FROM (
-    SELECT __reg_rid__, xs, list_transform(eta, lambda v: exp(v-list_max(eta))) AS ee
+    SELECT __reg_rid__, xs, eta, __reg_logsumexp(eta) AS denom
     FROM (
-      SELECT f.__reg_rid__, f.xs,
-             list_transform((SELECT B FROM __reg_bmat), lambda bc: __reg_dot(f.xs, bc)) || [0.0::DOUBLE] AS eta
-      FROM __reg_feat f JOIN __reg_yv y ON y.__reg_rid__ = f.__reg_rid__
-      CROSS JOIN __reg_kfeat WHERE f.nf = __reg_kfeat.k
+      SELECT __reg_rid__, xs, list_transform(raw_eta,lambda v: v-list_max(raw_eta)) AS eta
+      FROM (
+        SELECT f.__reg_rid__, f.xs,
+               list_transform((SELECT B FROM __reg_bmat), lambda bc: __reg_dot(f.xs, bc)) || [0.0::DOUBLE] AS raw_eta
+        FROM __reg_feat f JOIN __reg_yv y ON y.__reg_rid__ = f.__reg_rid__
+        CROSS JOIN __reg_kfeat WHERE f.nf = __reg_kfeat.k
+      )
     )
   )
-),
-__reg_xunits AS (
-  SELECT list(unit ORDER BY i) AS units
-  FROM (SELECT ix.i, coalesce(nullif(max(abs(r.xs[ix.i])),0.0),1.0) AS unit
-        FROM range(1,(SELECT k FROM __reg_kfeat)+2) ix(i)
-        LEFT JOIN __reg_probsraw r ON true GROUP BY ix.i)
-),
-__reg_probs AS (
-  SELECT r.* REPLACE (list_transform(xs, lambda v,j: v/u.units[j]) AS xs)
-  FROM __reg_probsraw r CROSS JOIN __reg_xunits u
 ),
 __reg_dims AS (
   SELECT (SELECT len(B) FROM __reg_bmat) AS km1,
@@ -3695,6 +3695,15 @@ __reg_dims AS (
 ),
 -- block-structured information matrix via flat index pairs
 __reg_idx AS (SELECT unnest(range(1, (SELECT M FROM __reg_dims)+1)) AS i),
+-- One joint root-information/feature scale per estimated coefficient.
+__reg_xunits AS (
+  SELECT list(logunit ORDER BY i) AS units
+  FROM (SELECT ix.i, coalesce(nullif(max(ln(nullif(abs(r.xs[(ix.i-1)%dm.d+1]),0.0))
+                   +0.5*(r.lp[(ix.i-1)//dm.d+1]+r.lq[(ix.i-1)//dm.d+1])),
+                   '-Infinity'::DOUBLE),0.0) AS logunit
+        FROM __reg_idx ix LEFT JOIN __reg_probsraw r ON true
+        CROSS JOIN __reg_dims dm GROUP BY ix.i)
+),
 __reg_pairs AS (
   SELECT a.i AS a, b.i AS b,
          (a.i-1)//(SELECT d FROM __reg_dims) AS ca, (a.i-1)%(SELECT d FROM __reg_dims) AS ja,
@@ -3705,11 +3714,12 @@ __reg_info AS (
   SELECT list(rowlist ORDER BY a) AS A FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
       SELECT p.a AS a, p.b AS b,
-             sum(__reg_pr.p[p.ca+1] * (CASE WHEN p.ca = p.cb
-                   THEN list_sum(list_transform(__reg_pr.p, lambda pv, i: CASE WHEN i != p.ca+1 THEN pv ELSE 0.0 END))
-                   ELSE -__reg_pr.p[p.cb+1] END)
-                 * __reg_pr.xs[p.ja+1] * __reg_pr.xs[p.kb+1]) AS val
-      FROM __reg_probs __reg_pr, __reg_pairs p GROUP BY p.a, p.b
+             sum(CASE WHEN r.xs[p.ja+1]=0 OR r.xs[p.kb+1]=0 THEN 0.0 ELSE
+                   sign(r.xs[p.ja+1])*sign(r.xs[p.kb+1])*(CASE WHEN p.ca=p.cb THEN 1.0 ELSE -1.0 END)
+                   *exp(r.lp[p.ca+1]+(CASE WHEN p.ca=p.cb THEN r.lq[p.ca+1] ELSE r.lp[p.cb+1] END)
+                        +ln(nullif(abs(r.xs[p.ja+1]),0.0))+ln(nullif(abs(r.xs[p.kb+1]),0.0))
+                        -u.units[p.a]-u.units[p.b]) END) AS val
+      FROM __reg_probsraw r, __reg_pairs p, __reg_xunits u GROUP BY p.a, p.b
     ) GROUP BY a
   )
 ),
@@ -3759,7 +3769,7 @@ __reg_percoef AS (
   SELECT gs.a AS a, cls[(gs.a-1)//d + 1] AS class, fn[(gs.a-1)%d + 1] AS feature,
          B[(gs.a-1)//d + 1][(gs.a-1)%d + 1] AS coefficient, crit,
          CASE WHEN Rinv IS NOT NULL AND isfinite(Rinv[gs.a][gs.a]) AND Rinv[gs.a][gs.a] > 0.0
-              THEN sqrt(Rinv[gs.a][gs.a]) / dsc[gs.a] / units[(gs.a-1)%d + 1] ELSE NULL END AS std_error
+              THEN __reg_exp_scale(sqrt(Rinv[gs.a][gs.a])/dsc[gs.a],-units[gs.a]) ELSE NULL END AS std_error
   FROM __reg_final, unnest(range(1, len(B)*d + 1)) AS gs(a)
 )
 SELECT class, feature, coefficient, std_error,
