@@ -275,3 +275,19 @@ def test_influence_rejects_output_column_collisions(con, column, uppercase, empt
     load(con, "edge_train", data)
     with pytest.raises(duckdb.Error, match="collides with the output"):
         con.execute("SELECT * FROM linreg_influence('edge_model', 'edge_train', 'y')").fetchall()
+
+
+@pytest.mark.parametrize('df', [0.1, 1.0, 2.0, 5.0, 30.0])
+@pytest.mark.parametrize('probability', [1e-6, 0.025, 0.5, 0.975, 1-1e-6])
+def test_student_t_quantiles_in_heavy_tails(con, df, probability):
+    from scipy.stats import t
+    actual = con.execute('SELECT t_ppf(?,?)', [probability, df]).fetchone()[0]
+    assert actual == pytest.approx(t.ppf(probability, df), rel=1e-10, abs=1e-12)
+
+
+def test_student_t_quantile_boundaries(con):
+    from scipy.stats import norm
+    assert con.execute('SELECT t_ppf(NULL,2), t_ppf(.5,NULL)').fetchone() == (None,None)
+    assert con.execute("SELECT isnan(t_ppf(-.1,2)),isnan(t_ppf(.5,0)),isnan(t_ppf(.5,'NaN'::DOUBLE))").fetchone() == (True,True,True)
+    assert con.execute('SELECT t_ppf(0,2),t_ppf(1,2)').fetchone() == (-float('inf'),float('inf'))
+    assert con.execute("SELECT t_ppf(.975,'Infinity'::DOUBLE)").fetchone()[0] == pytest.approx(norm.ppf(.975))

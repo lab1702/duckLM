@@ -113,3 +113,16 @@ def test_cv_rejects_null_model_when_only_one_fold_is_singular(con):
         SELECT cv_deviance FROM cv_l2('mixed_rank', 'y', 'linear', [0.0], k := 3)
     """).fetchone()[0]
     assert actual == pytest.approx(np.mean(errors), abs=1e-8)
+
+
+def test_auto_rejects_finite_unconverged_gamma_irls(con):
+    con.execute("CREATE OR REPLACE TABLE overshoot AS SELECT i::DOUBLE x,1.0 y,-8.0 expo FROM range(4)t(i)")
+    coefficients = dict(con.execute("""
+        SELECT * FROM gamma_fit('overshoot','y',offset_col:='expo',max_iter:=100)
+    """).fetchall())
+    assert coefficients['(Intercept)'] == pytest.approx(8.0, abs=1e-7)
+    assert coefficients['x'] == pytest.approx(0.0, abs=1e-7)
+    with pytest.raises(duckdb.Error, match='iteration limit reached'):
+        con.execute("""
+            SELECT * FROM gamma_fit('overshoot','y',offset_col:='expo',max_iter:=100,solver:='irls')
+        """).fetchall()

@@ -174,3 +174,44 @@ def test_multinomial_evaluation_preserves_rid_outcome(con):
     assert actual["n"] == len(scores) == 8
     assert actual["accuracy"] == pytest.approx(np.mean([label == pred for label, pred, _ in scores]))
     assert actual["log_loss"] == pytest.approx(-np.mean([np.log(probs[label]) for label, _, probs in scores]))
+
+
+@pytest.mark.parametrize('family,power', [('poisson',1.0),('gamma',2.0),('tweedie',1.5),('nbinom',None),('logit',None)])
+def test_offset_null_deviance_uses_intercept_only_fit(con, family, power):
+    from scipy.optimize import brentq
+    y = np.array([0.,1.,0.,1.,1.,0.]) if family == 'logit' else np.array([1.,3.,2.,8.,5.,7.])
+    offsets = np.array([-1.,0.2,0.7,1.3,-0.4,0.8])
+    con.execute("CREATE TABLE offset_null_data(y DOUBLE, expo DOUBLE)")
+    con.executemany('INSERT INTO offset_null_data VALUES (?,?)', list(zip(y.tolist(), offsets.tolist())))
+    def inverse(b):
+        return 1/(1+np.exp(-b-offsets)) if family == 'logit' else np.exp(b+offsets)
+    def score(b):
+        mu = inverse(b)
+        if family == 'nbinom': return np.sum((y-mu)/(1+mu))
+        if family == 'logit': return np.sum(y-mu)
+        return np.sum((y-mu)*mu**(1-power))
+    intercept = brentq(score,-10,10,xtol=1e-14)
+    mu = inverse(intercept)
+    con.execute("CREATE TABLE offset_null_model AS SELECT '(Intercept)' feature, ?::DOUBLE coefficient", [intercept])
+    metrics = _metrics(con, f"{family}_evaluate('offset_null_model','offset_null_data','y',offset_col:='expo')")
+    if family == 'logit': expected = -2*np.sum(y*np.log(mu)+(1-y)*np.log1p(-mu))
+    elif family == 'nbinom': expected = 2*np.sum(y*np.log(y/mu)-(y+1)*np.log((y+1)/(mu+1)))
+    else: expected = len(y)*mean_tweedie_deviance(y,mu,power=power)
+    assert metrics['null_deviance'] == pytest.approx(expected,abs=1e-10)
+    assert metrics['deviance'] == pytest.approx(expected,abs=1e-10)
+    assert metrics['pseudo_r2'] == pytest.approx(0.0,abs=1e-10)
+
+
+def test_perfect_offset_null_model_has_undefined_pseudo_r2(con):
+    con.execute("CREATE TABLE perfect_null_model AS SELECT '(Intercept)' feature, 0.0 coefficient")
+    con.execute('CREATE TABLE perfect_null_data AS SELECT pow(2,i) y, ln(pow(2,i)) expo FROM range(4)t(i)')
+    result = _metrics(con,"poisson_evaluate('perfect_null_model','perfect_null_data','y',offset_col:='expo')")
+    assert result['null_deviance'] == 0
+    assert result['pseudo_r2'] is None
+
+
+def test_logit_null_likelihood_stays_finite_with_extreme_offsets(con):
+    con.execute("CREATE TABLE extreme_null_model AS SELECT '(Intercept)' feature, 0.0 coefficient")
+    con.execute('CREATE TABLE extreme_null_data AS SELECT * FROM (VALUES (0.0,100.0),(1.0,-100.0)) t(y,expo)')
+    result = _metrics(con,"logit_evaluate('extreme_null_model','extreme_null_data','y',offset_col:='expo')")
+    assert result['null_deviance'] == pytest.approx(400.0)

@@ -85,7 +85,9 @@ Covariance from `tbl`; scores `newdata` (default `tbl`). Singular design → NUL
 ```
 
 z-based for `logit`/`poisson`/`nbinom`, Student-t(n−d) for `linreg`/`gamma`/`tweedie`.
-`robust`/`cluster` are always z. Singular/penalized/df≤0 → NULL SEs.
+`robust`/`cluster` are always z. Singular/df≤0 → NULL SEs.
+Use unpenalized fits for inference; model tables do not retain penalty metadata,
+so summaries cannot detect penalization.
 
 ```
 multinom_summary(model, tbl, outcome, conf_level := 0.95)

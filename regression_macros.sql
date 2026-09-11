@@ -565,16 +565,16 @@ __reg_irls(it, betas, move) AS (
         )
     )
 ),
--- Last irls iterate, and whether it can be trusted. A singular X'WX (a constant
+-- Last irls iterate, and whether it converged and can be trusted. A singular X'WX (a constant
 -- or perfectly collinear feature) returns NULL coefficients; complete
 -- separation drives them to ~1e305. Both are rejected here, which is what makes
 -- solver := 'auto' fall back to gradient descent instead of returning garbage.
 -- Empty (=> ok false) when irls did not run at all, which is exactly the gate gd
 -- wants: solver := 'gd' and the l1 > 0 path both need gd to run.
-__reg_irls_beta AS (SELECT betas FROM __reg_irls ORDER BY it DESC LIMIT 1),
+__reg_irls_beta AS (SELECT betas, move FROM __reg_irls ORDER BY it DESC LIMIT 1),
 __reg_irls_ok AS (
     SELECT coalesce(
-             (SELECT list_aggregate(
+             (SELECT move < tol AND list_aggregate(
                         list_transform(betas, lambda v: coalesce(isfinite(v) AND abs(v) < 1e100, false)),
                         'bool_and')
               FROM __reg_irls_beta),
@@ -703,7 +703,7 @@ __reg_sol AS (
              WHEN (SELECT ok FROM __reg_irls_ok)
                THEN (SELECT betas FROM __reg_irls_beta)
              -- Only reachable for an explicit solver := 'irls'; 'auto' falls back.
-             ELSE error(caller || ': the irls solver did not converge -- X''WX is singular '
+             ELSE error(caller || ': the irls solver did not converge -- iteration limit reached or X''WX is singular '
                         || '(perfectly collinear features, or complete separation for logistic). '
                         || 'Use solver := ''auto'' (the default) or solver := ''gd'', or add l2 ridge.')
            END AS betas
@@ -892,7 +892,7 @@ ORDER BY __reg_rid__;
 -- standard statsmodels/scikit-learn definitions.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE MACRO __reg_eval(model, tbl, outcome, family, caller, offset_col, power, alpha) AS TABLE
-WITH
+WITH RECURSIVE
 __reg_numbered AS MATERIALIZED (
     SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)
 ),
@@ -934,7 +934,7 @@ __reg_y AS (SELECT rid, v AS y FROM __reg_long WHERE col = outcome),
 -- One row per evaluated observation: actual y, linear predictor z, and the
 -- mean response yhat under the family's inverse link.
 __reg_rows AS (
-    SELECT y.y, z.z,
+    SELECT y.y, z.z, coalesce(o.o, 0.0) AS o,
            CASE family WHEN 'logistic' THEN 1.0 / (1.0 + exp(-z.z))
                        WHEN 'poisson'  THEN exp(z.z)
                        WHEN 'gamma'    THEN exp(z.z)
@@ -942,6 +942,7 @@ __reg_rows AS (
                        WHEN 'nbinom'   THEN exp(z.z)
                        ELSE z.z END AS yhat
     FROM __reg_z z JOIN __reg_y y ON y.rid = z.rid
+    LEFT JOIN __reg_offset o ON o.rid = z.rid
     WHERE z.z IS NOT NULL AND y.y IS NOT NULL
 ),
 __reg_evalcheck AS (
@@ -989,23 +990,68 @@ __reg_agg AS (
            sum((y - yhat) * (y - yhat) / (yhat + alpha * yhat * yhat)) AS pearson_nb
     FROM __reg_rows
 ),
--- Null-model quantities need ybar, so aggregate a second time against it.
+-- Fit the intercept-only null on the evaluated rows, retaining their offsets.
+-- The score changes sign at the unique intercept-only optimum.
+-- The no-offset path keeps the exact mean baseline, without recursion.
+__reg_null_data AS (
+    SELECT list(struct_pack(y := y, o := o)) AS rows,
+           min(o) AS omin, max(o) AS omax
+    FROM __reg_rows
+),
+__reg_null_bounds(it, lo, hi) AS (
+    SELECT 0,
+           (CASE WHEN family = 'logistic' THEN ln(a.ybar/(1.0-a.ybar)) ELSE ln(a.ybar) END) - d.omax,
+           (CASE WHEN family = 'logistic' THEN ln(a.ybar/(1.0-a.ybar)) ELSE ln(a.ybar) END) - d.omin
+    FROM __reg_agg a, __reg_null_data d
+    WHERE offset_col IS NOT NULL AND family != 'linear' AND a.ybar > 0
+      AND (family != 'logistic' OR a.ybar < 1)
+    UNION ALL
+    SELECT it+1, CASE WHEN score > 0 THEN mid ELSE lo END,
+                 CASE WHEN score > 0 THEN hi ELSE mid END
+    FROM (
+      SELECT it, lo, hi, mid,
+             list_sum(list_transform(d.rows, lambda r:
+               list_transform([CASE WHEN family = 'logistic'
+                 THEN 1.0/(1.0+exp(-greatest(-700.0,least(700.0,mid+r.o))))
+                 ELSE exp(greatest(-700.0,least(700.0,mid+r.o))) END], lambda mu:
+                 CASE family WHEN 'gamma' THEN r.y/mu-1.0
+                   WHEN 'tweedie' THEN (r.y-mu)*pow(mu,1.0-power)
+                   WHEN 'nbinom' THEN (r.y-mu)/(1.0+alpha*mu)
+                   ELSE r.y-mu END)[1])) AS score
+      FROM (SELECT *, lo/2.0+hi/2.0 AS mid FROM __reg_null_bounds
+            WHERE it < 80 AND lo < hi) b, __reg_null_data d
+    )
+),
+__reg_null_intercept AS (
+    SELECT lo/2.0+hi/2.0 AS b FROM __reg_null_bounds ORDER BY it DESC LIMIT 1
+),
+__reg_null_rows AS (
+    SELECT r.*, CASE WHEN offset_col IS NULL OR family = 'linear' OR a.ybar = 0
+                              OR (family = 'logistic' AND a.ybar = 1) THEN a.ybar
+                    WHEN family = 'logistic' THEN 1.0/(1.0+exp(-((SELECT b FROM __reg_null_intercept)+r.o)))
+                    ELSE exp((SELECT b FROM __reg_null_intercept)+r.o) END AS mu0,
+           CASE WHEN family = 'logistic' AND a.ybar > 0 AND a.ybar < 1
+                THEN CASE WHEN offset_col IS NULL THEN ln(a.ybar/(1.0-a.ybar))
+                          ELSE (SELECT b FROM __reg_null_intercept)+r.o END END AS z0
+    FROM __reg_rows r, __reg_agg a
+),
 __reg_null AS (
     SELECT sum((y - a.ybar) * (y - a.ybar)) AS sst,
            -- lim(p -> 0+) p*ln(p) = 0, including one-class holdouts.
            sum(CASE WHEN a.ybar IN (0, 1) THEN 0.0
-                    ELSE y * ln(a.ybar) + (1 - y) * ln(1 - a.ybar) END) AS ll0_bin,
-           sum((CASE WHEN y > 0 THEN y * ln(y / a.ybar) ELSE 0.0 END) - (y - a.ybar)) AS null_dev_pois_half,
-           sum(-ln(y / a.ybar) + (y - a.ybar) / a.ybar) AS null_dev_gam_half,
+                    ELSE -y*greatest(-r.z0,0.0) - (1-y)*greatest(r.z0,0.0)
+                         - ln(1.0+exp(-abs(r.z0))) END) AS ll0_bin,
+           sum((CASE WHEN y > 0 THEN y * ln(y / r.mu0) ELSE 0.0 END) - (y - r.mu0)) AS null_dev_pois_half,
+           sum(-ln(y / r.mu0) + (y - r.mu0) / r.mu0) AS null_dev_gam_half,
            sum(CASE WHEN power = 1 THEN
-                      (CASE WHEN y > 0 THEN y * ln(y / a.ybar) ELSE 0.0 END) - (y - a.ybar)
-                    WHEN power = 2 THEN -ln(y / a.ybar) + (y - a.ybar) / a.ybar
+                      (CASE WHEN y > 0 THEN y * ln(y / r.mu0) ELSE 0.0 END) - (y - r.mu0)
+                    WHEN power = 2 THEN -ln(y / r.mu0) + (y - r.mu0) / r.mu0
                     ELSE pow(greatest(y, 0.0), 2.0 - power) / ((1.0 - power) * (2.0 - power))
-               - y * pow(a.ybar, 1.0 - power) / (1.0 - power)
-               + pow(a.ybar, 2.0 - power) / (2.0 - power) END) AS null_dev_tw_half,
-           sum((CASE WHEN y > 0 THEN y * ln(y / a.ybar) ELSE 0.0 END)
-               - (y + 1.0 / alpha) * ln((y + 1.0 / alpha) / (a.ybar + 1.0 / alpha))) AS null_dev_nb_half
-    FROM __reg_rows r, __reg_agg a
+               - y * pow(r.mu0, 1.0 - power) / (1.0 - power)
+               + pow(r.mu0, 2.0 - power) / (2.0 - power) END) AS null_dev_tw_half,
+           sum((CASE WHEN y > 0 THEN y * ln(y / r.mu0) ELSE 0.0 END)
+               - (y + 1.0 / alpha) * ln((y + 1.0 / alpha) / (r.mu0 + 1.0 / alpha))) AS null_dev_nb_half
+    FROM __reg_null_rows r, __reg_agg a
 )
 SELECT
     a.n::BIGINT AS n,
@@ -1027,15 +1073,15 @@ SELECT
                 WHEN 'tweedie'  THEN 2.0 * a.dev_tw_half
                 WHEN 'nbinom'   THEN 2.0 * a.dev_nb_half END AS deviance,
     CASE family WHEN 'logistic' THEN -2.0 * nu.ll0_bin
-                WHEN 'poisson'  THEN 2.0 * nu.null_dev_pois_half
-                WHEN 'gamma'    THEN 2.0 * nu.null_dev_gam_half
-                WHEN 'tweedie'  THEN 2.0 * nu.null_dev_tw_half
-                WHEN 'nbinom'   THEN 2.0 * nu.null_dev_nb_half END AS null_deviance,
+                WHEN 'poisson'  THEN 2.0 * greatest(0.0, nu.null_dev_pois_half)
+                WHEN 'gamma'    THEN 2.0 * greatest(0.0, nu.null_dev_gam_half)
+                WHEN 'tweedie'  THEN 2.0 * greatest(0.0, nu.null_dev_tw_half)
+                WHEN 'nbinom'   THEN 2.0 * greatest(0.0, nu.null_dev_nb_half) END AS null_deviance,
     CASE family WHEN 'logistic' THEN 1.0 - a.ll_bin / nullif(nu.ll0_bin, 0.0)
-                WHEN 'poisson'  THEN 1.0 - a.dev_pois_half / nu.null_dev_pois_half
-                WHEN 'gamma'    THEN 1.0 - a.dev_gam_half / nu.null_dev_gam_half
-                WHEN 'tweedie'  THEN 1.0 - a.dev_tw_half / nu.null_dev_tw_half
-                WHEN 'nbinom'   THEN 1.0 - a.dev_nb_half / nu.null_dev_nb_half END AS pseudo_r2,
+                WHEN 'poisson'  THEN 1.0 - a.dev_pois_half / nullif(greatest(0.0, nu.null_dev_pois_half), 0.0)
+                WHEN 'gamma'    THEN 1.0 - a.dev_gam_half / nullif(greatest(0.0, nu.null_dev_gam_half), 0.0)
+                WHEN 'tweedie'  THEN 1.0 - a.dev_tw_half / nullif(greatest(0.0, nu.null_dev_tw_half), 0.0)
+                WHEN 'nbinom'   THEN 1.0 - a.dev_nb_half / nullif(greatest(0.0, nu.null_dev_nb_half), 0.0) END AS pseudo_r2,
     CASE WHEN family = 'gamma'   THEN a.pearson_gam / (a.n - m.kparams)
          WHEN family = 'tweedie' THEN a.pearson_tw / (a.n - m.kparams)
          WHEN family = 'nbinom'  THEN a.pearson_nb / (a.n - m.kparams) END AS dispersion,
@@ -1620,14 +1666,14 @@ __reg_cv_irls(it, B, move) AS (
     )
   )
 ),
-__reg_cv_irls_beta AS (SELECT B FROM __reg_cv_irls ORDER BY it DESC LIMIT 1),
--- Trustworthy only if every coefficient of every model came back finite and sane;
+__reg_cv_irls_beta AS (SELECT B, move FROM __reg_cv_irls ORDER BY it DESC LIMIT 1),
+-- Trustworthy only after convergence with every coefficient finite and sane;
 -- a singular X'WX in any fold (or divergence under separation) sends the whole run
 -- back to gradient descent. Empty -- hence false -- when irls did not run at all,
 -- which is exactly the gate gradient descent wants for the L1 sweeps.
 __reg_cv_irls_ok AS (
   SELECT coalesce(
-           (SELECT list_aggregate(list_transform(B, lambda bm:
+           (SELECT move < tol AND list_aggregate(list_transform(B, lambda bm:
                       bm IS NOT NULL AND coalesce(list_aggregate(list_transform(bm,
                           lambda v: coalesce(isfinite(v) AND abs(v) < 1e100, false)), 'bool_and'), false)), 'bool_and')
             FROM __reg_cv_irls_beta),
@@ -2090,7 +2136,7 @@ CREATE OR REPLACE MACRO __reg_betai(a, b, x) AS (
   END
 );
 -- P(T>t), cancellation-free tail. Likewise folded to a single __reg_betai
--- expansion (t_ppf runs 13 Newton steps, each expanding this macro).
+-- expansion for the bracketed t_ppf inversion.
 CREATE OR REPLACE MACRO __reg_t_sf(t, df) AS (
   (CASE WHEN t >= 0.0 THEN 0.0 ELSE 1.0 END)
   + (CASE WHEN t >= 0.0 THEN 0.5 ELSE -0.5 END)
@@ -2101,17 +2147,36 @@ CREATE OR REPLACE MACRO __reg_t_pdf(t, df) AS (
   exp(lgamma((df+1.0)/2.0) - lgamma(df/2.0) - 0.5*ln(df * 3.141592653589793::DOUBLE))
   * pow(1.0 + t*t/df, -(df+1.0)/2.0)
 );
--- Newton from the normal quantile. p and df are bound to lambda variables for
--- the same reason as in norm_ppf above: the Newton body expands __reg_t_sf and
--- __reg_t_pdf, which reference df many times over, and each such reference would
--- otherwise paste in the caller's whole `df` expression.
+-- Bracketed inversion of the smaller tail, with lambda-bound arguments to
+-- avoid repeatedly expanding the caller's expressions.
 CREATE OR REPLACE MACRO __reg_t_ppf(p, df) AS (
-  CASE WHEN df = 1.0 THEN tan(3.141592653589793 * (p - 0.5))    -- Cauchy: exact
-       ELSE list_transform([p::DOUBLE], pp ->
-              list_transform([df::DOUBLE], dd ->
-                list_reduce(
-                  [ norm_ppf(pp) ] || list_transform(range(1, 13), lambda i: 0.0::DOUBLE),
-                  (t, e) -> t - ((1.0 - __reg_t_sf(t, dd)) - pp) / __reg_t_pdf(t, dd))
+  CASE WHEN p IS NULL OR df IS NULL THEN NULL
+       WHEN isnan(p) OR isnan(df) OR df <= 0 OR p < 0 OR p > 1 THEN 'NaN'::DOUBLE
+       WHEN df = 'Infinity'::DOUBLE THEN norm_ppf(p)
+       WHEN p = 0 THEN '-Infinity'::DOUBLE
+       WHEN p = 1 THEN 'Infinity'::DOUBLE
+       WHEN p = 0.5 THEN 0.0
+       WHEN df = 1.0 THEN (CASE WHEN p < 0.5 THEN -1.0 ELSE 1.0 END) / tan(pi() * least(p,1.0-p))
+       ELSE list_transform([least(p, 1.0-p)::DOUBLE], lambda q:
+              list_transform([df::DOUBLE], lambda dd:
+                list_transform([
+                  -- Double until the positive quantile is bracketed. Keeping
+                  -- the survival probability avoids subtraction near p = 1.
+                  list_reduce(list_transform(range(1024), lambda i: struct_pack(hi := 0.0::DOUBLE, sf := 0.0::DOUBLE)),
+                    lambda bound, unused: CASE WHEN bound.sf > q
+                      THEN struct_pack(hi := bound.hi*2.0, sf := __reg_t_sf(bound.hi*2.0, dd))
+                      ELSE bound END,
+                    struct_pack(hi := 1.0::DOUBLE, sf := __reg_t_sf(1.0, dd))).hi
+                ], lambda upper:
+                  list_transform([
+                    list_reduce(list_transform(range(80), lambda i: struct_pack(lo := 0.0::DOUBLE, hi := 0.0::DOUBLE)),
+                      lambda bounds, unused: CASE WHEN __reg_t_sf(bounds.lo/2.0 + bounds.hi/2.0, dd) > q
+                        THEN struct_pack(lo := bounds.lo/2.0 + bounds.hi/2.0, hi := bounds.hi)
+                        ELSE struct_pack(lo := bounds.lo, hi := bounds.lo/2.0 + bounds.hi/2.0) END,
+                      struct_pack(lo := 0.0::DOUBLE, hi := upper))
+                  ], lambda bounds: (CASE WHEN p < 0.5 THEN -1.0 ELSE 1.0 END)
+                      * (bounds.lo/2.0 + bounds.hi/2.0))[1]
+                )[1]
               )[1]
             )[1]
   END

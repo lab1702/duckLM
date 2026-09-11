@@ -85,16 +85,17 @@ picks the fastest solver that is valid for the problem:
   to **cyclic coordinate descent** with soft-thresholding instead (this is glmnet's
   proximal-Newton scheme), which also makes lasso coefficients *exactly* zero
   rather than merely small.
-- **Nesterov gradient descent** as an automatic fallback when `XᵀWX` turns out to
-  be singular — a constant or perfectly collinear feature, or complete separation
-  in logistic regression. GD degrades gracefully on those inputs where IRLS cannot.
+- **Nesterov gradient descent** as an automatic fallback when `XᵀWX` is
+  singular (constant or perfectly collinear features), logistic separation
+  causes divergence, or IRLS reaches the iteration limit without convergence.
+  GD degrades gracefully on those inputs where IRLS cannot.
 
-The fallback is free: each solver is a recursive CTE gated so that the one not in
-play emits no seed row and never iterates. So `'auto'` costs the same as IRLS on
-a well-conditioned fit, and the same as GD when it has to fall back.
+Each solver is a recursive CTE gated so that GD runs only when requested or
+when IRLS fails. A successful automatic IRLS fit incurs no GD iterations;
+a fallback runs GD after the unsuccessful IRLS attempt.
 
 Force a solver with `'gd'` or `'irls'`. Forcing `'irls'` on a singular design
-raises a clear error rather than falling back — useful if you would rather hear
+or an unconverged fit raises a clear error rather than falling back — useful if you would rather hear
 about a rank-deficient design than have it silently absorbed.
 
 ```sql
@@ -254,6 +255,10 @@ SELECT * FROM logit_evaluate('churn_model', 'training_data', 'churned');
 | `tweedie_evaluate` | `n, rmse, mae, deviance, null_deviance, pseudo_r2, dispersion` |
 | `nbinom_evaluate` | `n, rmse, mae, loglik, deviance, null_deviance, pseudo_r2, dispersion, aic, bic` |
 
+For offset models, the GLM null baseline fits an intercept while retaining the
+evaluated rows' offsets. A zero null deviance makes pseudo-R² undefined (`NULL`).
+Linear R² retains the usual constant-mean baseline.
+
 `pseudo_r2` is McFadden's (logistic) or deviance-based (Poisson/Gamma); `aic`
 and `bic` use *k* = number of model coefficients (intercept included). Gamma's
 log-likelihood/AIC depend on the dispersion parameter, so it reports deviance,
@@ -327,7 +332,7 @@ when the dispersion is estimated (`linreg`/`gamma`/`tweedie`, Pearson φ). Both
 the normal and Student-t CDFs/quantiles are computed in pure SQL and exposed as
 reusable helpers — `norm_cdf(z)`, `norm_ppf(p)`, `t_cdf(t, df)`, `t_ppf(p, df)`
 — matching SciPy to ~1e-12 across the practical range (`t_ppf` is exact for
-`df = 1`; extreme-tail quantiles at very low `df` are approximate):
+`df = 1`; other quantiles use bracketed inversion of the smaller tail):
 
 ```sql
 SELECT norm_ppf(0.975) AS z95, t_ppf(0.975, 30) AS t95;   -- 1.959964, 2.042272
