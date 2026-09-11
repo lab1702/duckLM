@@ -625,11 +625,12 @@ __reg_gd AS (
                    -- unbounded curvature, so damp the step by the largest
                    -- per-row Hessian weight hw. 1 for the bounded families.
                    -- NB mean-scaling can make curvature far below one. Use
-                   -- its actual curvature (plus ridge) to avoid tiny steps
-                   -- being mistaken for convergence on large-count data.
+                   -- its curvature plus the largest residual (and ridge):
+                   -- the residual bounds steps far from the optimum, where
+                   -- curvature alone can be arbitrarily small.
                    CASE WHEN family = 'nbinom'
                         THEN greatest(1e-300, l2 + list_aggregate(
-                               list_transform(res, lambda ob: ob.hw), 'max'))
+                               list_transform(res, lambda ob: ob.hw + abs(ob.r)), 'max'))
                         WHEN family IN ('poisson', 'gamma', 'tweedie')
                         THEN greatest(1.0, list_aggregate(
                                list_transform(res, lambda ob: ob.hw), 'max'))
@@ -1069,7 +1070,7 @@ __reg_null_bounds(it, lo, hi) AS (
            (CASE WHEN family = 'logistic' THEN ln(a.ybar/(1.0-a.ybar)) ELSE ln(a.ybar) END) - d.omax,
            (CASE WHEN family = 'logistic' THEN ln(a.ybar/(1.0-a.ybar)) ELSE ln(a.ybar) END) - d.omin
     FROM __reg_agg a, __reg_null_data d
-    WHERE offset_col IS NOT NULL AND family != 'linear' AND a.ybar > 0
+    WHERE offset_col IS NOT NULL AND family NOT IN ('linear','tweedie') AND a.ybar > 0
       AND (family != 'logistic' OR a.ybar < 1)
     UNION ALL
     SELECT it+1, CASE WHEN score > 0 THEN mid ELSE lo END,
@@ -1088,8 +1089,24 @@ __reg_null_bounds(it, lo, hi) AS (
             WHERE it < 80 AND lo < hi) b, __reg_null_data d
     )
 ),
+-- Tweedie's intercept-only score has an analytic root for every power:
+-- exp(b) = sum(y*exp((1-p)*offset)) / sum(exp((2-p)*offset)).
+-- Shift each exponential sum by its maximum to keep extreme offsets finite.
+__reg_tw_null_terms AS (
+    SELECT CASE WHEN y > 0 THEN ln(y)+(1.0-power)*o END AS lognum,
+           (2.0-power)*o AS logden
+    FROM __reg_rows
+    WHERE family = 'tweedie' AND offset_col IS NOT NULL
+      AND (SELECT ybar FROM __reg_agg) > 0
+),
 __reg_null_intercept AS (
-    SELECT lo/2.0+hi/2.0 AS b FROM __reg_null_bounds ORDER BY it DESC LIMIT 1
+    (SELECT lo/2.0+hi/2.0 AS b FROM __reg_null_bounds ORDER BY it DESC LIMIT 1)
+    UNION ALL
+    SELECT max(nmax)+ln(sum(exp(lognum-nmax)))
+           -max(dmax)-ln(sum(exp(logden-dmax))) AS b
+    FROM (SELECT *, max(lognum) OVER () AS nmax, max(logden) OVER () AS dmax
+          FROM __reg_tw_null_terms)
+    HAVING count(*) > 0
 ),
 __reg_null_rows AS (
     SELECT r.*, CASE WHEN offset_col IS NULL OR family = 'linear' OR a.ybar = 0
@@ -1794,11 +1811,12 @@ __reg_cv_gd AS (
       FROM (
         SELECT it, B, look, step, mfold, ml2, ml1, mntrain, res,
                -- NB candidates can differ by many orders of magnitude in
-               -- curvature; condition each fold/model independently.
+               -- curvature; condition each fold/model independently and
+               -- bound steps with residuals when far from the optimum.
                CASE WHEN family = 'nbinom'
                     THEN list_transform(mfold, lambda mf, m:
                            greatest(1e-300, ml2[m] + list_aggregate(
-                             list_transform(res, lambda ob: ob.hw[m]), 'max')))
+                             list_transform(res, lambda ob: ob.hw[m]+abs(ob.r[m])), 'max')))
                     ELSE list_resize([]::DOUBLE[], len(mfold),
                          CASE WHEN family IN ('poisson','gamma','tweedie')
                            THEN greatest(1.0, list_aggregate(list_transform(res,
@@ -2007,7 +2025,7 @@ __reg_nbd_gd AS (
     FROM (
       SELECT it, B, look, step, n, res,
              list_transform(malp_int, lambda al, m: greatest(1e-300,
-               list_aggregate(list_transform(res, lambda ob: ob.hw[m]), 'max'))) AS damp
+               list_aggregate(list_transform(res, lambda ob: ob.hw[m]+abs(ob.r[m])), 'max'))) AS damp
       FROM (
         SELECT it, B, look, step, n, malp_int,
                list_transform(rows, lambda rw: struct_pack(

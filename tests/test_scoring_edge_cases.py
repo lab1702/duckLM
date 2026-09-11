@@ -383,3 +383,22 @@ def test_multinomial_loss_is_infinite_for_an_unseen_class(con):
     assert metrics['n'] == 1
     assert metrics['accuracy'] == 0
     assert metrics['log_loss'] == np.inf
+
+
+@pytest.mark.parametrize('power', [1.0, 1.5, 2.0, 3.0, 4.0])
+@pytest.mark.parametrize('offset_shift', [-100.0, 0.0, 100.0])
+def test_tweedie_offset_null_deviance_matches_analytic_optimum(con, power, offset_shift):
+    from scipy.special import logsumexp
+
+    y = np.array([.01, 10.])
+    offset = np.array([0.,4.]) + offset_shift
+    intercept = logsumexp(np.log(y)+(1-power)*offset) - logsumexp((2-power)*offset)
+    con.execute("CREATE TABLE model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient", [float(intercept)])
+    con.execute('CREATE TABLE observations(y DOUBLE, expo DOUBLE)')
+    con.executemany('INSERT INTO observations VALUES (?,?)', list(zip(y.tolist(), offset.tolist())))
+    metrics = _metrics(con, f"tweedie_evaluate('model','observations','y',power:={power},offset_col:='expo')")
+    mu = np.exp(intercept+offset)
+    expected = len(y)*mean_tweedie_deviance(y,mu,power=power)
+    assert metrics['deviance'] == pytest.approx(expected, rel=1e-9)
+    assert metrics['null_deviance'] == pytest.approx(expected, rel=1e-9)
+    assert metrics['pseudo_r2'] == pytest.approx(0.0, abs=1e-9)

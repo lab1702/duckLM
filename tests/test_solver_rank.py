@@ -184,3 +184,28 @@ def test_negative_binomial_dispersion_profiles_large_count_trends(con):
     for alpha, loglik in actual.items():
         expected = con.execute(f"SELECT loglik FROM nbinom_evaluate('exact_count_model','profile_counts','y',alpha:={alpha})").fetchone()[0]
         assert loglik == pytest.approx(expected, rel=1e-8, abs=1e-5)
+
+
+@pytest.mark.parametrize('offset', [-8.0, 4.0, 20.0])
+@pytest.mark.parametrize('scale', [1.0, 1e10])
+def test_negative_binomial_gd_remains_stable_with_offsets(con, offset, scale):
+    con.execute(f'CREATE OR REPLACE TABLE offset_counts AS SELECT i::DOUBLE x,{scale}*(1.+i%3) y,{offset} expo FROM range(12)t(i)')
+    con.execute('CREATE OR REPLACE TABLE constant_offset_counts AS SELECT *,1.0 c FROM offset_counts')
+    # Changing a constant offset changes only the intercept, providing a stable
+    # independent reference even when IRLS initialization is far from the mean.
+    con.execute('CREATE OR REPLACE TABLE no_offset_counts AS SELECT x,y FROM offset_counts')
+    expected = dict(con.execute("SELECT * FROM nbinom_fit('no_offset_counts','y',solver:='irls')").fetchall())
+    expected['(Intercept)'] -= offset
+    for table, solver in [('offset_counts','gd'), ('constant_offset_counts','auto')]:
+        actual = dict(con.execute(f"SELECT * FROM nbinom_fit('{table}','y',offset_col:='expo',solver:='{solver}',max_iter:=2000)").fetchall())
+        if table == 'constant_offset_counts':
+            assert actual.pop('c') == 0
+        assert actual == pytest.approx(expected, rel=1e-6, abs=1e-6)
+
+
+def test_negative_binomial_cv_handles_different_fold_means(con):
+    con.execute('CREATE OR REPLACE TABLE nb_fold_means AS SELECT 1.0 x,CASE WHEN i%2=0 THEN 100.0 ELSE 1.0 END y FROM range(10)t(i)')
+    actual = con.execute("SELECT cv_deviance FROM cv_alpha('nb_fold_means','y',[.5,1.],k:=2,max_iter:=2000)").fetchnumpy()['cv_deviance']
+    y, mu = np.array([100.,1.]), np.array([1.,100.])
+    expected = np.mean(2 * (y*np.log(y/mu) - (y+1)*np.log((y+1)/(mu+1))))
+    np.testing.assert_allclose(actual, expected, rtol=1e-6)
