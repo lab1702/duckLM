@@ -2151,9 +2151,15 @@ FROM nbinom_dispersion(tbl, outcome,
 -- ===========================================================================
 
 -- ---- Standard normal CDF and quantile (closed form, ~1e-15) ----------------
+-- Reciprocal Mills ratio in the tail, via Laplace's continued fraction.
+CREATE OR REPLACE MACRO __reg_norm_tail_d(a) AS (
+  list_reduce([a::DOUBLE] || list_transform(range(24,0,-1), lambda j: j::DOUBLE),
+              (den, n) -> a+n/den)
+);
 CREATE OR REPLACE MACRO __reg_norm_q(a) AS (          -- upper tail P(Z>a), a>=0
   CASE
-    WHEN a > 37.0 THEN 0.0
+    WHEN isnan(a) THEN 'NaN'::DOUBLE
+    WHEN a > 40.0 THEN 0.0
     WHEN a < 7.071067811865475244 THEN
       exp(-a*a/2.0)
       * ((((((0.0352624965998911*a+0.700383064443688)*a+6.37396220353165)*a
@@ -2161,7 +2167,7 @@ CREATE OR REPLACE MACRO __reg_norm_q(a) AS (          -- upper tail P(Z>a), a>=0
       / (((((((0.0883883476483184*a+1.75566716318264)*a+16.064177579207)*a
             +86.7807322029461)*a+296.564248779674)*a+637.333633378831)*a
             +793.826512519948)*a+440.413735824752)
-    ELSE exp(-a*a/2.0) / (a+1.0/(a+2.0/(a+3.0/(a+4.0/(a+0.65))))) / 2.506628274631
+    ELSE exp(-a*a/2.0-ln(__reg_norm_tail_d(a))-ln(2.506628274631))
   END
 );
 CREATE OR REPLACE MACRO norm_cdf(z) AS (
@@ -2185,8 +2191,14 @@ CREATE OR REPLACE MACRO __reg_norm_ppf_raw(p) AS (
        ELSE                   -__reg_acklam_tail(sqrt(-2.0*ln(1.0-p))) END
 );
 CREATE OR REPLACE MACRO __reg_norm_ppf_halley(x0, p) AS (
-  x0 - ((norm_cdf(x0)-p)*2.506628274631*exp(x0*x0/2.0))
-       / (1.0 + x0*((norm_cdf(x0)-p)*2.506628274631*exp(x0*x0/2.0))/2.0)
+  -- Correct in log probability space in the tail: neither the inverse
+  -- density nor a subnormal CDF difference is representable there.
+  CASE WHEN abs(x0) > 8.0 THEN
+    list_transform([__reg_norm_tail_d(abs(x0))], lambda den:
+      x0 + sign(x0)*(-x0*x0/2.0-ln(2.506628274631)-ln(den)
+                     -ln(least(p,1.0-p)))/den)[1]
+  ELSE x0 - ((norm_cdf(x0)-p)*2.506628274631*exp(x0*x0/2.0))
+       / (1.0 + x0*((norm_cdf(x0)-p)*2.506628274631*exp(x0*x0/2.0))/2.0) END
 );
 -- Macro expansion is textual: every reference to a parameter re-expands the
 -- caller's whole argument expression. __reg_norm_ppf_halley references x0 dozens
@@ -2260,11 +2272,14 @@ CREATE OR REPLACE MACRO __reg_betai(a, b, x) AS (
 -- P(T>t), cancellation-free tail. Likewise folded to a single __reg_betai
 -- expansion for the bracketed t_ppf inversion.
 CREATE OR REPLACE MACRO __reg_t_sf(t, df) AS (
-  (CASE WHEN t >= 0.0 THEN 0.0 ELSE 1.0 END)
+  CASE WHEN df IS NULL OR t IS NULL THEN NULL
+       WHEN isnan(df) OR isnan(t) OR df <= 0 THEN 'NaN'::DOUBLE
+       WHEN df = 'Infinity'::DOUBLE THEN norm_cdf(-t)
+       ELSE (CASE WHEN t >= 0.0 THEN 0.0 ELSE 1.0 END)
   + (CASE WHEN t >= 0.0 THEN 0.5 ELSE -0.5 END)
-    * __reg_betai(df/2.0, 0.5, df/(df + t*t))
+    * __reg_betai(df/2.0, 0.5, df/(df + t*t)) END
 );
-CREATE OR REPLACE MACRO t_cdf(t, df) AS ( 1.0 - __reg_t_sf(t::DOUBLE, df::DOUBLE) );
+CREATE OR REPLACE MACRO t_cdf(t, df) AS ( __reg_t_sf(-t::DOUBLE, df::DOUBLE) );
 CREATE OR REPLACE MACRO __reg_t_pdf(t, df) AS (
   exp(lgamma((df+1.0)/2.0) - lgamma(df/2.0) - 0.5*ln(df * 3.141592653589793::DOUBLE))
   * pow(1.0 + t*t/df, -(df+1.0)/2.0)
@@ -2304,6 +2319,28 @@ CREATE OR REPLACE MACRO __reg_t_ppf(p, df) AS (
   END
 );
 CREATE OR REPLACE MACRO t_ppf(p, df) AS ( __reg_t_ppf(p::DOUBLE, df::DOUBLE) );
+
+-- Bernoulli information and residuals from logits. Computing 1-mu after the
+-- sigmoid rounds to one loses variance and valid influence diagnostics.
+CREATE OR REPLACE MACRO __reg_logit_var(eta) AS (
+  exp(-abs(eta))/pow(1.0+exp(-abs(eta)),2.0)
+);
+CREATE OR REPLACE MACRO __reg_logit_resid(y, eta) AS (
+  CASE WHEN eta >= 0 THEN (y-1.0)+exp(-eta)/(1.0+exp(-eta))
+       ELSE y-exp(eta)/(1.0+exp(eta)) END
+);
+CREATE OR REPLACE MACRO __reg_logit_pearson(y, eta) AS (
+  CASE WHEN y = 1 THEN exp(-eta/2.0) WHEN y = 0 THEN -exp(eta/2.0)
+       ELSE __reg_logit_resid(y,eta)/sqrt(__reg_logit_var(eta)) END
+);
+CREATE OR REPLACE MACRO __reg_logit_devres(y, eta) AS (
+  CASE WHEN (y = 1 AND eta >= 0) OR (y = 0 AND eta <= 0)
+       THEN (2*y-1)*sqrt(2.0)*exp(-abs(eta)/2.0)
+            * CASE WHEN abs(eta) > 30 THEN 1.0
+                   ELSE sqrt(__reg_log1p(exp(-abs(eta)))/exp(-abs(eta))) END
+       ELSE sign(__reg_logit_resid(y,eta))*sqrt(2.0*(
+            y*greatest(-eta,0.0)+(1-y)*greatest(eta,0.0)+__reg_log1p(exp(-abs(eta))))) END
+);
 
 -- ---- Shared coefficient-inference core -------------------------------------
 CREATE OR REPLACE MACRO __reg_summary(model, tbl, outcome, family, caller,
@@ -2385,14 +2422,14 @@ __reg_rows0 AS (
     AND (weights_col IS NULL OR w.wt IS NOT NULL)
 ),
 __reg_rww AS (
-  SELECT r.__reg_rid__, r.xs, r.y, r.wt, mu,
+  SELECT r.__reg_rid__, r.xs, r.y, r.wt, mu, r.eta,
          r.wt * (CASE family
-                   WHEN 'logistic' THEN mu*(1.0-mu)  WHEN 'linear' THEN 1.0
+                   WHEN 'logistic' THEN __reg_logit_var(r.eta) WHEN 'linear' THEN 1.0
                    WHEN 'poisson'  THEN mu           WHEN 'gamma'  THEN 1.0
                    WHEN 'tweedie'  THEN pow(mu, 2.0-power)
                    WHEN 'nbinom'   THEN mu/(1.0+alpha*mu) END) AS w,
          r.wt * (CASE family
-                   WHEN 'logistic' THEN (r.y-mu)*(r.y-mu)/(mu*(1.0-mu))
+                   WHEN 'logistic' THEN pow(__reg_logit_pearson(r.y,r.eta),2)
                    WHEN 'linear'   THEN (r.y-mu)*(r.y-mu)
                    WHEN 'poisson'  THEN (r.y-mu)*(r.y-mu)/mu
                    WHEN 'gamma'    THEN (r.y-mu)*(r.y-mu)/(mu*mu)
@@ -2400,7 +2437,7 @@ __reg_rww AS (
                    WHEN 'nbinom'   THEN (r.y-mu)*(r.y-mu)/(mu*(1.0+alpha*mu)) END) AS pearson
   FROM (
     -- eta clamped to [-700, 700] (as the fit does) so mu = exp(eta) never overflows
-    SELECT __reg_rid__, xs, y, wt,
+    SELECT __reg_rid__, xs, y, wt, eta,
            CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0, least(eta, 700.0))))
                        WHEN 'linear'   THEN eta
                        ELSE exp(greatest(-700.0, least(eta, 700.0))) END AS mu
@@ -2482,12 +2519,13 @@ __reg_disp AS (
 __reg_robrow AS (
   SELECT __reg_rww.__reg_rid__, __reg_rww.xs, __reg_rww.wt, cl.cl AS cl,
          __reg_rww.wt * (CASE family
-                     WHEN 'logistic' THEN mu*(1.0-mu)  WHEN 'linear' THEN 1.0
+                     WHEN 'logistic' THEN __reg_logit_var(__reg_rww.eta) WHEN 'linear' THEN 1.0
                      WHEN 'poisson'  THEN mu
                      WHEN 'gamma'    THEN __reg_rww.y/mu
                      WHEN 'tweedie'  THEN (2.0-power)*pow(mu,2.0-power) + (power-1.0)*__reg_rww.y*pow(mu,1.0-power)
                      WHEN 'nbinom'   THEN mu*(1.0+alpha*__reg_rww.y)/pow(1.0+alpha*mu,2.0) END) AS hwt,
          __reg_rww.wt * (CASE family
+                     WHEN 'logistic' THEN __reg_logit_resid(__reg_rww.y,__reg_rww.eta)
                      WHEN 'gamma'   THEN (__reg_rww.y-mu)/mu
                      WHEN 'tweedie' THEN (__reg_rww.y-mu)*pow(mu,1.0-power)
                      WHEN 'nbinom'  THEN (__reg_rww.y-mu)/(1.0+alpha*mu)
@@ -2680,14 +2718,14 @@ __reg_rows0 AS (
 ),
 __reg_rww AS (
   SELECT r.xs, r.y, r.wt, mu,
-         r.wt * (CASE family WHEN 'logistic' THEN mu*(1.0-mu) WHEN 'linear' THEN 1.0
+         r.wt * (CASE family WHEN 'logistic' THEN __reg_logit_var(r.eta) WHEN 'linear' THEN 1.0
                    WHEN 'poisson' THEN mu WHEN 'gamma' THEN 1.0
                    WHEN 'tweedie' THEN pow(mu, 2.0-power) WHEN 'nbinom' THEN mu/(1.0+alpha*mu) END) AS w,
-         r.wt * (CASE family WHEN 'logistic' THEN (r.y-mu)*(r.y-mu)/(mu*(1.0-mu))
+         r.wt * (CASE family WHEN 'logistic' THEN pow(__reg_logit_pearson(r.y,r.eta),2)
                    WHEN 'linear' THEN (r.y-mu)*(r.y-mu) WHEN 'poisson' THEN (r.y-mu)*(r.y-mu)/mu
                    WHEN 'gamma' THEN (r.y-mu)*(r.y-mu)/(mu*mu) WHEN 'tweedie' THEN (r.y-mu)*(r.y-mu)/pow(mu,power)
                    WHEN 'nbinom' THEN (r.y-mu)*(r.y-mu)/(mu*(1.0+alpha*mu)) END) AS pearson
-  FROM (SELECT xs, y, wt, CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
+  FROM (SELECT xs, y, wt, eta, CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                             WHEN 'linear' THEN eta ELSE exp(greatest(-700.0,least(eta,700.0))) END AS mu
         FROM (SELECT xs, y, wt, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0)) r
 ),
@@ -2864,13 +2902,13 @@ __reg_rows0 AS (
 ),
 -- per row: mu, observed weight hw, variance V, residual, unit deviance
 __reg_pr AS (
-  SELECT __reg_rid__, xs, wt, y, mu,
-         wt * (CASE family WHEN 'logistic' THEN mu*(1.0-mu) WHEN 'linear' THEN 1.0
+  SELECT __reg_rid__, xs, wt, y, mu, eta,
+         wt * (CASE family WHEN 'logistic' THEN __reg_logit_var(eta) WHEN 'linear' THEN 1.0
                  WHEN 'poisson' THEN mu WHEN 'gamma' THEN y/mu
                  WHEN 'tweedie' THEN (2.0-power)*pow(mu,2.0-power)+(power-1.0)*y*pow(mu,1.0-power)
                  WHEN 'nbinom' THEN mu*(1.0+alpha*y)/pow(1.0+alpha*mu,2.0) END) AS hwt,
-         (y - mu) AS resid,
-         (CASE family WHEN 'logistic' THEN mu*(1.0-mu) WHEN 'linear' THEN 1.0 WHEN 'poisson' THEN mu
+         CASE WHEN family = 'logistic' THEN __reg_logit_resid(y,eta) ELSE y-mu END AS resid,
+         (CASE family WHEN 'logistic' THEN __reg_logit_var(eta) WHEN 'linear' THEN 1.0 WHEN 'poisson' THEN mu
                  WHEN 'gamma' THEN mu*mu WHEN 'tweedie' THEN pow(mu,power) WHEN 'nbinom' THEN mu*(1.0+alpha*mu) END) AS Vmu,
          (CASE family
             WHEN 'logistic' THEN 2.0*(y*greatest(-eta,0.0)+(1-y)*greatest(eta,0.0)+__reg_log1p(exp(-abs(eta))))
@@ -2899,7 +2937,9 @@ __reg_breadinv AS (
         FROM (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dscA FROM __reg_breada))
 ),
 __reg_lev AS (
-  SELECT p.__reg_rid__, p.hwt * list_sum(list_transform(p.xs, lambda xa, a: xa * list_dot_product(bi.Ainv[a], p.xs))) AS h
+  SELECT p.__reg_rid__,
+         list_sum(list_transform(p.xs, lambda xa, a: xa * list_dot_product(bi.Ainv[a], p.xs))) AS xax,
+         p.hwt * xax AS h
   FROM __reg_pr p CROSS JOIN __reg_breadinv bi
 ),
 __reg_disp AS (
@@ -2910,10 +2950,15 @@ __reg_disp AS (
 __reg_diag AS (
   SELECT p.__reg_rid__,
          CASE WHEN isfinite(l.h) THEN l.h ELSE NULL END AS hat,  -- NULL (not NaN) on singular bread
-         p.resid * sqrt(p.wt) / sqrt(p.Vmu) AS pearson_resid,
-         sign(p.resid) * sqrt(p.wt * greatest(p.udev, 0.0)) AS deviance_resid,
-         CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN (p.resid*sqrt(p.wt)/sqrt(p.Vmu)) / sqrt(dp.phi*(1.0-l.h)) END AS std_resid,
-         CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN (p.resid*p.resid*p.wt/p.Vmu/dp.phi) * l.h / (dp.d*(1.0-l.h)*(1.0-l.h)) END AS cooks_distance
+         CASE WHEN family = 'logistic' THEN sqrt(p.wt)*__reg_logit_pearson(p.y,p.eta)
+              ELSE p.resid * sqrt(p.wt) / sqrt(p.Vmu) END AS pearson_resid,
+         CASE WHEN family = 'logistic' THEN sqrt(p.wt)*__reg_logit_devres(p.y,p.eta)
+              ELSE sign(p.resid) * sqrt(p.wt * greatest(p.udev, 0.0)) END AS deviance_resid,
+         CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN pearson_resid / sqrt(dp.phi*(1.0-l.h)) END AS std_resid,
+         CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN
+              CASE WHEN family = 'logistic'
+                   THEN p.wt*p.wt*p.resid*p.resid*l.xax / (dp.d*(1.0-l.h)*(1.0-l.h))
+                   ELSE (p.resid*p.resid*p.wt/p.Vmu/dp.phi) * l.h / (dp.d*(1.0-l.h)*(1.0-l.h)) END END AS cooks_distance
   FROM __reg_pr p JOIN __reg_lev l ON l.__reg_rid__ = p.__reg_rid__ CROSS JOIN __reg_disp dp
 )
 SELECT n.* EXCLUDE (__reg_rid__), d.hat, d.pearson_resid, d.deviance_resid, d.std_resid, d.cooks_distance

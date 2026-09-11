@@ -388,3 +388,43 @@ def test_inference_rejects_invalid_distribution_parameters(con,family,parameter,
     con.execute('CREATE TABLE distribution_data AS SELECT i::DOUBLE x,1.0+i%3 y FROM range(10)t(i)')
     with pytest.raises(duckdb.Error,match=parameter+' must be finite'):
         con.execute(f"SELECT * FROM {family}_{kind}('distribution_model','distribution_data','y',{parameter}:={value})").fetchall()
+
+
+@pytest.mark.parametrize('probability', [1e-20,1e-100,1e-300,1e-320,5e-324,np.nextafter(1.,0.)])
+def test_normal_quantiles_preserve_extreme_valid_probabilities(con, probability):
+    from scipy.stats import norm
+    actual=con.execute('SELECT norm_ppf(?)',[float(probability)]).fetchone()[0]
+    assert actual==pytest.approx(norm.ppf(probability),abs=2e-12)
+
+
+@pytest.mark.parametrize('value', [-8.,-2.,0.,2.,8.])
+def test_student_t_cdf_has_normal_limit(con,value):
+    from scipy.stats import norm
+    actual=con.execute("SELECT t_cdf(?,'Infinity'::DOUBLE)",[value]).fetchone()[0]
+    assert actual==pytest.approx(norm.cdf(value),rel=1e-12,abs=0)
+    p=.975
+    assert con.execute("SELECT t_cdf(t_ppf(?,'Infinity'::DOUBLE),'Infinity'::DOUBLE)",[p]).fetchone()[0]==pytest.approx(p)
+
+
+@pytest.mark.parametrize('offset', [40.0,1000.0])
+def test_logistic_influence_preserves_confident_observation_diagnostics(con,offset):
+    con.execute(f"CREATE TABLE confident_data AS SELECT * FROM "
+                f"(VALUES (-1.,0.,0.),(-1.,1.,0.),(1.,0.,0.),(1.,1.,0.),(0.,0.,{offset}))t(x,y,expo)")
+    con.execute("CREATE TABLE confident_model AS SELECT * FROM logit_fit('confident_data','y',offset_col:='expo')")
+    actual=con.execute("SELECT hat,pearson_resid,std_resid,cooks_distance FROM logit_influence('confident_model','confident_data','y',offset_col:='expo') WHERE expo>0").fetchone()
+    # The first four rows have mu=1/4 and the surprising fifth row has mu~1.
+    eta=offset-np.log(3)
+    variance=np.exp(-eta)/(1+np.exp(-eta))**2
+    hat=variance/(.75+variance)
+    pearson=-np.exp(eta/2)
+    np.testing.assert_allclose(actual,[hat,pearson,pearson/np.sqrt(1-hat),2/3],rtol=1e-8,atol=0)
+
+
+@pytest.mark.parametrize('eta', [40.0,1000.0,-40.0,-1000.0])
+def test_logistic_influence_retains_tiny_correct_prediction_residuals(con,eta):
+    con.execute("CREATE TABLE tail_model AS SELECT '(Intercept)' feature,0.0 coefficient UNION ALL SELECT 'x',1.0")
+    con.execute(f"CREATE TABLE tail_data AS SELECT * FROM (VALUES (0.,0.),(1.,1.),(-1.,0.),({eta},{int(eta>0)}))t(x,y)")
+    actual=con.execute(f"SELECT pearson_resid,deviance_resid FROM logit_influence('tail_model','tail_data','y') WHERE x={eta}").fetchone()
+    sign=1 if eta>0 else -1
+    expected=sign*np.exp(-abs(eta)/2)
+    np.testing.assert_allclose(actual,[expected,np.sqrt(2)*expected],rtol=1e-12,atol=0)
