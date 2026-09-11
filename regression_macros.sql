@@ -289,16 +289,16 @@ __reg_ycheck AS (
                THEN error(caller || ': outcome column "' || outcome || '" must be non-negative for Poisson regression')
              WHEN family = 'gamma' AND min(v) <= 0
                THEN error(caller || ': outcome column "' || outcome || '" must be strictly positive for Gamma regression')
-             WHEN family = 'tweedie' AND power < 1
-               THEN error(caller || ': power must be >= 1 (1<power<2 for zero-inflated positive data; use linreg_fit for power=0)')
+             WHEN family = 'tweedie' AND (power IS NULL OR NOT isfinite(power) OR power < 1)
+               THEN error(caller || ': power must be >= 1 and finite (1<power<2 for zero-inflated positive data; use linreg_fit for power=0)')
              WHEN family = 'tweedie' AND power >= 2 AND min(v) <= 0
                THEN error(caller || ': outcome column "' || outcome || '" must be strictly positive for Tweedie power >= 2')
              WHEN family = 'tweedie' AND min(v) < 0
                THEN error(caller || ': outcome column "' || outcome || '" must be non-negative for Tweedie regression')
              WHEN family = 'nbinom' AND min(v) < 0
                THEN error(caller || ': outcome column "' || outcome || '" must be non-negative for negative binomial regression')
-             WHEN family = 'nbinom' AND alpha <= 0
-               THEN error(caller || ': alpha (dispersion) must be > 0')
+             WHEN family = 'nbinom' AND (alpha IS NULL OR NOT isfinite(alpha) OR alpha <= 0)
+               THEN error(caller || ': alpha (dispersion) must be finite and > 0')
              ELSE true
            END AS ok
     FROM __reg_clong
@@ -1560,7 +1560,9 @@ __reg_cv_chk AS (
          AND EXISTS (SELECT 1 FROM __reg_cv_yraw WHERE y <= 0)
       THEN error('cv: outcome must be strictly positive for Gamma or Tweedie power >= 2')
     WHEN k < 2 THEN error('cv: k must be >= 2')
-    WHEN len(grid) < 1 THEN error('cv: grid must be non-empty')
+    WHEN grid IS NULL OR len(grid) < 1 THEN error('cv: grid must be non-empty')
+    WHEN len(list_filter(grid, lambda v: v IS NULL OR NOT isfinite(v::DOUBLE))) > 0
+      THEN error('cv: grid values must be non-NULL and finite')
     WHEN sweep IN ('l2','l1') AND list_aggregate(grid,'min') < 0 THEN error('cv: penalty values must be >= 0')
     WHEN sweep = 'power' AND list_aggregate(grid,'min') < 1 THEN error('cv: tweedie power must be >= 1')
     WHEN sweep = 'alpha' AND list_aggregate(grid,'min') <= 0 THEN error('cv: nbinom alpha must be > 0')
@@ -1922,7 +1924,9 @@ __reg_nbd_chk AS (
                      WHERE colname != outcome AND colname NOT IN (SELECT col FROM __reg_nbd_fraw)))
     WHEN (SELECT count(*) FROM __reg_nbd_complete) = 0
       THEN error('nbinom_dispersion: no complete (non-NULL) rows to train on')
-    WHEN len(alpha_grid) < 1 THEN error('nbinom_dispersion: alpha_grid must be non-empty')
+    WHEN alpha_grid IS NULL OR len(alpha_grid) < 1 THEN error('nbinom_dispersion: alpha_grid must be non-empty')
+    WHEN len(list_filter(alpha_grid, lambda v: v IS NULL OR NOT isfinite(v::DOUBLE))) > 0
+      THEN error('nbinom_dispersion: alpha values must be non-NULL and finite')
     WHEN list_aggregate(alpha_grid,'min') <= 0 THEN error('nbinom_dispersion: alpha values must be > 0')
     ELSE true END AS ok
 ),
@@ -2263,7 +2267,11 @@ __reg_cols AS (
        UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
 ),
 __reg_inputcheck AS (
-  SELECT CASE WHEN conf_level IS NULL OR NOT isfinite(conf_level) OR conf_level <= 0 OR conf_level >= 1
+  SELECT CASE WHEN family = 'nbinom' AND (alpha IS NULL OR NOT isfinite(alpha) OR alpha <= 0)
+              THEN error(caller || ': alpha must be finite and > 0')
+              WHEN family = 'tweedie' AND (power IS NULL OR NOT isfinite(power) OR power < 1)
+              THEN error(caller || ': power must be finite and >= 1')
+              WHEN conf_level IS NULL OR NOT isfinite(conf_level) OR conf_level <= 0 OR conf_level >= 1
               THEN error(caller || ': conf_level must be finite and strictly between 0 and 1')
               WHEN starts_with(lower(tbl), '__reg_') OR starts_with(lower(model), '__reg_')
               THEN error(caller || ': table names beginning with "__reg_" are reserved for internal use; please rename')
@@ -2561,7 +2569,11 @@ __reg_scorecols AS (
        UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
 ),
 __reg_inputcheck AS (
-  SELECT CASE WHEN conf_level IS NULL OR NOT isfinite(conf_level) OR conf_level <= 0 OR conf_level >= 1
+  SELECT CASE WHEN family = 'nbinom' AND (alpha IS NULL OR NOT isfinite(alpha) OR alpha <= 0)
+              THEN error(caller || ': alpha must be finite and > 0')
+              WHEN family = 'tweedie' AND (power IS NULL OR NOT isfinite(power) OR power < 1)
+              THEN error(caller || ': power must be finite and >= 1')
+              WHEN conf_level IS NULL OR NOT isfinite(conf_level) OR conf_level <= 0 OR conf_level >= 1
               THEN error(caller || ': conf_level must be finite and strictly between 0 and 1')
               WHEN starts_with(lower(tbl), '__reg_') OR starts_with(lower(model), '__reg_')
                 OR starts_with(lower(coalesce(newdata, tbl)), '__reg_')
@@ -2748,7 +2760,11 @@ __reg_cols AS (
        UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
 ),
 __reg_inputcheck AS (
-  SELECT CASE WHEN starts_with(lower(tbl), '__reg_') OR starts_with(lower(model), '__reg_')
+  SELECT CASE WHEN family = 'nbinom' AND (alpha IS NULL OR NOT isfinite(alpha) OR alpha <= 0)
+              THEN error(caller || ': alpha must be finite and > 0')
+              WHEN family = 'tweedie' AND (power IS NULL OR NOT isfinite(power) OR power < 1)
+              THEN error(caller || ': power must be finite and >= 1')
+              WHEN starts_with(lower(tbl), '__reg_') OR starts_with(lower(model), '__reg_')
               THEN error(caller || ': table names beginning with "__reg_" are reserved for internal use; please rename')
               WHEN EXISTS (SELECT 1 FROM __reg_cols WHERE starts_with(lower(colname), '__reg_'))
               THEN error(caller || ': column names beginning with "__reg_" are reserved for internal use; please rename')

@@ -133,3 +133,14 @@ def test_refinement_cannot_skip_better_coarse_candidate(con):
     coarse=con.execute("SELECT min(cv_deviance) FROM cv_l2('uneven_refinement','y','linear',[0.,.5,100.])").fetchone()[0]
     refined=con.execute("SELECT min(cv_deviance) FROM cv_l2_refine('uneven_refinement','y','linear',[0.,.5,100.])").fetchone()[0]
     assert refined <= coarse+1e-10
+
+
+@pytest.mark.parametrize('bad',['NULL',"'NaN'::DOUBLE","'Infinity'::DOUBLE"])
+@pytest.mark.parametrize('kind',['alpha','power','l1','l2','dispersion'])
+def test_tuning_rejects_invalid_grid_candidates(con,bad,kind):
+    grid=f'[{bad},1.5]::DOUBLE[]'
+    if kind=='dispersion':call=f"nbinom_dispersion('balanced','y',{grid})"
+    elif kind in ('alpha','power'):call=f"cv_{kind}('balanced','y',{grid})"
+    else:call=f"cv_{kind}('balanced','y','linear',{grid})"
+    with pytest.raises(duckdb.Error,match='non-NULL and finite'):
+        con.execute('SELECT * FROM '+call).fetchall()

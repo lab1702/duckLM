@@ -148,3 +148,11 @@ def test_outcome_validation_ignores_incomplete_training_rows(con,family,missing)
     for table in ['retained_rows','with_invalid_dropped_row']:
         fitted.append(dict(con.execute(f"SELECT * FROM {family}_fit('{table}','y',offset_col:='expo',weights_col:='wt')").fetchall()))
     assert fitted[1]==pytest.approx(fitted[0],abs=1e-10)
+
+
+@pytest.mark.parametrize('family,parameter',[('nbinom','alpha'),('tweedie','power')])
+@pytest.mark.parametrize('value',['NULL',"'NaN'::DOUBLE","'Infinity'::DOUBLE"])
+def test_fit_rejects_missing_or_nonfinite_distribution_parameters(con,family,parameter,value):
+    con.execute('CREATE OR REPLACE TABLE distribution_input AS SELECT i::DOUBLE x,1.0+i%3 y FROM range(10)t(i)')
+    with pytest.raises(duckdb.Error,match=parameter+'.*finite'):
+        con.execute(f"SELECT * FROM {family}_fit('distribution_input','y',{parameter}:={value})").fetchall()

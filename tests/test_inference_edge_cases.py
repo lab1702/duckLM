@@ -378,3 +378,13 @@ def test_inference_rejects_invalid_confidence_levels(con,confidence,kind):
         call='linreg_'+kind
     with pytest.raises(duckdb.Error,match='conf_level must be finite and strictly between 0 and 1'):
         con.execute(f"SELECT * FROM {call}('bad_conf_model','bad_conf_data','y',conf_level:={confidence})").fetchall()
+
+
+@pytest.mark.parametrize('family,parameter',[('nbinom','alpha'),('tweedie','power')])
+@pytest.mark.parametrize('kind',['summary','predict_ci','influence'])
+@pytest.mark.parametrize('value',['NULL','-0.1',"'NaN'::DOUBLE","'Infinity'::DOUBLE"])
+def test_inference_rejects_invalid_distribution_parameters(con,family,parameter,kind,value):
+    con.execute("CREATE TABLE distribution_model AS SELECT '(Intercept)' feature,0.0 coefficient")
+    con.execute('CREATE TABLE distribution_data AS SELECT i::DOUBLE x,1.0+i%3 y FROM range(10)t(i)')
+    with pytest.raises(duckdb.Error,match=parameter+' must be finite'):
+        con.execute(f"SELECT * FROM {family}_{kind}('distribution_model','distribution_data','y',{parameter}:={value})").fetchall()
