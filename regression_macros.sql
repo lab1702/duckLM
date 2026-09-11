@@ -80,8 +80,9 @@
 -- Fit parameters:
 --   max_iter      := 50000   hard cap on gradient iterations
 --   learning_rate := NULL    step size on the standardized scale; NULL picks
---                            a convergent default (4/(d+1+4*l2) logistic,
---                            1/(d+1+l2) otherwise; Poisson/Gamma steps are
+--                            a convergent default (4/(d+1) logistic,
+--                            1/(d+1) otherwise; ridge is applied proximally;
+--                            Poisson/Gamma steps are
 --                            additionally damped each iteration by the largest
 --                            curvature weight, since theirs is unbounded)
 --   tol           := 1e-10   stop when the gradient step is smaller than this
@@ -232,6 +233,12 @@ CREATE OR REPLACE MACRO __reg_mul_div(a, b, c) AS (
        ELSE sign(a)*sign(b)*sign(c)*exp(ln(abs(a))+ln(abs(b))-ln(abs(c))) END
 );
 
+-- Ridge proximal shrinkage without overflowing step*penalty.
+CREATE OR REPLACE MACRO __reg_ridge_div(value, step, penalty) AS (
+  CASE WHEN penalty = 0 THEN value
+       WHEN isfinite(step*penalty) THEN value/(1.0+step*penalty)
+       ELSE __reg_mul_div(value,1.0/penalty,step+1.0/penalty) END
+);
 -- Sum large terms before small ones, with compensation, so cancellation does
 -- not discard a finite intercept or another smaller contribution.
 CREATE OR REPLACE MACRO __reg_fsum(vs) AS (
@@ -585,15 +592,16 @@ __reg_cfg AS (
                THEN error(caller || ': solver must be ''auto'', ''gd'' or ''irls'', got ''' || solver || '''')
              -- Guaranteed-convergent steps: on standardized data the mean-loss
              -- gradient is L-Lipschitz with L <= (d+1)/4 (logistic, from the
-             -- sigmoid derivative bound) or L <= d+1 (linear), plus l2 from the
-             -- ridge penalty. Poisson/Gamma have no global Lipschitz bound;
+             -- sigmoid derivative bound) or L <= d+1 (linear). Ridge uses a
+             -- proximal step, so it cannot slow the unpenalized intercept.
+             -- Poisson/Gamma have no global Lipschitz bound;
              -- their base step is locally safe at the mean-scaled start
              -- (fitted means ~= 1, curvature weights ~= 1) and is damped each
              -- iteration by the largest curvature weight in the loop below.
              ELSE coalesce(learning_rate,
                            CASE WHEN family = 'logistic'
-                                THEN 4.0 / (f.d + 1 + 4.0 * l2)
-                                ELSE 1.0 / (f.d + 1 + l2)
+                                THEN 4.0 / (f.d + 1)
+                                ELSE 1.0 / (f.d + 1)
                            END)
            END AS step,
            -- Negative-binomial dispersion on the mean-scaled internal problem:
@@ -739,21 +747,16 @@ __reg_gd AS (
            list_aggregate(list_transform(newbetas, lambda nb, j: abs(nb - look[j])), 'max')
     FROM (
         SELECT it, betas, look,
-               -- L1 proximal step (soft-threshold): beta_j <- prox_{t*l1}(z_j),
-               -- prox(z) = sign(z) * max(|z| - t*l1, 0), zeroing small coefficients
-               -- exactly (feature selection). The intercept is never penalized; a
-               -- no-op when l1 = 0, so unpenalized / pure-ridge fits are unchanged.
+               -- Elastic-net proximal step: soft threshold for L1, then ridge
+               -- shrinkage. The intercept is never penalized.
                list_transform(zstep, lambda zj, j:
                    CASE WHEN j = 1 THEN zj
-                        ELSE sign(zj) * greatest(abs(zj) - threshl1, 0.0) END) AS newbetas
+                        ELSE __reg_ridge_div(sign(zj) * greatest(abs(zj) - threshl1, 0.0),prox_step,l2) END) AS newbetas
         FROM (
-            SELECT it, betas, look, step * (l1 / damp) AS threshl1,
-                   -- smooth-part gradient step z = look + (step/damp)*(grad - l2*look);
-                   -- (1/sumw) sum_i w_i xs_ij r_i is the mean-loss gradient, and the
-                   -- smooth L2 gradient l2*look_j stays here (not in the prox).
+            SELECT it, betas, look, step * (l1 / damp) AS threshl1, step/damp AS prox_step,
+                   -- Smooth data-loss gradient; both penalties are proximal.
                    list_transform(look, lambda b, j:
-                       b + step * ((list_sum(list_transform(res, lambda ob: ob.w * ob.xs[j] * ob.r)) / sumw
-                                    - CASE WHEN j = 1 THEN 0.0 ELSE l2 * b END) / damp)) AS zstep
+                       b + step * ((list_sum(list_transform(res, lambda ob: ob.w * ob.xs[j] * ob.r)) / sumw) / damp)) AS zstep
             FROM (
                 SELECT it, betas, n, sumw, step, look, res,
                    -- The log-link families (Poisson/Gamma/Tweedie) have
@@ -761,11 +764,11 @@ __reg_gd AS (
                    -- per-row Hessian weight hw. 1 for the bounded families.
                    -- NB mean-scaling and Tweedie powers above two can make
                    -- curvature far below one. Use its absolute value plus
-                   -- the largest residual (and ridge):
+                   -- the largest residual:
                    -- the residual bounds steps far from the optimum, where
                    -- curvature alone can be arbitrarily small.
                    CASE WHEN family IN ('nbinom','tweedie')
-                        THEN coalesce(nullif(l2 + list_aggregate(
+                        THEN coalesce(nullif(list_aggregate(
                                list_transform(res, lambda ob: abs(ob.hw) + abs(ob.r)), 'max'),0.0),1.0)
                         WHEN family IN ('poisson', 'gamma')
                         THEN greatest(1.0, list_aggregate(
@@ -1600,8 +1603,8 @@ __reg_mpacked AS MATERIALIZED (
 ),
 __reg_mcfg AS (
   -- softmax gradient is L-Lipschitz with L <= (d+1)/2 on standardized data,
-  -- plus l2 from the ridge penalty
-  SELECT coalesce(learning_rate, 2.0 / (D1 + 2.0 * l2)) AS step
+  -- ridge is proximal and does not slow the free intercept
+  SELECT coalesce(learning_rate, 2.0 / D1) AS step
   FROM __reg_mpacked, __reg_mchk WHERE ok
 ),
 __reg_mgd AS (
@@ -1616,18 +1619,15 @@ __reg_mgd AS (
              list_aggregate(list_transform(bk, lambda v, j: abs(v - look[k][j])), 'max')), 'max')
   FROM (
     SELECT it, B, look,
-           -- L1 prox (soft-threshold) on the L2-inclusive gradient step, per
-           -- class per coefficient; the intercept (j=1) is unpenalized. No-op
-           -- when l1 = 0, so unpenalized / pure-ridge fits are unchanged.
+           -- Elastic-net proximal update; the intercept is unpenalized.
            list_transform(zstep, lambda zk, k: list_transform(zk, lambda zkj, j:
                CASE WHEN j = 1 THEN zkj
-                    ELSE sign(zkj) * greatest(abs(zkj) - threshl1, 0.0) END)) AS newB
+                    ELSE __reg_ridge_div(sign(zkj) * greatest(abs(zkj) - threshl1, 0.0),prox_step,l2) END)) AS newB
     FROM (
-      SELECT it, B, look, step * l1 AS threshl1,
-             -- z[k][j] = look + step*((1/n) sum_i xs_ij r_ik - l2*look [not intercept])
+      SELECT it, B, look, step * l1 AS threshl1, step AS prox_step,
+             -- z[k][j] = look + step*((1/n) sum_i xs_ij r_ik)
              list_transform(look, lambda bk, k: list_transform(bk, lambda lkj, j:
-                 lkj + step * (list_sum(list_transform(res, lambda ob: ob.r[k] * ob.xs[j])) / n
-                               - CASE WHEN j = 1 THEN 0.0 ELSE l2 * lkj END))) AS zstep
+                 lkj + step * (list_sum(list_transform(res, lambda ob: ob.r[k] * ob.xs[j])) / n))) AS zstep
       FROM (
         SELECT it, B, n, step, look,
              list_transform(rows, lambda rw: struct_pack(
@@ -1899,8 +1899,10 @@ __reg_cv_cfg AS (
            -- Global standardization bounds the full-data squared design norm
            -- by n*(d+1). Divide by the smallest training-fold count to bound
            -- every fold's curvature, including singular-design GD fallbacks.
-           CASE WHEN family='logistic' THEN 4.0/((f.d+1)*(SELECT n FROM __reg_cv_n)/list_aggregate(ma.mntrain,'min')+4.0*list_aggregate(ma.ml2,'max'))
-                ELSE 1.0/((f.d+1)*(SELECT n FROM __reg_cv_n)/list_aggregate(ma.mntrain,'min')+list_aggregate(ma.ml2,'max')) END) AS step,
+           -- Penalties are proximal, so a candidate cannot change another
+           -- candidate's step or shrink the unpenalized intercept's step.
+           CASE WHEN family='logistic' THEN 4.0/((f.d+1)*(SELECT n FROM __reg_cv_n)/list_aggregate(ma.mntrain,'min'))
+                ELSE 1.0/((f.d+1)*(SELECT n FROM __reg_cv_n)/list_aggregate(ma.mntrain,'min')) END) AS step,
          f.d + 1 AS D1, ma.M AS M
   FROM __reg_cv_feats f, __reg_cv_marr ma, __reg_cv_chk chk WHERE chk.ok
 ),
@@ -2032,20 +2034,19 @@ __reg_cv_gd AS (
              list_aggregate(list_transform(bm, lambda v, j: abs(v - look[m][j])), 'max')), 'max')
   FROM (
     SELECT it, B, look,
-           -- L1 prox on the L2-inclusive gradient step, per model per coef
+           -- Elastic-net proximal update, independently for each model.
            list_transform(zstep, lambda zm, m: list_transform(zm, lambda zmj, j:
                CASE WHEN j = 1 THEN zmj
-                    ELSE sign(zmj) * greatest(abs(zmj) - step*(ml1[m]/damp[m]), 0.0) END)) AS newB
+                    ELSE __reg_ridge_div(sign(zmj) * greatest(abs(zmj) - step*(ml1[m]/damp[m]), 0.0),step/damp[m],ml2[m]) END)) AS newB
     FROM (
-      SELECT it, B, look, step, damp, ml1,
+      SELECT it, B, look, step, damp, ml1, ml2,
              -- The held-out rows are zeroed in `r` (below), not here: this inner
              -- lambda runs once per (row, model, coefficient), so testing the fold
              -- here would index mfold[m] and compare it D1 times per (row, model).
              -- A zero residual contributes nothing to the gradient either way.
              list_transform(look, lambda bm, m: list_transform(bm, lambda lmj, j:
                  lmj + step * ((
-                   list_sum(list_transform(res, lambda ob: ob.xs[j] * ob.r[m])) / mntrain[m]
-                   - CASE WHEN j = 1 THEN 0.0 ELSE ml2[m] * lmj END) / damp[m]))) AS zstep
+                   list_sum(list_transform(res, lambda ob: ob.xs[j] * ob.r[m])) / mntrain[m]) / damp[m]))) AS zstep
       FROM (
         SELECT it, B, look, step, mfold, ml2, ml1, mntrain, res,
                -- NB/Tweedie candidates can differ by many orders of magnitude in
@@ -2053,12 +2054,12 @@ __reg_cv_gd AS (
                -- bound steps with residuals when far from the optimum.
                CASE WHEN family IN ('nbinom','tweedie')
                     THEN list_transform(mfold, lambda mf, m:
-                           coalesce(nullif(ml2[m] + list_aggregate(
+                           coalesce(nullif(list_aggregate(
                              list_transform(res, lambda ob: abs(ob.hw[m])+abs(ob.r[m])), 'max'),0.0),1.0))
-                    ELSE list_resize([]::DOUBLE[], len(mfold),
-                         CASE WHEN family IN ('poisson','gamma','tweedie')
+                    ELSE list_transform(mfold, lambda mf,m:
+                         CASE WHEN family IN ('poisson','gamma')
                            THEN greatest(1.0, list_aggregate(list_transform(res,
-                             lambda ob: list_aggregate(ob.hw, 'max')), 'max'))
+                             lambda ob: ob.hw[m]), 'max'))
                            ELSE 1.0 END) END AS damp
         FROM (
           SELECT it, B, look, step, mfold, ml2, ml1, mntrain, mpow, mlogalp_int,
@@ -2947,19 +2948,19 @@ __reg_final AS (
 ),
 -- per-coefficient SE with guards: NULL when the covariance is singular / non-finite / non-positive
 __reg_percoef AS (
-  SELECT gs.i AS i, names[gs.i] AS feature, bvec[gs.i] AS coefficient, uset, df, crit,
+  SELECT gs.i AS i, names[gs.i] AS feature, bvec[gs.i] AS coefficient, uset, df, crit, units[gs.i] AS feature_unit,
          CASE WHEN robactive THEN
                 -- A singular design cannot identify coefficient uncertainty.
                 -- df <= 0 (saturated): robust variance is undefined; at n==d the
                 -- leverage h->1 makes hc2/hc3's sc^2/(1-h)^k a 0/0 finite artifact
-                CASE WHEN Rinv IS NOT NULL AND df > 0.0 AND isfinite(rv[gs.i]) AND rv[gs.i] > 0.0 THEN sqrt(rv[gs.i]) / units[gs.i] ELSE NULL END
+                CASE WHEN Rinv IS NOT NULL AND df > 0.0 AND isfinite(rv[gs.i]) AND rv[gs.i] > 0.0 THEN sqrt(rv[gs.i]) ELSE NULL END
               ELSE
                 CASE WHEN Rinv IS NOT NULL AND isfinite(phi * Rinv[gs.i][gs.i]) AND phi * Rinv[gs.i][gs.i] > 0.0
-                     THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] / units[gs.i] / (CASE WHEN est THEN 1.0 ELSE sqrt(wscale) END) / sqrt(wunit) ELSE NULL END
+                     THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] / (CASE WHEN est THEN 1.0 ELSE sqrt(wscale) END) / sqrt(wunit) ELSE NULL END
          END AS scaled_std_error
   FROM __reg_final, unnest(range(1, len(bvec)+1)) AS gs(i)
 )
-SELECT feature, coefficient, scaled_std_error * ru.runit AS std_error,
+SELECT feature, coefficient, __reg_mul_div(scaled_std_error,ru.runit,feature_unit) AS std_error,
        coefficient / std_error AS statistic,
        CASE WHEN std_error IS NULL THEN NULL
             WHEN uset THEN 2.0 * __reg_t_sf(abs(coefficient / std_error), df)
@@ -3191,8 +3192,10 @@ __reg_sfeat AS (
   WHERE NOT EXISTS (SELECT 1 FROM __reg_mdlj)
 ),
 __reg_scoords AS (
-  SELECT sf.*, list_transform(sf.xs, lambda v,a: (v/cp.units[a])/cp.dsc[a]) AS zs
-  FROM __reg_sfeat sf CROSS JOIN __reg_cparams cp
+  -- Combine response and feature units before forming large extrapolation
+  -- coordinates; the interval standard error then already has response units.
+  SELECT sf.*, list_transform(sf.xs, lambda v,a: __reg_mul_div(v,ru.runit,cp.units[a])/cp.dsc[a]) AS zs
+  FROM __reg_sfeat sf CROSS JOIN __reg_cparams cp CROSS JOIN __reg_resunits ru
 ),
 __reg_sdesign AS (
   SELECT *, coalesce(nullif(list_max(list_transform(zs,lambda v: abs(v))),0.0),1.0) AS zunit
@@ -3226,11 +3229,11 @@ SELECT sn.* EXCLUDE (__reg_srid__),
        CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-s.eta)) WHEN 'linear' THEN s.eta ELSE exp(s.eta) END AS prediction,
        CASE WHEN s.unit_se IS NULL OR NOT isfinite(s.unit_se) THEN NULL
             ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta - s.crit*s.unit_se)))
-                              WHEN 'linear' THEN s.eta - __reg_mul_div(s.crit*s.unit_se,s.runit,1.0)
+                              WHEN 'linear' THEN __reg_dot([s.eta,-s.crit],[1.0,s.unit_se])
                               ELSE exp(s.eta - s.crit*s.unit_se) END) END AS conf_low,
        CASE WHEN s.unit_se IS NULL OR NOT isfinite(s.unit_se) THEN NULL
             ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta + s.crit*s.unit_se)))
-                              WHEN 'linear' THEN s.eta + __reg_mul_div(s.crit*s.unit_se,s.runit,1.0)
+                              WHEN 'linear' THEN __reg_dot([s.eta,s.crit],[1.0,s.unit_se])
                               ELSE exp(s.eta + s.crit*s.unit_se) END) END AS conf_high
 FROM __reg_serrors s JOIN __reg_snum sn ON sn.__reg_srid__ = s.__reg_srid__
 CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok

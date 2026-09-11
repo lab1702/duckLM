@@ -852,7 +852,7 @@ def test_multinomial_tiny_class_information_has_finite_standard_errors(con, scal
     np.testing.assert_allclose(se*np.sqrt(scale), np.sqrt(np.diag(np.linalg.inv(design.T@design))), rtol=1e-10)
 
 
-@pytest.mark.parametrize('feature_scale,response_scale,new_x', [(1.,1.,1e160), (1.,1.,1e300), (1e-100,1e-170,1e160), (1e100,1e100,1e160)])
+@pytest.mark.parametrize('feature_scale,response_scale,new_x', [(1.,1.,1e160), (1.,1.,1e300), (1e-100,1e-170,1e160), (1e100,1e100,1e160), (1e-200,1e-200,1e150), (1e-310,1e-310,1e150), (1e-310,1e-200,1e150)])
 def test_prediction_intervals_scale_newdata_before_covariance_products(con, feature_scale, response_scale, new_x):
     from scipy.stats import t
     x = np.arange(10, dtype=float)
@@ -868,9 +868,46 @@ def test_prediction_intervals_scale_newdata_before_covariance_products(con, feat
     con.execute("CREATE TABLE extrap_model AS SELECT * FROM linreg_fit('extrap_train','y')")
     con.execute('CREATE TABLE extrap_score AS SELECT ?::DOUBLE x', [new_x])
     actual = np.array(con.execute("SELECT prediction,conf_low,conf_high FROM linreg_predict_ci('extrap_model','extrap_train','y',newdata:='extrap_score')").fetchone())
-    units = (new_x/feature_scale)*response_scale
+    units = new_x*(response_scale/feature_scale)
     assert np.isfinite(actual).all()
     np.testing.assert_allclose(actual/units, [expected_prediction,expected_prediction-width,expected_prediction+width], rtol=1e-9)
+
+
+@pytest.mark.parametrize('robust', ['none', 'hc0', 'hc1', 'hc2', 'hc3', 'cluster'])
+@pytest.mark.parametrize('scale', [1e-310, 1e-305])
+def test_linear_standard_errors_combine_response_and_feature_units(con, robust, scale):
+    x = np.arange(10, dtype=float)
+    y = x+x%2
+    design = np.column_stack([np.ones(len(x)), x])
+    beta = np.linalg.lstsq(design,y,rcond=None)[0]
+    inverse = np.linalg.inv(design.T@design)
+    residual = y-design@beta
+    if robust == 'none':
+        covariance = inverse*(residual@residual)/8
+    elif robust == 'cluster':
+        scores = design*residual[:,None]
+        groups = np.array([scores[x.astype(int)//2 == group].sum(axis=0) for group in range(5)])
+        covariance = inverse@(groups.T@groups)@inverse*(5/4)*(9/8)
+    else:
+        meat_weights = residual**2
+        hat = np.einsum('ij,jk,ik->i',design,inverse,design)
+        if robust == 'hc2': meat_weights /= 1-hat
+        if robust == 'hc3': meat_weights /= (1-hat)**2
+        covariance = inverse@(design.T@(meat_weights[:,None]*design))@inverse
+        if robust == 'hc1': covariance *= 10/8
+    con.execute('CREATE TABLE tiny_units AS SELECT i::DOUBLE*? x,(i+i%2)::DOUBLE*? y FROM range(10)t(i)', [scale,scale])
+    con.execute("CREATE TABLE tiny_units_model AS SELECT * FROM linreg_fit('tiny_units','y')")
+    if robust == 'cluster':
+        con.execute('ALTER TABLE tiny_units ADD COLUMN grp INTEGER')
+        con.execute('UPDATE tiny_units SET grp = CAST(round(x/?) AS INTEGER)//2', [scale])
+        options = ",cluster_col:='grp'"
+    else:
+        options = f",robust:='{robust}'"
+    actual = con.execute(f"SELECT feature,std_error,statistic,p_value,conf_low,conf_high FROM linreg_summary('tiny_units_model','tiny_units','y'{options})").fetchall()
+    assert np.isfinite(np.array([row[1:] for row in actual], dtype=float)).all()
+    standard_errors = np.array([row[1] for row in actual])
+    standard_errors[0] /= scale
+    np.testing.assert_allclose(standard_errors,np.sqrt(np.diag(covariance)),rtol=1e-9)
 
 
 @pytest.mark.parametrize('family', ['linreg','logit','poisson','gamma','tweedie','nbinom'])

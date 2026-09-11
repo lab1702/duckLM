@@ -77,6 +77,18 @@ def test_refinement_interpolates_large_neighbors_and_retains_winner(con, grid, w
     assert winner in actual
 
 
+@pytest.mark.parametrize('penalty', [1e8, 1e308])
+@pytest.mark.parametrize('macro', ['cv_l2', 'cv_l2_refine'])
+def test_ridge_candidates_cannot_change_other_candidates_in_singular_fallback(con, penalty, macro):
+    con.execute('CREATE TABLE singular_cv AS SELECT (i%3)::DOUBLE x,(i%3)::DOUBLE z,(i%5=0)::DOUBLE y FROM range(60)t(i)')
+    baseline = con.execute("SELECT cv_deviance FROM cv_l2('singular_cv','y','logistic',[0.],k:=2)").fetchone()[0]
+    extra = ',n_refine:=3' if macro.endswith('_refine') else ''
+    scores = con.execute(f"SELECT cv_deviance FROM {macro}('singular_cv','y','logistic',[0.,{penalty}],k:=2{extra})").fetchnumpy()['cv_deviance']
+    expected = -2*(.2*np.log(.2)+.8*np.log(.8))
+    assert baseline == pytest.approx(expected,abs=1e-10)
+    np.testing.assert_allclose(scores,expected,atol=1e-9,rtol=0)
+
+
 def test_cv_power_equal_predictions_have_equal_scores_including_endpoints(con):
     rows = con.execute(
         "SELECT * FROM cv_power('balanced','y',[1.0,1.3,1.5,1.7,2.0])"

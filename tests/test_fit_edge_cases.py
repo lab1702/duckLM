@@ -39,6 +39,24 @@ def test_multinomial_high_leverage_logits_match_stable_likelihood():
     assert np.max(np.abs(objective(actual)[1])) < .01
 
 
+@pytest.mark.parametrize('solver', ['auto', 'gd'])
+@pytest.mark.parametrize('penalty', [1e8, 1e308])
+def test_large_ridge_penalties_preserve_the_free_logistic_intercept(con, solver, penalty):
+    con.execute('CREATE OR REPLACE TABLE ridge_intercept AS SELECT (i%3)::DOUBLE x,(i%5=0)::DOUBLE y FROM range(60)t(i)')
+    coefficients = dict(con.execute(f"SELECT * FROM logit_fit('ridge_intercept','y',l2:={penalty},solver:='{solver}')").fetchall())
+    assert coefficients['(Intercept)'] == pytest.approx(np.log(.2/.8),abs=1e-8)
+    assert coefficients['x'] == pytest.approx(0.,abs=1e-9)
+
+
+@pytest.mark.parametrize('penalty', [1e8, 1e308])
+def test_large_ridge_penalties_preserve_multinomial_class_frequencies(con, penalty):
+    con.execute("CREATE OR REPLACE TABLE ridge_classes AS SELECT (i%3)::DOUBLE x,CASE WHEN i%5=0 THEN 'a' WHEN i%5 IN (1,2) THEN 'b' ELSE 'c' END y FROM range(60)t(i)")
+    rows = con.execute(f"SELECT class,feature,coefficient FROM multinom_fit('ridge_classes','y',l2:={penalty})").fetchall()
+    for label, feature, coefficient in rows:
+        expected = np.log(2.) if label != 'a' and feature == '(Intercept)' else 0.
+        assert coefficient == pytest.approx(expected,abs=1e-8)
+
+
 @pytest.fixture(scope="module")
 def con():
     connection = duckdb.connect()

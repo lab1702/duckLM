@@ -60,7 +60,7 @@ SELECT * FROM rev_model;
 | `tbl` | — | table/view name as a **string** (resolved via `query_table`; schema-qualified names work) |
 | `outcome` | — | column to predict, as a string; for `logit_fit` it must be 0/1 or boolean, for `poisson_fit` non-negative, for `gamma_fit` strictly positive |
 | `max_iter` | `50000` | hard cap on solver iterations (only the `gd` path gets near it; IRLS converges in ~5–10) |
-| `learning_rate` | `NULL` | step size on the standardized scale; `NULL` auto-picks a convergent default (`4/(d+1+4·l2)` logistic, `1/(d+1+l2)` otherwise; Poisson/Gamma steps are additionally damped each iteration by the largest curvature weight, since theirs is unbounded) |
+| `learning_rate` | `NULL` | step size on the standardized scale; `NULL` auto-picks a convergent default (`4/(d+1)` logistic, `1/(d+1)` otherwise; ridge is applied by proximal shrinkage, leaving the intercept's step unchanged; Poisson/Gamma steps are additionally damped each iteration by the largest curvature weight, since theirs is unbounded) |
 | `tol` | `1e-10` | stop early when the gradient step is smaller than this |
 | `l2` | `0.0` | ridge penalty `(l2/2)·Σβ²` added to the mean loss of the internally standardized problem, intercept unpenalized |
 | `l1` | `0.0` | lasso penalty `l1·Σ\|β\|` (feature selection); combine with `l2` for elastic net. Intercept unpenalized |
