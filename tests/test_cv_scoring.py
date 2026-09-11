@@ -102,3 +102,34 @@ def test_cv_deviance_uses_finite_log_predictors_when_means_underflow(con,family)
     else:
         expected=np.mean(4*(-2*np.sqrt(y)+y*np.exp(-.5*z)+np.exp(.5*z)))
     assert actual==pytest.approx(expected,rel=1e-6)
+
+
+@pytest.mark.parametrize('incomplete',[False,True])
+@pytest.mark.parametrize('call',["cv_l2('too_small','y','linear',[0.,1.])","cv_l2_refine('too_small','y','linear',[0.,1.])"])
+def test_cv_rejects_empty_training_folds_after_filtering(con,incomplete,call):
+    con.execute('CREATE TABLE too_small AS SELECT 2.0 x,4.0 y')
+    if incomplete:
+        con.execute('INSERT INTO too_small VALUES (NULL,1),(1,NULL)')
+    with pytest.raises(duckdb.Error,match='at least two complete rows'):
+        con.execute('SELECT * FROM '+call).fetchall()
+
+
+@pytest.mark.parametrize('n',[1,2,3,10,11])
+def test_refinement_keeps_incumbent_on_uneven_grid(con,n):
+    points=con.execute(f'SELECT __reg_refine_grid([0.,.5,100.],.5,{n})').fetchone()[0]
+    assert len(points)==n
+    assert .5 in points
+    assert points==sorted(points)
+    if n>=3:
+        assert points[0]==0 and points[-1]==100
+
+
+def test_refinement_cannot_skip_better_coarse_candidate(con):
+    # Reuse the independent fixed-seed interior-optimum regression fixture.
+    from test_regression_macros import TestGridRefinement
+    data=TestGridRefinement()._ridge_interior(7)
+    con.register('refinement_source',data)
+    con.execute('CREATE TABLE uneven_refinement AS SELECT * FROM refinement_source')
+    coarse=con.execute("SELECT min(cv_deviance) FROM cv_l2('uneven_refinement','y','linear',[0.,.5,100.])").fetchone()[0]
+    refined=con.execute("SELECT min(cv_deviance) FROM cv_l2_refine('uneven_refinement','y','linear',[0.,.5,100.])").fetchone()[0]
+    assert refined <= coarse+1e-10

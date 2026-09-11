@@ -1542,6 +1542,8 @@ __reg_cv_chk AS (
                      WHERE colname != outcome AND colname NOT IN (SELECT col FROM __reg_cv_fraw)))
     WHEN (SELECT count(*) FROM __reg_cv_complete) = 0
       THEN error('cv: no complete (non-NULL) rows to train on')
+    WHEN (SELECT count(*) FROM __reg_cv_complete) < 2
+      THEN error('cv: at least two complete rows are required for nonempty training folds')
     WHEN family NOT IN ('linear','logistic','poisson','gamma','tweedie','nbinom')
       THEN error('cv: unsupported family ' || family)
     WHEN family = 'logistic' AND EXISTS (SELECT 1 FROM __reg_cv_yraw WHERE y NOT IN (0,1))
@@ -2033,10 +2035,16 @@ CREATE OR REPLACE MACRO reg_grid(lo, hi, n, log_spaced := false) AS (
 CREATE OR REPLACE MACRO __reg_refine_grid(grid, best, n) AS (
   WITH nb AS (
     SELECT coalesce((SELECT max(g) FROM unnest(grid) AS t(g) WHERE g < best), best) AS lo,
-           coalesce((SELECT min(g) FROM unnest(grid) AS t(g) WHERE g > best), best) AS hi
+           coalesce((SELECT min(g) FROM unnest(grid) AS t(g) WHERE g > best), best) AS hi,
+           best::DOUBLE AS winner
   )
-  SELECT CASE WHEN n < 2 OR lo = hi THEN [best::DOUBLE]
-              ELSE list_transform(range(n), lambda i: lo + (hi-lo)*i/(n-1.0)) END
+  SELECT CASE WHEN n < 2 OR lo = hi THEN [winner::DOUBLE]
+              WHEN n = 2 AND winner > lo AND winner < hi
+                THEN CASE WHEN winner-lo < hi-winner THEN [winner::DOUBLE,hi] ELSE [lo,winner::DOUBLE] END
+              ELSE list_transform(range(n), lambda i:
+                CASE WHEN winner > lo AND winner < hi
+                           AND i = greatest(1,least(n-2,round((winner-lo)/(hi-lo)*(n-1))))
+                     THEN winner::DOUBLE ELSE lo + (hi-lo)*i/(n-1.0) END) END
   FROM nb
 );
 

@@ -470,7 +470,10 @@ one zoomed in on the winner. `reg_grid(lo, hi, n)` builds an evenly spaced grid
 `nbinom_dispersion_refine` wrapper runs the whole two-stage sweep in a single
 call: it fits the coarse grid, finds the best value, then re-sweeps `n_refine`
 (default 10) points **bracketing that value between its two coarse-grid
-neighbours**, returning the refined curve. Take its argmin `cv_deviance` (or
+neighbours**, returning the refined curve. The grid retains the coarse winner;
+with at least three points it also retains both neighboring endpoints. A
+one-point refinement returns the winner, and a two-point refinement pairs it
+with the farther endpoint. Take its argmin `cv_deviance` (or
 argmax `loglik`) as the estimate. Two `n`-point stages resolve the optimum about
 as finely as one `n²`-point grid at a fraction of the cost.
 
