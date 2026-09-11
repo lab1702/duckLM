@@ -850,3 +850,24 @@ def test_multinomial_tiny_class_information_has_finite_standard_errors(con, scal
     design = np.column_stack([np.ones(6), np.arange(6)])
     se = con.execute("SELECT std_error FROM multinom_summary('tiny_model','tiny_classes','y')").df()['std_error'].to_numpy()
     np.testing.assert_allclose(se*np.sqrt(scale), np.sqrt(np.diag(np.linalg.inv(design.T@design))), rtol=1e-10)
+
+
+@pytest.mark.parametrize('feature_scale,response_scale,new_x', [(1.,1.,1e160), (1.,1.,1e300), (1e-100,1e-170,1e160), (1e100,1e100,1e160)])
+def test_prediction_intervals_scale_newdata_before_covariance_products(con, feature_scale, response_scale, new_x):
+    from scipy.stats import t
+    x = np.arange(10, dtype=float)
+    y = x+x%2
+    design = np.column_stack([np.ones(len(x)), x])
+    beta = np.linalg.lstsq(design,y,rcond=None)[0]
+    covariance = np.linalg.inv(design.T@design)*np.sum((y-design@beta)**2)/8
+    # Compute in units of the scoring value so no reference variance overflows.
+    scoring = np.array([feature_scale/new_x,1.])
+    expected_prediction = scoring@beta
+    width = t.ppf(.975,8)*np.sqrt(scoring@covariance@scoring)
+    con.execute('CREATE TABLE extrap_train AS SELECT i::DOUBLE*? x,(i+i%2)::DOUBLE*? y FROM range(10)t(i)', [feature_scale,response_scale])
+    con.execute("CREATE TABLE extrap_model AS SELECT * FROM linreg_fit('extrap_train','y')")
+    con.execute('CREATE TABLE extrap_score AS SELECT ?::DOUBLE x', [new_x])
+    actual = np.array(con.execute("SELECT prediction,conf_low,conf_high FROM linreg_predict_ci('extrap_model','extrap_train','y',newdata:='extrap_score')").fetchone())
+    units = (new_x/feature_scale)*response_scale
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(actual/units, [expected_prediction,expected_prediction-width,expected_prediction+width], rtol=1e-9)

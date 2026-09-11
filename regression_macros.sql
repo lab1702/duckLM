@@ -232,6 +232,13 @@ CREATE OR REPLACE MACRO __reg_mul_div(a, b, c) AS (
        ELSE sign(a)*sign(b)*sign(c)*exp(ln(abs(a))+ln(abs(b))-ln(abs(c))) END
 );
 
+-- Apply a root weight before dividing by feature units. A positive relative
+-- weight may underflow when squared even though its weighted design is finite.
+CREATE OR REPLACE MACRO __reg_weighted_center(v, mu, sw, scale) AS (
+  CASE WHEN isfinite(v-mu) THEN __reg_mul_div(sw,v-mu,scale)
+       ELSE __reg_mul_div(sw,v,scale)-__reg_mul_div(sw,mu,scale) END
+);
+
 CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1, alpha, solver) AS TABLE
 WITH RECURSIVE
 -- Every column cast to DOUBLE, with a synthetic row id.
@@ -333,6 +340,8 @@ __reg_ycheck AS (
 ),
 -- Normalize the common weight scale before sums and weighted moments. The
 -- objective uses mean weights, so this preserves both fits and penalties.
+-- Keep root weights too: w/max(w) can round to zero while sqrt(w)/sqrt(max(w))
+-- times a large feature still contributes to weighted moments and gradients.
 -- Keep invalid inputs unchanged for the weight validation below.
 __reg_wraw AS MATERIALIZED (
     SELECT c.rid, coalesce(wv.v, 1.0) AS w
@@ -340,17 +349,18 @@ __reg_wraw AS MATERIALIZED (
     LEFT JOIN __reg_clong wv ON wv.rid = c.rid AND wv.col = coalesce(weights_col, '')
 ),
 __reg_w AS MATERIALIZED (
-    SELECT rid, CASE WHEN w < 0 OR NOT isfinite(w) THEN w ELSE w/wscale END AS w
+    SELECT rid, CASE WHEN w < 0 OR NOT isfinite(w) THEN w ELSE w/wscale END AS w,
+           CASE WHEN w < 0 OR NOT isfinite(w) THEN 0.0 ELSE sqrt(w)/sqrt(wscale) END AS sw
     FROM __reg_wraw
     CROSS JOIN (SELECT coalesce(max(w) FILTER (WHERE w > 0 AND isfinite(w)),1.0) AS wscale FROM __reg_wraw)
 ),
 -- Center the mean accumulation to preserve small spreads around large means.
 -- Retain a scale for observations whose centered sum can still overflow.
 __reg_moments AS MATERIALIZED (
-    SELECT s.col, s.v, w.w, min(s.v) OVER (PARTITION BY s.col) AS vbase,
+    SELECT s.col, s.v, w.w, w.sw, min(s.v) OVER (PARTITION BY s.col) AS vbase,
            max(abs(s.v)) OVER (PARTITION BY s.col) AS vscale
     FROM __reg_clong s JOIN __reg_w w ON w.rid = s.rid
-    WHERE w.w > 0
+    WHERE w.sw > 0
 ),
 -- Standardization uses positive-weight complete rows. Center the observations
 -- before squaring: E[x^2] - E[x]^2 loses the variance when a feature has a
@@ -359,8 +369,8 @@ __reg_moments AS MATERIALIZED (
 __reg_means AS MATERIALIZED (
     SELECT col,
            CASE WHEN min(v) = max(v) THEN min(v)
-                WHEN isfinite(sum(w*(v-vbase))) THEN min(vbase)+sum(w*(v-vbase))/sum(w)
-                ELSE max(vscale)*(sum(w*(v/nullif(vscale,0.0)))/sum(w)) END AS mu,
+                WHEN isfinite(sum(__reg_weighted_center(v,vbase,sw,1.0)*sw)) THEN min(vbase)+sum(__reg_weighted_center(v,vbase,sw,1.0)*sw)/sum(w)
+                ELSE max(vscale)*(sum(__reg_mul_div(sw,v,nullif(vscale,0.0))*sw)/sum(w)) END AS mu,
            min(v) = max(v) AS constant
     FROM __reg_moments
     WHERE col != outcome
@@ -372,7 +382,7 @@ __reg_means AS MATERIALIZED (
 -- overflow or underflow the variance calculation.
 __reg_scales AS MATERIALIZED (
     SELECT m.col, m.mu, m.constant,
-           max(__reg_center_scale(s.v,m.mu)) FILTER (WHERE w.w > 0) AS scale
+           max(w.sw*__reg_center_scale(s.v,m.mu)) FILTER (WHERE w.sw > 0) AS scale
     FROM __reg_means m JOIN __reg_clong s ON s.col = m.col
     JOIN __reg_w w ON w.rid = s.rid
     GROUP BY m.col, m.mu, m.constant
@@ -382,8 +392,9 @@ __reg_scales AS MATERIALIZED (
 __reg_stats AS MATERIALIZED (
     SELECT m.col, row_number() OVER (ORDER BY m.col) AS j, m.mu,
            CASE WHEN m.constant THEN 1.0
-                ELSE m.scale*sqrt(sum(w.w * __reg_centered(s.v,m.mu,nullif(m.scale,0.0)) ^ 2) FILTER (WHERE w.w > 0)
-                          / sum(w.w) FILTER (WHERE w.w > 0)) END AS sigma
+                ELSE __reg_mul_div(m.scale,
+                     sqrt(sum(__reg_weighted_center(s.v,m.mu,w.sw,nullif(m.scale,0.0)) ^ 2) FILTER (WHERE w.sw > 0)),
+                     sqrt(sum(w.w) FILTER (WHERE w.sw > 0))) END AS sigma
     FROM __reg_scales m JOIN __reg_clong s ON s.col = m.col
     JOIN __reg_w w ON w.rid = s.rid
     GROUP BY m.col, m.mu, m.constant, m.scale
@@ -403,20 +414,20 @@ __reg_feats AS MATERIALIZED (
 -- ~= 1 from the zero initialization.
 __reg_ymean AS (
     SELECT CASE WHEN min(v) = max(v) THEN min(v)
-                WHEN isfinite(sum(w*(v-vbase))) THEN min(vbase)+sum(w*(v-vbase))/sum(w)
-                ELSE max(vscale)*(sum(w*(v/nullif(vscale,0.0)))/sum(w)) END AS mu
+                WHEN isfinite(sum(__reg_weighted_center(v,vbase,sw,1.0)*sw)) THEN min(vbase)+sum(__reg_weighted_center(v,vbase,sw,1.0)*sw)/sum(w)
+                ELSE max(vscale)*(sum(__reg_mul_div(sw,v,nullif(vscale,0.0))*sw)/sum(w)) END AS mu
     FROM __reg_moments WHERE col = outcome
 ),
 __reg_ycenter AS (
-    SELECT m.mu, s.v, w.w,
-           max(__reg_center_scale(s.v,m.mu)) OVER () AS scale
+    SELECT m.mu, s.v, w.w, w.sw,
+           max(w.sw*__reg_center_scale(s.v,m.mu)) OVER () AS scale
     FROM __reg_clong s JOIN __reg_w w ON w.rid = s.rid
     CROSS JOIN __reg_ymean m
-    WHERE s.col = outcome AND w.w > 0
+    WHERE s.col = outcome AND w.sw > 0
 ),
 __reg_ystdev AS (
     SELECT any_value(mu) AS mu,
-           any_value(scale)*sqrt(sum(w*pow(__reg_centered(v,mu,nullif(scale,0.0)),2))/sum(w)) AS sd
+           __reg_mul_div(any_value(scale),sqrt(sum(pow(__reg_weighted_center(v,mu,sw,nullif(scale,0.0)),2))),sqrt(sum(w))) AS sd
     FROM __reg_ycenter
 ),
 __reg_ystats AS (
@@ -438,12 +449,14 @@ __reg_ystats AS (
 -- intercept); for linear the outcome is z-scored, so the offset is divided by
 -- sd_y to live on the same scale. o = 0 when no offset column is given.
 -- Each row carries y (transformed), xs (standardized features), o (internal
--- offset), and w (sample weight). sumw is the total weight; the gradient is
+-- offset), w (sample weight), sw (its root), and wxs (root-weighted features).
+-- Weighted products use sw and wxs to preserve large features with tiny weights.
+-- sumw is the total weight; the gradient is
 -- (1/sumw) * sum_i w_i xs_ij r_i.
 __reg_packed AS MATERIALIZED (
     -- Zero-weight observations do not participate in optimization, including
     -- the curvature maximum that damps gradient steps for log-link families.
-    SELECT list(struct_pack(y := y, xs := xs, o := o, w := w)) FILTER (WHERE w > 0) AS rows,
+    SELECT list(struct_pack(y := y, xs := xs, wxs := wxs, o := o, w := w, sw := sw)) FILTER (WHERE sw > 0) AS rows,
            count(*)::DOUBLE AS n,
            sum(w) AS sumw
     FROM (
@@ -457,9 +470,10 @@ __reg_packed AS MATERIALIZED (
         SELECT x.rid,
                __reg_centered(any_value(yv.v),any_value(ys.mu_y),any_value(ys.sd_y)) AS y,
                [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), zp -> zp.v) AS xs,
+               [any_value(wt.sw)] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_weighted_center(x.v,s.mu,wt.sw,s.sigma)))), zp -> zp.v) AS wxs,
                coalesce(any_value(ov.v), 0.0)
                  / (CASE WHEN family = 'linear' THEN any_value(ys.sd_y) ELSE 1.0 END) AS o,
-               any_value(wt.w) AS w
+               any_value(wt.w) AS w, any_value(wt.sw) AS sw
         FROM __reg_clong x
         JOIN __reg_stats s  ON s.col = x.col
         JOIN __reg_clong yv ON yv.rid = x.rid AND yv.col = outcome
@@ -581,11 +595,12 @@ __reg_irls(it, betas, move) AS (
                            list_transform(range(1, len(betas) + 1), lambda a:
                                list_sum(list_transform(res, lambda ob: ob.wr * ob.xs[a]))) AS XWr
                     FROM (
-                        -- per row: expected-info weight wirls, and wr = wirls*(xs.beta) + w*residual
+                        -- Features already carry sqrt(w): keep the information factor
+                        -- unweighted, and multiply the working RHS by sqrt(w).
                         SELECT it, betas, sumw,
                                list_transform(mus, lambda e: struct_pack(
                                    xs := e.xs,
-                                   wirls := e.w * (CASE family
+                                   wirls := (CASE family
                                               WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
                                               WHEN 'linear'   THEN 1.0
                                               WHEN 'poisson'  THEN e.mu
@@ -608,7 +623,7 @@ __reg_irls(it, betas, move) AS (
                         FROM (
                             SELECT g.it, g.betas, p.sumw, c.log_alpha_int AS log_alpha_int,
                                    list_transform(p.rows, lambda rw: struct_pack(
-                                       xs := rw.xs, w := rw.w, y := rw.y,
+                                       xs := rw.wxs, w := rw.sw, y := rw.y,
                                        linpred := list_dot_product(rw.xs, g.betas),
                                        mu := CASE family
                                                WHEN 'logistic' THEN 1.0 / (1.0 + exp(-greatest(least(list_dot_product(rw.xs, g.betas) + rw.o, 700.0), -700.0)))
@@ -624,7 +639,7 @@ __reg_irls(it, betas, move) AS (
                 )
             )
         )
-        CROSS JOIN (SELECT rows AS step_rows FROM __reg_packed) __reg_step_data
+        CROSS JOIN (SELECT list_transform(rows, lambda rw: struct_pack(xs := rw.xs, w := rw.sw)) AS step_rows FROM __reg_packed) __reg_step_data
     )
 ),
 -- Last irls iterate, and whether it converged and can be trusted. A singular X'WX (a constant
@@ -717,8 +732,8 @@ __reg_gd AS (
                        -- with mu = exp(eta); Tweedie unifies p=1 (Poisson) and
                        -- p=2 (Gamma), and 1<p<2 admits exact zeros.
                        list_transform(rows, lambda rw: struct_pack(
-                           xs := rw.xs,
-                           w  := rw.w,
+                           xs := rw.wxs,
+                           w  := rw.sw,
                            r  := CASE WHEN family = 'logistic'
                                       THEN rw.y - 1.0 / (1.0 + exp(-(list_dot_product(rw.xs, look) + rw.o)))
                                       WHEN family = 'poisson'
@@ -3107,6 +3122,14 @@ __reg_sfeat AS (
   SELECT __reg_srid__, [1.0::DOUBLE], 0::INT FROM __reg_snum
   WHERE NOT EXISTS (SELECT 1 FROM __reg_mdlj)
 ),
+__reg_scoords AS (
+  SELECT sf.*, list_transform(sf.xs, lambda v,a: (v/cp.units[a])/cp.dsc[a]) AS zs
+  FROM __reg_sfeat sf CROSS JOIN __reg_cparams cp
+),
+__reg_sdesign AS (
+  SELECT *, coalesce(nullif(list_max(list_transform(zs,lambda v: abs(v))),0.0),1.0) AS zunit
+  FROM __reg_scoords
+),
 __reg_scored AS (
   SELECT sn.__reg_srid__,
          CASE WHEN sf.nf = (SELECT k FROM __reg_beta)
@@ -3114,28 +3137,34 @@ __reg_scored AS (
               THEN (CASE WHEN offset_col IS NULL THEN 0.0 ELSE so.o END)
                    + list_dot_product(sf.xs, (SELECT bvec FROM __reg_beta)) END AS eta,
          CASE WHEN sf.nf = (SELECT k FROM __reg_beta) AND cp.Rinv IS NOT NULL
-              THEN cp.phi * list_sum(list_transform(
-                       list_transform(sf.xs, lambda v, a: (v / cp.units[a]) / cp.dsc[a]),
-                       lambda va, a: va * list_dot_product(cp.Rinv[a], list_transform(sf.xs, lambda v2, a2: (v2 / cp.units[a2]) / cp.dsc[a2]))))
-              END AS var_eta,
+              THEN list_sum(list_transform(list_transform(sf.zs,lambda v: v/sf.zunit),
+                       lambda va,a: va * list_dot_product(cp.Rinv[a],list_transform(sf.zs,lambda v: v/sf.zunit))))
+              END AS unit_variance,
+         sf.zunit AS zunit, cp.phi AS phi,
          cp.crit AS crit, cp.se_weight_scale AS se_weight_scale,
          (SELECT runit FROM __reg_resunits) AS runit
   FROM __reg_snum sn
-  LEFT JOIN __reg_sfeat sf ON sf.__reg_srid__ = sn.__reg_srid__
+  LEFT JOIN __reg_sdesign sf ON sf.__reg_srid__ = sn.__reg_srid__
   LEFT JOIN __reg_soff so ON so.__reg_srid__ = sn.__reg_srid__
   CROSS JOIN __reg_cparams cp
+),
+__reg_serrors AS (
+  SELECT *, CASE WHEN unit_variance >= 0 AND isfinite(unit_variance) AND phi >= 0
+                 THEN __reg_mul_div(sqrt(phi)*sqrt(unit_variance),zunit,
+                                    CASE WHEN family = 'linear' THEN 1.0 ELSE se_weight_scale END) END AS unit_se
+  FROM __reg_scored
 )
 SELECT sn.* EXCLUDE (__reg_srid__),
        CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-s.eta)) WHEN 'linear' THEN s.eta ELSE exp(s.eta) END AS prediction,
-       CASE WHEN s.var_eta IS NULL OR NOT isfinite(s.var_eta) OR s.var_eta < 0.0 THEN NULL
-            ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta - s.crit*(sqrt(s.var_eta)/s.se_weight_scale))))
-                              WHEN 'linear' THEN s.eta - (s.crit*sqrt(s.var_eta))*s.runit
-                              ELSE exp(s.eta - s.crit*(sqrt(s.var_eta)/s.se_weight_scale)) END) END AS conf_low,
-       CASE WHEN s.var_eta IS NULL OR NOT isfinite(s.var_eta) OR s.var_eta < 0.0 THEN NULL
-            ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta + s.crit*(sqrt(s.var_eta)/s.se_weight_scale))))
-                              WHEN 'linear' THEN s.eta + (s.crit*sqrt(s.var_eta))*s.runit
-                              ELSE exp(s.eta + s.crit*(sqrt(s.var_eta)/s.se_weight_scale)) END) END AS conf_high
-FROM __reg_scored s JOIN __reg_snum sn ON sn.__reg_srid__ = s.__reg_srid__
+       CASE WHEN s.unit_se IS NULL OR NOT isfinite(s.unit_se) THEN NULL
+            ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta - s.crit*s.unit_se)))
+                              WHEN 'linear' THEN s.eta - __reg_mul_div(s.crit*s.unit_se,s.runit,1.0)
+                              ELSE exp(s.eta - s.crit*s.unit_se) END) END AS conf_low,
+       CASE WHEN s.unit_se IS NULL OR NOT isfinite(s.unit_se) THEN NULL
+            ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta + s.crit*s.unit_se)))
+                              WHEN 'linear' THEN s.eta + __reg_mul_div(s.crit*s.unit_se,s.runit,1.0)
+                              ELSE exp(s.eta + s.crit*s.unit_se) END) END AS conf_high
+FROM __reg_serrors s JOIN __reg_snum sn ON sn.__reg_srid__ = s.__reg_srid__
 CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok
 ORDER BY s.__reg_srid__;
 

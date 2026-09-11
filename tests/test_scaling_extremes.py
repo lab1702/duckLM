@@ -227,3 +227,18 @@ def test_batch_fits_preserve_extreme_mixed_sign_feature_units(con, kind):
         outputs.append(np.array([row[-1]*(1e308 if kind=='multinomial' and table=='scaled' and row[-2]=='x' else 1.0) for row in rows]))
     assert np.isfinite(outputs[1]).all()
     np.testing.assert_allclose(outputs[1], outputs[0], rtol=1e-8, atol=1e-9)
+
+
+@pytest.mark.parametrize('scale', [1e160, 1e200, 1e300])
+@pytest.mark.parametrize('solver', ['auto', 'irls', 'gd'])
+@pytest.mark.parametrize('l1,l2', [(0.,0.), (0.,.2), (.1,.2)])
+@pytest.mark.parametrize('rare_outcome', [0., 2.])
+def test_positive_weights_below_relative_double_range_still_affect_fit(con, scale, solver, l1, l2, rare_outcome):
+    con.execute('CREATE TABLE varied_weights AS SELECT * FROM (VALUES (0.,0.,?),(1.,1.,?),(?,?,?))t(x,y,w)', [scale,scale,scale,rare_outcome*scale,1/scale])
+    coefficients = dict(con.execute(f"SELECT * FROM linreg_fit('varied_weights','y',weights_col:='w',solver:='{solver}',l1:={l1},l2:={l2})").fetchall())
+    # The root-weighted raw design tends to [[1,0],[1,1],[0,1]], with y=[0,1,rare_outcome].
+    # Weighted mean(x)=mean(y)=1/2 and var(x)=3/4.
+    covariance = .25+rare_outcome/2
+    response_sd = np.sqrt(.25+rare_outcome**2/2)
+    slope = (covariance/.75-l1*response_sd/np.sqrt(.75))/(1+l2)
+    assert coefficients == pytest.approx({'(Intercept)': .5-.5*slope, 'x': slope}, abs=1e-8)
