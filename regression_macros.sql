@@ -1817,6 +1817,7 @@ __reg_cv_score AS (
   SELECT gg.g AS g, r.y AS y,
          list_dot_product(r.xs, s.B[(gg.g - 1) * k + r.fold + 1]) AS eta,
          ys.mu_y AS mu_y, ys.sd_y AS sd_y,
+         eta + ln(ys.sd_y) AS z,
          -- Candidate-dependent deviances have different scales and cannot be
          -- ranked across powers/dispersions. Compare the held-out means using
          -- one common loss throughout each sweep (including refinement).
@@ -1827,11 +1828,11 @@ __reg_cv_score AS (
 SELECT grid[g] AS param,
        sum(CASE family
              WHEN 'linear'   THEN pow(y - (mu_y + sd_y * eta), 2)
-             WHEN 'logistic' THEN -2.0 * (y * ln(greatest(1.0/(1.0+exp(-eta)),1e-15)) + (1-y)*ln(greatest(1.0-1.0/(1.0+exp(-eta)),1e-15)))
-             WHEN 'poisson'  THEN 2.0 * ((CASE WHEN y>0 THEN y*ln(y/(sd_y*exp(eta))) ELSE 0.0 END) - (y - sd_y*exp(eta)))
-             WHEN 'gamma'    THEN 2.0 * (-ln(y/(sd_y*exp(eta))) + (y - sd_y*exp(eta))/(sd_y*exp(eta)))
-             WHEN 'tweedie'  THEN 2.0 * (pow(greatest(y,0.0),2.0-pw)/((1.0-pw)*(2.0-pw)) - y*pow(sd_y*exp(eta),1.0-pw)/(1.0-pw) + pow(sd_y*exp(eta),2.0-pw)/(2.0-pw))
-             WHEN 'nbinom'   THEN 2.0 * ((CASE WHEN y>0 THEN y*ln(y/(sd_y*exp(eta))) ELSE 0.0 END) - (y + 1.0/al)*ln((y + 1.0/al)/(sd_y*exp(eta) + 1.0/al)))
+             WHEN 'logistic' THEN 2.0 * (y*greatest(-eta,0.0) + (1-y)*greatest(eta,0.0) + __reg_log1p(exp(-abs(eta))))
+             WHEN 'poisson'  THEN 2.0 * ((CASE WHEN y>0 THEN y*(ln(y)-z) ELSE 0.0 END) - (y - exp(z)))
+             WHEN 'gamma'    THEN 2.0 * (-ln(y) + z + y*exp(-z) - 1.0)
+             WHEN 'tweedie'  THEN 2.0 * (pow(greatest(y,0.0),2.0-pw)/((1.0-pw)*(2.0-pw)) - (CASE WHEN y=0 THEN 0.0 ELSE y*exp((1.0-pw)*z) END)/(1.0-pw) + exp((2.0-pw)*z)/(2.0-pw))
+             WHEN 'nbinom'   THEN 2.0 * __reg_nb_halfdev(y,z,al)
            END) / (SELECT n FROM __reg_cv_n) AS cv_deviance
 FROM __reg_cv_score
 GROUP BY g, grid[g]

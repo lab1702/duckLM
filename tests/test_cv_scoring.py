@@ -86,3 +86,19 @@ def test_refinement_does_not_shadow_legal_table_names(con,macro):
     expected=con.execute(f"SELECT * FROM {macro}('balanced','y'{args},n_refine:=2)").fetchall()
     actual=con.execute(f"SELECT * FROM {macro}('__rr_best','y'{args},n_refine:=2)").fetchall()
     np.testing.assert_allclose(np.asarray(actual,dtype=float),np.asarray(expected,dtype=float),rtol=1e-10,atol=1e-12)
+
+
+@pytest.mark.parametrize('family',['poisson','nbinom','tweedie'])
+def test_cv_deviance_uses_finite_log_predictors_when_means_underflow(con,family):
+    con.execute('CREATE TABLE extreme_holdout AS SELECT * FROM (VALUES (1000.,1.),(0.,1.),(0.,1.),(1.,exp(-1.)))t(x,y)')
+    call=f"cv_l2('extreme_holdout','y','{family}',[0.],k:=2)"
+    actual=con.execute(f'SELECT cv_deviance FROM {call}').fetchone()[0]
+    assert np.isfinite(actual)
+    y=np.array([1.,1.,1.,np.exp(-1.)]); z=np.array([-1000.,0.,0.,0.])
+    if family=='poisson':
+        expected=np.mean(2*(y*(np.log(y)-z)-y+np.exp(z)))
+    elif family=='nbinom':
+        expected=np.mean(2*(y*(np.log(y)-z)-(y+1)*(np.log1p(y)-np.logaddexp(0,z))))
+    else:
+        expected=np.mean(4*(-2*np.sqrt(y)+y*np.exp(-.5*z)+np.exp(.5*z)))
+    assert actual==pytest.approx(expected,rel=1e-6)
