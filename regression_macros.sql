@@ -232,15 +232,32 @@ CREATE OR REPLACE MACRO __reg_mul_div(a, b, c) AS (
        ELSE sign(a)*sign(b)*sign(c)*exp(ln(abs(a))+ln(abs(b))-ln(abs(c))) END
 );
 
+-- Sum large terms before small ones, with compensation, so cancellation does
+-- not discard a finite intercept or another smaller contribution.
+CREATE OR REPLACE MACRO __reg_fsum(vs) AS (
+  list_aggregate(list_transform(list_reverse_sort(list_transform(vs,
+    lambda zv: struct_pack(magnitude := abs(zv), value := zv))), lambda zv: zv.value), 'fsum')
+);
+CREATE OR REPLACE MACRO __reg_scaled_dot(va, vb) AS (
+  list_transform([struct_pack(sa := list_max(list_transform(va,lambda zv: abs(zv))),
+                             sb := list_max(list_transform(vb,lambda zv: abs(zv))))], lambda zu:
+    CASE WHEN zu.sa = 0 OR zu.sb = 0 THEN 0.0 ELSE
+      __reg_mul_div(zu.sa, __reg_fsum(list_transform(va,
+        lambda zv,zj: (zv/zu.sa)*(vb[zj]/zu.sb))), 1.0/zu.sb) END)[1]
+);
 -- Preserve finite sums when individual coefficient products overflow. Keep
--- the ordinary dot product for precision and speed at representable scales.
+-- representable terms separate from overflowing products when those cancel;
+-- scaling both vectors together could otherwise underflow the smaller terms.
 CREATE OR REPLACE MACRO __reg_dot(va, vb) AS (
-  CASE WHEN isfinite(list_dot_product(va,vb)) THEN list_dot_product(va,vb)
-       ELSE list_transform([struct_pack(sa := list_max(list_transform(va,lambda zv: abs(zv))),
-                                        sb := list_max(list_transform(vb,lambda zv: abs(zv))))], lambda zu:
-         __reg_mul_div(zu.sa,
-           list_dot_product(list_transform(va,lambda zv: zv/zu.sa),list_transform(vb,lambda zv: zv/zu.sb)),
-           1.0/zu.sb))[1] END
+  list_transform([list_transform(va,lambda zv,zj: zv*vb[zj])], lambda products:
+    list_transform([__reg_fsum(products)], lambda direct:
+      CASE WHEN isfinite(direct) THEN direct ELSE
+        list_transform([__reg_fsum(list_transform(products,
+          lambda zv: CASE WHEN isfinite(zv) THEN zv ELSE 0.0 END))
+          + __reg_scaled_dot(list_transform(va,
+              lambda zv,zj: CASE WHEN isfinite(products[zj]) THEN 0.0 ELSE zv END),vb)], lambda separated:
+          CASE WHEN isfinite(separated) THEN separated ELSE __reg_scaled_dot(va,vb) END)[1]
+      END)[1])[1]
 );
 
 -- Combine the mean powers before multiplying by outcomes or residuals.
@@ -458,14 +475,25 @@ __reg_ystats AS (
            END AS sd_y
     FROM __reg_ystdev
 ),
+-- A common Tweedie offset is an unpenalized intercept shift. Remove it before
+-- optimization so large exposures cannot create a vanishing initial score.
+__reg_offsets AS (
+    SELECT CASE WHEN family != 'tweedie' THEN 0.0 ELSE coalesce(
+           CASE WHEN min(v) = max(v) THEN min(v)
+                WHEN isfinite(sum(__reg_weighted_center(v,vbase,sw,1.0)*sw))
+                  THEN min(vbase)+sum(__reg_weighted_center(v,vbase,sw,1.0)*sw)/sum(w)
+                ELSE max(vscale)*(sum(__reg_mul_div(sw,v,nullif(vscale,0.0))*sw)/sum(w)) END,0.0)
+           END AS center
+    FROM __reg_moments WHERE col = offset_col
+),
 -- The whole training set packed into one row: a list of {y, xs} structs where
 -- xs = [1.0 (intercept), standardized features in name order]. __reg_clong is
 -- already restricted to complete rows.
 -- Each row carries y (transformed), xs (standardized features), and o, the
 -- internal offset. An offset is a known per-row term in the linear predictor
--- eta = o + xs.beta; it is not fit and not penalized. For the log-link
--- families it passes through unchanged (dividing y by its mean only shifts the
--- intercept); for linear the outcome is z-scored, so the offset is divided by
+-- eta = o + xs.beta; it is not fit and not penalized. For Tweedie its common
+-- weighted center is removed and restored in the model intercept; for linear
+-- the outcome is z-scored, so the offset is divided by
 -- sd_y to live on the same scale. o = 0 when no offset column is given.
 -- Each row carries y (transformed), xs (standardized features), o (internal
 -- offset), w (sample weight), sw (its root), and wxs (root-weighted features).
@@ -499,7 +527,7 @@ __reg_packed AS MATERIALIZED (
                     ELSE [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), zp -> zp.v) END AS xs,
                CASE WHEN family = 'linear'
                     THEN __reg_mul_div(any_value(wt.sw),coalesce(any_value(ov.v),0.0),any_value(ys.sd_y))
-                    ELSE coalesce(any_value(ov.v),0.0) END AS o,
+                    ELSE coalesce(any_value(ov.v),0.0)-any_value(os.center) END AS o,
                any_value(wt.w) AS w, any_value(wt.sw) AS sw
         FROM __reg_clong x
         JOIN __reg_stats s  ON s.col = x.col
@@ -507,6 +535,7 @@ __reg_packed AS MATERIALIZED (
         JOIN __reg_w wt     ON wt.rid = x.rid
         LEFT JOIN __reg_clong ov ON ov.rid = x.rid AND ov.col = coalesce(offset_col, '')
         CROSS JOIN __reg_ystats ys
+        CROSS JOIN __reg_offsets os
         WHERE x.col != outcome
           AND x.col != coalesce(offset_col, '')
           AND x.col != coalesce(weights_col, '')
@@ -643,7 +672,7 @@ __reg_irls(it, betas, move) AS (
                                               WHEN 'nbinom'   THEN __reg_nb_fit_info(ln(e.mu),log_alpha_int,l1=0 AND l2=0) END) * e.linpred
                                           + (CASE family
                                               WHEN 'gamma'    THEN e.y / e.mu - 1.0
-                                              WHEN 'tweedie'  THEN (e.y - e.mu) * pow(e.mu, 1.0 - power)
+                                              WHEN 'tweedie'  THEN __reg_tw_score(e.y,e.mu,power)
                                               WHEN 'nbinom'   THEN __reg_nb_fit_score(e.y,ln(e.mu),log_alpha_int,l1=0 AND l2=0)
                                               ELSE e.y - e.mu END))
                                    )) AS res
@@ -730,14 +759,15 @@ __reg_gd AS (
                    -- The log-link families (Poisson/Gamma/Tweedie) have
                    -- unbounded curvature, so damp the step by the largest
                    -- per-row Hessian weight hw. 1 for the bounded families.
-                   -- NB mean-scaling can make curvature far below one. Use
-                   -- its curvature plus the largest residual (and ridge):
+                   -- NB mean-scaling and Tweedie powers above two can make
+                   -- curvature far below one. Use its absolute value plus
+                   -- the largest residual (and ridge):
                    -- the residual bounds steps far from the optimum, where
                    -- curvature alone can be arbitrarily small.
-                   CASE WHEN family = 'nbinom'
+                   CASE WHEN family IN ('nbinom','tweedie')
                         THEN coalesce(nullif(l2 + list_aggregate(
-                               list_transform(res, lambda ob: ob.hw + abs(ob.r)), 'max'),0.0),1.0)
-                        WHEN family IN ('poisson', 'gamma', 'tweedie')
+                               list_transform(res, lambda ob: abs(ob.hw) + abs(ob.r)), 'max'),0.0),1.0)
+                        WHEN family IN ('poisson', 'gamma')
                         THEN greatest(1.0, list_aggregate(
                                list_transform(res, lambda ob: ob.hw), 'max'))
                         ELSE 1.0
@@ -768,8 +798,7 @@ __reg_gd AS (
                                       WHEN family = 'gamma'
                                       THEN rw.y / exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)) - 1.0
                                       WHEN family = 'tweedie'
-                                      THEN (rw.y - exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)))
-                                           * pow(exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)), 1.0 - power)
+                                      THEN __reg_tw_score(rw.y,exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)),power)
                                       WHEN family = 'nbinom'
                                       -- NB2: r = (y - mu) / (1 + alpha*mu), mu = exp(eta);
                                       -- reduces to Poisson (y - mu) as alpha -> 0
@@ -781,8 +810,7 @@ __reg_gd AS (
                                       WHEN family = 'gamma'
                                       THEN rw.y / exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0))
                                       WHEN family = 'tweedie'
-                                      THEN (2.0 - power) * pow(exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)), 2.0 - power)
-                                           + (power - 1.0) * rw.y * pow(exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)), 1.0 - power)
+                                      THEN __reg_tw_observed(rw.y,exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)),power)
                                       WHEN family = 'nbinom'
                                       -- NB Hessian weight mu(1+alpha*y)/(1+alpha*mu)^2
                                       THEN __reg_nb_fit_observed(rw.y,least(list_dot_product(rw.xs, look) + rw.o,700.0),log_alpha_int,l1=0 AND l2=0)
@@ -827,12 +855,14 @@ SELECT feature, coefficient
 FROM (
     SELECT '(Intercept)' AS feature,
            CASE WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom')
-                THEN ln(ys.sd_y) + (s.betas[1] - coalesce(list_sum(list_transform(f.names,
-                     lambda nm, j: s.betas[j + 1] * (f.mus[j] / f.sigmas[j]))), 0.0))
-                ELSE ys.mu_y + ys.sd_y * (s.betas[1] - coalesce(list_sum(list_transform(f.names,
-                     lambda nm, j: s.betas[j + 1] * (f.mus[j] / f.sigmas[j]))), 0.0))
+                THEN __reg_dot([ln(ys.sd_y),s.betas[1],-os.center]
+                     || list_transform(f.names,lambda nm,j: s.betas[j+1]/f.sigmas[j]),
+                     [1.0,1.0,1.0] || list_transform(f.mus,lambda v: -v))
+                ELSE __reg_dot([ys.mu_y,ys.sd_y,-os.center]
+                     || list_transform(f.names,lambda nm,j: __reg_mul_div(ys.sd_y,s.betas[j+1],f.sigmas[j])),
+                     [1.0,s.betas[1],1.0] || list_transform(f.mus,lambda v: -v))
            END AS coefficient
-    FROM __reg_sol s, __reg_feats f, __reg_ystats ys
+    FROM __reg_sol s, __reg_feats f, __reg_ystats ys, __reg_offsets os
     UNION ALL
     SELECT unnest(f.names),
            unnest(list_transform(f.names, lambda nm, j:
@@ -1824,7 +1854,7 @@ __reg_cv_stats AS MATERIALIZED (
   GROUP BY col
 ),
 __reg_cv_feats AS MATERIALIZED (SELECT count(*)::INT AS d FROM __reg_cv_stats),
-__reg_cv_ys AS (
+__reg_cv_ys AS MATERIALIZED (
   SELECT CASE WHEN family='linear' THEN mu ELSE 0.0 END AS mu_y,
          CASE WHEN family='logistic' THEN 1.0
               WHEN family IN ('poisson','gamma','tweedie','nbinom') THEN (CASE WHEN mu=0.0 THEN 1.0 ELSE mu END)
@@ -1835,6 +1865,7 @@ __reg_cv_ys AS (
                                   THEN ybase+avg(y-ybase) OVER ()
                                   ELSE yscale*avg(y/nullif(yscale,0.0)) OVER () END AS mu_raw
                     FROM (SELECT *,min(y) OVER () AS ybase,max(abs(y)) OVER () AS yscale FROM __reg_cv_yraw))))
+  CROSS JOIN __reg_cv_chk chk WHERE chk.ok
 ),
 __reg_cv_n AS (SELECT count(*)::DOUBLE AS n FROM __reg_cv_yraw),
 __reg_cv_foldsz AS (SELECT fold AS f, count(*)::DOUBLE AS sz FROM __reg_cv_yraw GROUP BY fold),
@@ -1950,8 +1981,7 @@ __reg_cv_irls(it, B, move) AS (
                         END) * l
                      + (CASE family
                           WHEN 'gamma'    THEN e.yt / exp(greatest(least(l,700.0),-700.0)) - 1.0
-                          WHEN 'tweedie'  THEN (e.yt - exp(greatest(least(l,700.0),-700.0)))
-                                             * pow(exp(greatest(least(l,700.0),-700.0)), 1.0-mpow[m])
+                          WHEN 'tweedie'  THEN __reg_tw_score(e.yt,exp(greatest(least(l,700.0),-700.0)),mpow[m])
                           WHEN 'nbinom'   THEN __reg_nb_fit_score(e.yt,greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                           WHEN 'logistic' THEN e.yt - 1.0/(1.0+exp(-greatest(least(l,700.0),-700.0)))
                           WHEN 'linear'   THEN e.yt - l
@@ -2016,13 +2046,13 @@ __reg_cv_gd AS (
                    - CASE WHEN j = 1 THEN 0.0 ELSE ml2[m] * lmj END) / damp[m]))) AS zstep
       FROM (
         SELECT it, B, look, step, mfold, ml2, ml1, mntrain, res,
-               -- NB candidates can differ by many orders of magnitude in
+               -- NB/Tweedie candidates can differ by many orders of magnitude in
                -- curvature; condition each fold/model independently and
                -- bound steps with residuals when far from the optimum.
-               CASE WHEN family = 'nbinom'
+               CASE WHEN family IN ('nbinom','tweedie')
                     THEN list_transform(mfold, lambda mf, m:
                            coalesce(nullif(ml2[m] + list_aggregate(
-                             list_transform(res, lambda ob: ob.hw[m]+abs(ob.r[m])), 'max'),0.0),1.0))
+                             list_transform(res, lambda ob: abs(ob.hw[m])+abs(ob.r[m])), 'max'),0.0),1.0))
                     ELSE list_resize([]::DOUBLE[], len(mfold),
                          CASE WHEN family IN ('poisson','gamma','tweedie')
                            THEN greatest(1.0, list_aggregate(list_transform(res,
@@ -2039,8 +2069,7 @@ __reg_cv_gd AS (
                      (CASE WHEN family='logistic' THEN rw.yt - 1.0/(1.0+exp(-list_dot_product(rw.xs,bm)))
                            WHEN family='poisson'  THEN rw.yt - exp(least(list_dot_product(rw.xs,bm),700.0))
                            WHEN family='gamma'    THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)) - 1.0
-                           WHEN family='tweedie'  THEN (rw.yt - exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)))
-                                                       * pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)), 1.0 - mpow[m])
+                           WHEN family='tweedie'  THEN __reg_tw_score(rw.yt,exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),mpow[m])
                            WHEN family='nbinom'   THEN __reg_nb_fit_score(rw.yt,least(list_dot_product(rw.xs,bm),700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                            ELSE rw.yt - list_dot_product(rw.xs,bm) END) END),
                    -- hw damps the step for the unbounded-curvature log-link families
@@ -2052,8 +2081,7 @@ __reg_cv_gd AS (
                      CASE WHEN mfold[m] = rw.fold THEN 0.0 ELSE
                      (CASE WHEN family='poisson' THEN exp(least(list_dot_product(rw.xs,bm),700.0))
                            WHEN family='gamma'   THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0))
-                           WHEN family='tweedie' THEN (2.0-mpow[m])*pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),2.0-mpow[m])
-                                                     + (mpow[m]-1.0)*rw.yt*pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),1.0-mpow[m])
+                           WHEN family='tweedie' THEN __reg_tw_observed(rw.yt,exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),mpow[m])
                            WHEN family='nbinom'  THEN __reg_nb_fit_observed(rw.yt,least(list_dot_product(rw.xs,bm),700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                            ELSE 0.0 END) END) END)) AS res
           FROM (

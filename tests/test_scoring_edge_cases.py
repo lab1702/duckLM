@@ -612,3 +612,20 @@ def test_negative_binomial_offset_null_model_uses_unclipped_score(con, outcome, 
     assert np.isfinite([metrics['deviance'],metrics['null_deviance'],metrics['pseudo_r2']]).all()
     assert metrics['null_deviance'] == pytest.approx(metrics['deviance'],rel=1e-7,abs=0.)
     assert metrics['pseudo_r2'] == pytest.approx(0.,abs=1e-7)
+
+
+@pytest.mark.parametrize('coordinate', [1., 2., 1e308])
+@pytest.mark.parametrize('intercept', [1., 1e-170])
+def test_scoring_keeps_small_terms_when_large_products_cancel(con, coordinate, intercept):
+    con.execute("CREATE TABLE cancelling_model AS SELECT * FROM (VALUES ('(Intercept)',?),('x',1e308),('z',-1e308))t(feature,coefficient)", [intercept])
+    con.execute('CREATE TABLE cancelling_data AS SELECT ?::DOUBLE x,?::DOUBLE z,?::DOUBLE y', [coordinate, coordinate, intercept])
+    prediction = con.execute("SELECT prediction FROM linreg_predict('cancelling_model','cancelling_data')").fetchone()[0]
+    assert prediction == pytest.approx(intercept, rel=1e-12, abs=0.)
+    assert _metrics(con,"linreg_evaluate('cancelling_model','cancelling_data','y')")['rmse'] == 0.
+
+
+def test_multinomial_scoring_keeps_intercept_after_overflowing_slope_cancellation(con):
+    con.execute("CREATE TABLE cancelling_multinomial AS SELECT * FROM (VALUES ('a','(Intercept)',0.),('a','x',0.),('a','z',0.),('b','(Intercept)',1.),('b','x',1e308),('b','z',-1e308))t(class,feature,coefficient)")
+    con.execute('CREATE TABLE cancelling_multidata AS SELECT 2.0 x,2.0 z')
+    probabilities = con.execute("SELECT probs FROM multinom_predict('cancelling_multinomial','cancelling_multidata')").fetchone()[0]
+    assert probabilities['b'] == pytest.approx(1/(1+np.exp(-1)), abs=1e-12)

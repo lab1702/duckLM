@@ -77,6 +77,7 @@ def test_refinement_retains_the_same_scoring_scale(con, sweep, grid):
     assert [row[0] for row in refined] == pytest.approx([coarse[0][0]] * 4, rel=1e-9)
 
 
+@pytest.mark.parametrize('threads', [1, 4, 24])
 @pytest.mark.parametrize('call,outcome', [
     ("cv_l2('bad_domain','y','logistic',[0.,1.],k:=3,max_iter:=50)",'1+i%2'),
     ("cv_l1('bad_domain','y','poisson',[0.,1.],k:=3,max_iter:=50)",'-1+i%2'),
@@ -85,7 +86,8 @@ def test_refinement_retains_the_same_scoring_scale(con, sweep, grid):
     ("cv_power('bad_domain','y',[1.5,2.],k:=3,max_iter:=50)",'i%2'),
     ("cv_power('bad_domain','y',[1.,1.5],k:=3,max_iter:=50)",'-1+i%2'),
 ])
-def test_cv_rejects_invalid_family_outcomes(con,call,outcome):
+def test_cv_rejects_invalid_family_outcomes(con,call,outcome,threads):
+    con.execute(f'SET threads={threads}')
     con.execute(f'CREATE TABLE bad_domain AS SELECT i::DOUBLE x,({outcome})::DOUBLE y FROM range(12)t(i)')
     with pytest.raises(duckdb.Error,match='cv: outcome must'):
         con.execute(f'SELECT * FROM {call}').fetchall()

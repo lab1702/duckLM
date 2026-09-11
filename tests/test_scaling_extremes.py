@@ -268,3 +268,30 @@ def test_linear_fit_uses_weighted_coordinates_when_raw_standardization_overflows
     predictions = np.array(con.execute("SELECT prediction FROM linreg_predict('weighted_model','weighted_coordinates',offset_col:='expo')").fetchall()).ravel()
     expected = [intercept+(slope+(1. if with_offset else 0.))*r[0] for r in rows]
     np.testing.assert_allclose(predictions,expected,rtol=1e-8,atol=1e-8)
+
+
+@pytest.mark.parametrize('solver', ['auto', 'irls', 'gd'])
+def test_linear_intercept_cancels_before_restoring_outcome_units(con, solver):
+    con.execute('CREATE TABLE finite_intercept AS SELECT * FROM (VALUES (-2.5,-1e308),(-2.,-5e307),(-1.5,0.))t(x,y)')
+    con.execute(f"CREATE TABLE finite_model AS SELECT * FROM linreg_fit('finite_intercept','y',solver:='{solver}')")
+    coefficients = dict(con.execute('SELECT * FROM finite_model').fetchall())
+    assert coefficients['(Intercept)']/1e308 == pytest.approx(1.5, abs=1e-8)
+    assert coefficients['x']/1e308 == pytest.approx(1., abs=1e-8)
+    predictions = np.array(con.execute("SELECT prediction FROM linreg_predict('finite_model','finite_intercept')").fetchall()).ravel()
+    np.testing.assert_allclose(predictions/1e308, [-1., -.5, 0.], atol=1e-8)
+
+
+@pytest.mark.parametrize('solver', ['auto', 'irls', 'gd'])
+@pytest.mark.parametrize('shift', [-400., 0., 400.])
+@pytest.mark.parametrize('offset_slope', [0., .1])
+@pytest.mark.parametrize('weighted', [False, True])
+def test_tweedie_fit_preserves_large_common_offset_shifts(con, solver, shift, offset_slope, weighted):
+    con.execute('CREATE TABLE shifted_tweedie AS SELECT i::DOUBLE x,exp(.3*i) y,?+?*i expo FROM range(6)t(i)', [shift, offset_slope])
+    if weighted:
+        con.execute('ALTER TABLE shifted_tweedie ADD COLUMN w DOUBLE DEFAULT 1.')
+        con.execute('UPDATE shifted_tweedie SET w = x+1')
+    weights = ",weights_col:='w'" if weighted else ''
+    coefficients = dict(con.execute(f"SELECT * FROM tweedie_fit('shifted_tweedie','y',power:=3,offset_col:='expo',solver:='{solver}'{weights})").fetchall())
+    # Every observation is exactly fitted, independently of positive weights.
+    assert coefficients['(Intercept)'] == pytest.approx(-shift, abs=1e-8)
+    assert coefficients['x'] == pytest.approx(.3-offset_slope, abs=1e-8)
