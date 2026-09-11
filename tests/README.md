@@ -32,6 +32,11 @@ python -m venv .venv
 .venv/Scripts/python -m pytest tests/ -q
 ```
 
+The root `pytest.ini` adds `-n auto` to every pytest run, so `pytest-xdist`
+automatically chooses the number of parallel workers. Install or update the
+dependencies above before running tests in an existing environment. For debugging,
+pass `-n 0` to run serially, or use `-n 4` to choose a specific worker count.
+
 ## SQL smoke test — `smoke.sql`
 
 No Python required — just the DuckDB CLI. Fits each family on deterministic

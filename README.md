@@ -60,6 +60,9 @@ python -m venv .venv && .venv/Scripts/python -m pip install -r tests/requirement
 duckdb < tests/smoke.sql
 ```
 
+Pytest runs tests in parallel by default using `pytest-xdist` with `-n auto`,
+configured in `pytest.ini`.
+
 ## Files
 
 - [regression_macros.sql](regression_macros.sql) — the entire library: every
