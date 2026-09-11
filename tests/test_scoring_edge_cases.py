@@ -235,3 +235,28 @@ def test_multinomial_scoring_reuses_one_snapshot(con):
     # The x=0 tie may choose either class; every other label must match.
     assert metrics['accuracy'] in (.95,1.0)
     assert metrics['log_loss'] == pytest.approx(np.logaddexp(0,-np.abs(np.arange(20)-10)).mean())
+
+
+@pytest.mark.parametrize('power',[1.0,1.2,1.5,1.9])
+@pytest.mark.parametrize('with_offset',[False,True])
+def test_tweedie_zero_holdout_has_zero_null_deviance(con,power,with_offset):
+    con.execute("CREATE TABLE zero_holdout_model AS SELECT '(Intercept)' feature,0.0 coefficient")
+    con.execute('CREATE TABLE zero_holdout AS SELECT i x,0.0 y,i/10.0 expo FROM range(5)t(i)')
+    offset=",offset_col:='expo'" if with_offset else ''
+    result=_metrics(con,f"tweedie_evaluate('zero_holdout_model','zero_holdout','y',power:={power}{offset})")
+    assert result['null_deviance']==0
+    assert result['pseudo_r2'] is None
+    mu=np.exp(np.arange(5)/10) if with_offset else np.ones(5)
+    assert result['deviance']==pytest.approx(2*np.sum(mu**(2-power))/(2-power))
+
+
+@pytest.mark.parametrize('family',['poisson','nbinom'])
+@pytest.mark.parametrize('outcome',[0.0,1.0])
+def test_count_evaluation_retains_finite_log_likelihood_after_underflow(con,family,outcome):
+    con.execute("CREATE TABLE small_mean_model AS SELECT '(Intercept)' feature,-800.0 coefficient")
+    con.execute('CREATE TABLE small_mean_data AS SELECT ?::DOUBLE y',[outcome])
+    result=_metrics(con,f"{family}_evaluate('small_mean_model','small_mean_data','y')")
+    assert result['loglik']==pytest.approx(-800*outcome)
+    expected=0 if outcome==0 else 1598 if family=='poisson' else 1600-4*np.log(2)
+    assert result['deviance']==pytest.approx(expected)
+    assert result['aic']==pytest.approx(1600*outcome+2)

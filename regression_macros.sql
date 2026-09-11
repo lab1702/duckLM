@@ -968,25 +968,26 @@ __reg_agg AS (
            sum(abs(y - yhat)) AS sae,
            sum(-y*greatest(-z,0.0) - (1-y)*greatest(z,0.0) - ln(1.0+exp(-abs(z)))) AS ll_bin,
            avg(CASE WHEN (yhat >= 0.5) = (y >= 0.5) THEN 1.0 ELSE 0.0 END) AS accuracy,
-           sum(y * ln(yhat) - yhat - lgamma(y + 1)) AS ll_pois,
-           sum((CASE WHEN y > 0 THEN y * ln(y / yhat) ELSE 0.0 END) - (y - yhat)) AS dev_pois_half,
-           sum(-ln(y / yhat) + (y - yhat) / yhat) AS dev_gam_half,
+           sum(y * z - yhat - lgamma(y + 1)) AS ll_pois,
+           sum((CASE WHEN y > 0 THEN y * (ln(y) - z) ELSE 0.0 END) - (y - yhat)) AS dev_pois_half,
+           sum(-ln(y) + z + y * exp(-z) - 1.0) AS dev_gam_half,
            sum(((y - yhat) / yhat) * ((y - yhat) / yhat)) AS pearson_gam,
            -- Tweedie unit half-deviance and Pearson chi-square (power = p).
            sum(CASE WHEN power = 1 THEN
-                      (CASE WHEN y > 0 THEN y * ln(y / yhat) ELSE 0.0 END) - (y - yhat)
-                    WHEN power = 2 THEN -ln(y / yhat) + (y - yhat) / yhat
+                      (CASE WHEN y > 0 THEN y * (ln(y) - z) ELSE 0.0 END) - (y - yhat)
+                    WHEN power = 2 THEN -ln(y) + z + y * exp(-z) - 1.0
                     ELSE pow(greatest(y, 0.0), 2.0 - power) / ((1.0 - power) * (2.0 - power))
-               - y * pow(yhat, 1.0 - power) / (1.0 - power)
-               + pow(yhat, 2.0 - power) / (2.0 - power) END) AS dev_tw_half,
+               - (CASE WHEN y = 0 THEN 0.0 ELSE y * exp((1.0 - power) * z) END) / (1.0 - power)
+               + exp((2.0 - power) * z) / (2.0 - power) END) AS dev_tw_half,
            sum((y - yhat) * (y - yhat) / pow(yhat, power)) AS pearson_tw,
            -- Negative binomial (NB2, r = 1/alpha): log-likelihood, half-deviance,
            -- and Pearson chi-square (variance = mu + alpha*mu^2).
            sum(lgamma(y + 1.0 / alpha) - lgamma(1.0 / alpha) - lgamma(y + 1)
-               + (1.0 / alpha) * ln((1.0 / alpha) / (1.0 / alpha + yhat))
-               + y * ln(yhat / (1.0 / alpha + yhat))) AS ll_nb,
-           sum((CASE WHEN y > 0 THEN y * ln(y / yhat) ELSE 0.0 END)
-               - (y + 1.0 / alpha) * ln((y + 1.0 / alpha) / (yhat + 1.0 / alpha))) AS dev_nb_half,
+               - (1.0 / alpha) * (greatest(z + ln(alpha), 0.0) + ln(1.0 + exp(-abs(z + ln(alpha)))))
+               - y * (greatest(-z - ln(alpha), 0.0) + ln(1.0 + exp(-abs(z + ln(alpha)))))) AS ll_nb,
+           sum((CASE WHEN y > 0 THEN y * (ln(y) - z) ELSE 0.0 END)
+               - (y + 1.0 / alpha) * (ln(y + 1.0 / alpha) + ln(alpha)
+                   - greatest(z + ln(alpha), 0.0) - ln(1.0 + exp(-abs(z + ln(alpha)))))) AS dev_nb_half,
            sum((y - yhat) * (y - yhat) / (yhat + alpha * yhat * yhat)) AS pearson_nb
     FROM __reg_rows
 ),
@@ -1043,7 +1044,8 @@ __reg_null AS (
                          - ln(1.0+exp(-abs(r.z0))) END) AS ll0_bin,
            sum((CASE WHEN y > 0 THEN y * ln(y / r.mu0) ELSE 0.0 END) - (y - r.mu0)) AS null_dev_pois_half,
            sum(-ln(y / r.mu0) + (y - r.mu0) / r.mu0) AS null_dev_gam_half,
-           sum(CASE WHEN power = 1 THEN
+           sum(CASE WHEN y = 0 AND r.mu0 = 0 THEN 0.0
+                    WHEN power = 1 THEN
                       (CASE WHEN y > 0 THEN y * ln(y / r.mu0) ELSE 0.0 END) - (y - r.mu0)
                     WHEN power = 2 THEN -ln(y / r.mu0) + (y - r.mu0) / r.mu0
                     ELSE pow(greatest(y, 0.0), 2.0 - power) / ((1.0 - power) * (2.0 - power))
