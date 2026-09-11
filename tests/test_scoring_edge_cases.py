@@ -589,3 +589,26 @@ def test_multinomial_scoring_cancels_overflowing_products(con):
     probabilities = con.execute("SELECT probs FROM multinom_predict('cancel_model','cancel_data')").fetchall()
     assert all(p == {'a':.5,'b':.5} for p, in probabilities)
     assert _metrics(con,"multinom_evaluate('cancel_model','cancel_data','y')")['log_loss'] == pytest.approx(np.log(2.))
+
+
+@pytest.mark.parametrize('outcome',[1e-310,1e-170,1e170,1e307])
+@pytest.mark.parametrize('alpha',[1e-10,1.,1e100])
+@pytest.mark.parametrize('offset_shift',[-1000.,0.,1000.])
+def test_negative_binomial_offset_null_model_uses_unclipped_score(con, outcome, alpha, offset_shift):
+    # Equal outcomes with exposures 1 and 2 give the quadratic
+    # 4*a*r^2+3*(1-a)*r-2=0, where a=alpha*y and exp(intercept)=r*y.
+    log_a = np.log(alpha)+np.log(outcome)
+    if log_a >= 0:
+        inv_a = np.exp(-log_a)
+        ratio = (3*(1-inv_a)+np.sqrt(9*(1-inv_a)**2+32*inv_a))/8
+    else:
+        a = np.exp(log_a)
+        ratio = 4/(3*(1-a)+np.sqrt(9*(1-a)**2+32*a))
+    intercept = np.log(outcome)+np.log(ratio)-offset_shift
+    con.execute('CREATE TABLE nb_null_data(y DOUBLE,expo DOUBLE)')
+    con.executemany('INSERT INTO nb_null_data VALUES (?,?)',[(outcome,offset_shift),(outcome,offset_shift+np.log(2.))])
+    con.execute("CREATE TABLE nb_null_model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient",[intercept])
+    metrics = _metrics(con,f"nbinom_evaluate('nb_null_model','nb_null_data','y',offset_col:='expo',alpha:={alpha})")
+    assert np.isfinite([metrics['deviance'],metrics['null_deviance'],metrics['pseudo_r2']]).all()
+    assert metrics['null_deviance'] == pytest.approx(metrics['deviance'],rel=1e-7,abs=0.)
+    assert metrics['pseudo_r2'] == pytest.approx(0.,abs=1e-7)

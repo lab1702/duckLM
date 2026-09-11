@@ -250,3 +250,21 @@ def test_positive_weights_below_relative_double_range_still_affect_fit(con, scal
     response_sd = np.sqrt(.25+rare_outcome**2/2)
     slope = (covariance/.75-l1*response_sd/np.sqrt(.75))/(1+l2)
     assert coefficients == pytest.approx({'(Intercept)': .5-.5*slope, 'x': slope}, abs=1e-8)
+
+
+@pytest.mark.parametrize('solver',['auto','irls','gd'])
+@pytest.mark.parametrize('l2',[0.,.2])
+@pytest.mark.parametrize('with_offset',[False,True])
+def test_linear_fit_uses_weighted_coordinates_when_raw_standardization_overflows(con, solver, l2, with_offset):
+    target_slope = -.5 if with_offset else 1.
+    con.execute('CREATE TABLE weighted_coordinates(x DOUBLE,y DOUBLE,w DOUBLE,expo DOUBLE)')
+    rows = [(x,(target_slope+(1. if with_offset else 0.))*x,w,x if with_offset else 0.) for x,w in [(0.,1e308),(1.,1e308),(1e308,1e-310)]]
+    con.executemany('INSERT INTO weighted_coordinates VALUES (?,?,?,?)',rows)
+    con.execute(f"CREATE TABLE weighted_model AS SELECT * FROM linreg_fit('weighted_coordinates','y',weights_col:='w',offset_col:='expo',solver:='{solver}',l2:={l2},max_iter:=1000)")
+    slope = target_slope/(1+l2)
+    intercept = .5*(target_slope-slope)
+    coefficients = dict(con.execute('SELECT * FROM weighted_model').fetchall())
+    assert coefficients == pytest.approx({'(Intercept)':intercept,'x':slope},abs=1e-8)
+    predictions = np.array(con.execute("SELECT prediction FROM linreg_predict('weighted_model','weighted_coordinates',offset_col:='expo')").fetchall()).ravel()
+    expected = [intercept+(slope+(1. if with_offset else 0.))*r[0] for r in rows]
+    np.testing.assert_allclose(predictions,expected,rtol=1e-8,atol=1e-8)

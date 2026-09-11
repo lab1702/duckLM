@@ -470,12 +470,16 @@ __reg_ystats AS (
 -- Each row carries y (transformed), xs (standardized features), o (internal
 -- offset), w (sample weight), sw (its root), and wxs (root-weighted features).
 -- Weighted products use sw and wxs to preserve large features with tiny weights.
--- sumw is the total weight; the gradient is
+-- Linear least squares packs the root-weighted response, design, and offset
+-- directly and uses unit optimizer weights. This avoids ever materializing an
+-- overflowing unweighted standardized observation. sumw retains the original
+-- normalized weight total, so regularization still acts on the mean loss.
+-- For the other families the gradient is
 -- (1/sumw) * sum_i w_i xs_ij r_i.
 __reg_packed AS MATERIALIZED (
     -- Zero-weight observations do not participate in optimization, including
     -- the curvature maximum that damps gradient steps for log-link families.
-    SELECT list(struct_pack(y := y, xs := xs, wxs := wxs, o := o, w := w, sw := sw)) FILTER (WHERE sw > 0) AS rows,
+    SELECT list(struct_pack(y := y, xs := xs, wxs := wxs, o := o, w := w, sw := CASE WHEN family = 'linear' THEN 1.0 ELSE sw END)) FILTER (WHERE sw > 0) AS rows,
            count(*)::DOUBLE AS n,
            sum(w) AS sumw
     FROM (
@@ -487,11 +491,15 @@ __reg_packed AS MATERIALIZED (
         -- collect unordered and sort the little list in list-land. list_sort orders
         -- a struct list lexicographically by field, hence j first.
         SELECT x.rid,
-               __reg_centered(any_value(yv.v),any_value(ys.mu_y),any_value(ys.sd_y)) AS y,
-               [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), zp -> zp.v) AS xs,
+               CASE WHEN family = 'linear'
+                    THEN __reg_weighted_center(any_value(yv.v),any_value(ys.mu_y),any_value(wt.sw),any_value(ys.sd_y))
+                    ELSE __reg_centered(any_value(yv.v),any_value(ys.mu_y),any_value(ys.sd_y)) END AS y,
                [any_value(wt.sw)] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_weighted_center(x.v,s.mu,wt.sw,s.sigma)))), zp -> zp.v) AS wxs,
-               coalesce(any_value(ov.v), 0.0)
-                 / (CASE WHEN family = 'linear' THEN any_value(ys.sd_y) ELSE 1.0 END) AS o,
+               CASE WHEN family = 'linear' THEN wxs
+                    ELSE [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), zp -> zp.v) END AS xs,
+               CASE WHEN family = 'linear'
+                    THEN __reg_mul_div(any_value(wt.sw),coalesce(any_value(ov.v),0.0),any_value(ys.sd_y))
+                    ELSE coalesce(any_value(ov.v),0.0) END AS o,
                any_value(wt.w) AS w, any_value(wt.sw) AS sw
         FROM __reg_clong x
         JOIN __reg_stats s  ON s.col = x.col
@@ -1257,14 +1265,8 @@ __reg_null_bounds(it, lo, hi) AS (
     FROM (
       SELECT it, lo, hi, mid,
              list_sum(list_transform(d.rows, lambda r:
-               list_transform([CASE WHEN family = 'logistic'
-                 THEN 1.0/(1.0+exp(-greatest(-700.0,least(700.0,mid+r.o))))
-                 ELSE exp(greatest(-700.0,least(700.0,mid+r.o))) END], lambda mu:
-                 CASE family WHEN 'logistic' THEN __reg_logit_resid(r.y,mid+r.o)
-                   WHEN 'gamma' THEN r.y/mu-1.0
-                   WHEN 'tweedie' THEN (r.y-mu)*pow(mu,1.0-power)
-                   WHEN 'nbinom' THEN (r.y-mu)/(1.0+alpha*mu)
-                   ELSE r.y-mu END)[1])) AS score
+               CASE WHEN family = 'logistic' THEN __reg_logit_resid(r.y,mid+r.o)
+                    ELSE __reg_nb_score(r.y,mid+r.o,alpha) END)) AS score
       FROM (SELECT *, lo/2.0+hi/2.0 AS mid FROM __reg_null_bounds
             WHERE it < 80 AND lo < hi) b, __reg_null_data d
     )
