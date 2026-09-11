@@ -780,6 +780,27 @@ def test_log_link_inference_preserves_finite_means_beyond_old_clipping_range(con
         np.testing.assert_allclose(observed[1], observed[0], rtol=1e-9, atol=1e-11)
 
 
+@pytest.mark.parametrize('power,scale', [(4.,1e-200),(4.,1e200),(6.,1e-100),(6.,1e100),(3.,1e-305),(3.,1e305)])
+def test_tweedie_inference_cancels_extreme_information_and_dispersion_units(con, power, scale):
+    con.execute('CREATE TABLE base_response AS SELECT i::DOUBLE/5 x,exp(.1*i/5)*(1.+.1*(i%3)) y,i%4 grp FROM range(20)t(i)')
+    con.execute('CREATE TABLE scaled_response AS SELECT x,y*? y,grp FROM base_response',[scale])
+    results = []
+    for table,factor in [('base_response',1.),('scaled_response',scale)]:
+        con.execute(f"CREATE OR REPLACE TABLE fit_input AS SELECT x,y FROM {table}")
+        con.execute(f"CREATE OR REPLACE TABLE inference_model AS SELECT * FROM tweedie_fit('fit_input','y',power:={power})")
+        errors = []
+        for robust in ['none','hc0','hc1','hc2','hc3','cluster']:
+            extra = ",cluster_col:='grp'" if robust == 'cluster' else f",robust:='{robust}'"
+            errors.append(con.execute(f"SELECT std_error FROM tweedie_summary('inference_model','{table}','y',power:={power}{extra})").df().to_numpy())
+        intervals = con.execute(f"SELECT prediction,conf_low,conf_high FROM tweedie_predict_ci('inference_model','{table}','y',power:={power})").df().to_numpy()/factor
+        diagnostics = con.execute(f"SELECT hat,pearson_resid,deviance_resid,std_resid,cooks_distance FROM tweedie_influence('inference_model','{table}','y',power:={power})").df()
+        diagnostics[['pearson_resid','deviance_resid']] /= np.exp(np.log(factor)*(1-power/2))
+        results.append([np.asarray(errors),intervals,diagnostics.to_numpy()])
+    for baseline,scaled in zip(*results):
+        assert np.isfinite(scaled).all()
+        np.testing.assert_allclose(scaled,baseline,rtol=1e-8,atol=1e-10)
+
+
 @pytest.mark.parametrize('scale', [1e-305, 1e-170, 1e170, 1e305])
 @pytest.mark.parametrize('robust', ['none', 'hc0', 'hc1', 'hc2', 'hc3', 'cluster'])
 def test_linear_inference_preserves_extreme_response_units(con, scale, robust):

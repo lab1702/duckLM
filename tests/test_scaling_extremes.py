@@ -320,6 +320,46 @@ def test_log_link_fit_preserves_overflowing_mean_scaled_response_contributions(c
     assert coefficients == pytest.approx({'(Intercept)':np.log(mean_unit),'x':slope},abs=1e-8)
 
 
+@pytest.mark.parametrize('solver', ['auto','irls','gd'])
+@pytest.mark.parametrize('scale', [1e-200,1e-310])
+@pytest.mark.parametrize('offset', [1.,1e200])
+def test_linear_constant_offsets_preserve_tiny_response_differences(con, solver, scale, offset):
+    con.execute('CREATE TABLE tiny_response AS SELECT i::DOUBLE x,i*? y,?::DOUBLE o FROM range(-1,2)t(i)',[scale,offset])
+    con.execute(f"CREATE TABLE tiny_model AS SELECT * FROM linreg_fit('tiny_response','y',offset_col:='o',solver:='{solver}',max_iter:=1000)")
+    coefficients = dict(con.execute('SELECT * FROM tiny_model').fetchall())
+    assert coefficients['(Intercept)'] == -offset
+    assert coefficients['x']/scale == pytest.approx(1.,abs=1e-8)
+    prediction = con.execute("SELECT prediction/? FROM linreg_predict('tiny_model','tiny_response',offset_col:='o') ORDER BY x",[scale]).fetchall()
+    np.testing.assert_allclose(np.array(prediction).ravel(),[-1.,0.,1.],atol=1e-8,rtol=0.)
+
+
+@pytest.mark.parametrize('solver', ['auto','irls','gd'])
+@pytest.mark.parametrize('scale', [1e200,1e308])
+def test_linear_varying_offsets_do_not_overflow_solver_sums(con, solver, scale):
+    con.execute('CREATE TABLE large_offset AS SELECT i::DOUBLE x,1.0 y,i*? o FROM range(-1,2)t(i)',[scale])
+    coefficients = dict(con.execute(f"SELECT * FROM linreg_fit('large_offset','y',offset_col:='o',solver:='{solver}',max_iter:=1000)").fetchall())
+    assert coefficients['(Intercept)'] == pytest.approx(1.,abs=1e-8)
+    assert coefficients['x']/scale == pytest.approx(-1.,abs=1e-8)
+
+
+@pytest.mark.parametrize('solver', ['auto','irls','gd'])
+@pytest.mark.parametrize('weighted', [False,True])
+def test_linear_offset_normalization_preserves_outcome_based_l1_penalty(con, solver, weighted):
+    x = np.arange(-2.,3.)
+    y = 3+.2*x+np.array([.1,-.2,.3,-.1,.2])
+    o = 5+30*x
+    w = np.arange(1.,6.) if weighted else np.ones(5)
+    con.execute('CREATE TABLE offset_penalty(x DOUBLE,y DOUBLE,o DOUBLE,w DOUBLE)')
+    con.executemany('INSERT INTO offset_penalty VALUES (?,?,?,?)',list(zip(x,y,o,w)))
+    mean_x,mean_y,mean_o = [np.average(v,weights=w) for v in [x,y,o]]
+    var_x = np.average((x-mean_x)**2,weights=w)
+    var_y = np.average((y-mean_y)**2,weights=w)
+    covariance = np.average((x-mean_x)*(y-o-mean_y+mean_o),weights=w)
+    slope = np.sign(covariance)*max(abs(covariance)-.05*np.sqrt(var_x*var_y),0)/(var_x*1.2)
+    coefficients = dict(con.execute(f"SELECT * FROM linreg_fit('offset_penalty','y',offset_col:='o',weights_col:='w',solver:='{solver}',l1:=.05,l2:=.2)").fetchall())
+    assert coefficients == pytest.approx({'(Intercept)':mean_y-mean_o-slope*mean_x,'x':slope},abs=1e-7)
+
+
 @pytest.mark.parametrize('solver', ['auto', 'irls', 'gd'])
 def test_linear_intercept_cancels_before_restoring_outcome_units(con, solver):
     con.execute('CREATE TABLE finite_intercept AS SELECT * FROM (VALUES (-2.5,-1e308),(-2.,-5e307),(-1.5,0.))t(x,y)')

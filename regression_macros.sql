@@ -303,6 +303,12 @@ CREATE OR REPLACE MACRO __reg_sigmoid(eta) AS (
        ELSE exp(eta)/(1.0+exp(eta)) END
 );
 
+CREATE OR REPLACE MACRO __reg_response_scale(y, logunit) AS (
+  CASE WHEN logunit=0 THEN y WHEN y=0 THEN 0.0
+       WHEN exp(logunit)>0 AND isfinite(exp(logunit)) THEN y/exp(logunit)
+       ELSE exp(ln(y)-logunit) END
+);
+
 -- Combine the mean powers before multiplying by outcomes or residuals.
 CREATE OR REPLACE MACRO __reg_tw_score(y, mu, power) AS (
   __reg_mul_div(y-mu,pow(mu,2.0-power),mu)
@@ -512,25 +518,28 @@ __reg_ystdev AS (
            __reg_mul_div(any_value(scale),sqrt(sum(pow(__reg_weighted_center(v,mu,sw,nullif(scale,0.0)),2))),sqrt(sum(w))) AS sd
     FROM __reg_ycenter
 ),
-__reg_ystats AS (
-    SELECT CASE WHEN family = 'linear' THEN mu ELSE 0.0 END AS mu_y,
-           CASE WHEN family = 'logistic' THEN 1.0
-                WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom')
-                  THEN (CASE WHEN mu = 0.0 THEN 1.0 ELSE mu END)
-                ELSE (CASE WHEN coalesce(sd,0.0) = 0.0 THEN 1.0 ELSE sd END)
-           END AS sd_y
-    FROM __reg_ystdev
-),
--- A common Tweedie offset is an unpenalized intercept shift. Remove it before
--- optimization so large exposures cannot create a vanishing initial score.
+-- A common linear/Tweedie offset is an unpenalized intercept shift. Center
+-- it before scaling, preserving tiny outcomes beside a large constant offset.
 __reg_offsets AS (
-    SELECT CASE WHEN family != 'tweedie' THEN 0.0 ELSE coalesce(
+    SELECT CASE WHEN family NOT IN ('linear','tweedie') THEN 0.0 ELSE coalesce(
            CASE WHEN min(v) = max(v) THEN min(v)
                 WHEN isfinite(sum(__reg_weighted_center(v,vbase,sw,1.0)*sw))
                   THEN min(vbase)+sum(__reg_weighted_center(v,vbase,sw,1.0)*sw)/sum(w)
                 ELSE max(vscale)*(sum(__reg_mul_div(sw,v,nullif(vscale,0.0))*sw)/sum(w)) END,0.0)
            END AS center
     FROM __reg_moments WHERE col = offset_col
+),
+__reg_ystats AS (
+    SELECT CASE WHEN family = 'linear' THEN mu ELSE 0.0 END AS mu_y,
+           CASE WHEN family = 'logistic' THEN 1.0
+                WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom')
+                  THEN (CASE WHEN mu = 0.0 THEN 1.0 ELSE mu END)
+                ELSE greatest(CASE WHEN coalesce(sd,0.0) = 0.0 THEN 1.0 ELSE sd END,
+                     coalesce((SELECT max(sw*__reg_center_scale(v,os.center))
+                               FROM __reg_moments CROSS JOIN __reg_offsets os WHERE col=offset_col),0.0))
+           END AS sd_y,
+           CASE WHEN coalesce(sd,0.0) = 0.0 THEN 1.0 ELSE sd END AS native_yunit
+    FROM __reg_ystdev
 ),
 -- The whole training set packed into one row: a list of training-row structs where
 -- xs = [1.0 (intercept), standardized features in name order]. __reg_clong is
@@ -571,7 +580,7 @@ __reg_packed AS MATERIALIZED (
                CASE WHEN family = 'linear' THEN wxs
                     ELSE [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), zp -> zp.v) END AS xs,
                CASE WHEN family = 'linear'
-                    THEN __reg_mul_div(any_value(wt.sw),coalesce(any_value(ov.v),0.0),any_value(ys.sd_y))
+                    THEN __reg_weighted_center(coalesce(any_value(ov.v),0.0),any_value(os.center),any_value(wt.sw),any_value(ys.sd_y))
                     ELSE coalesce(any_value(ov.v),0.0)-any_value(os.center) END AS o,
                any_value(wt.w) AS w, any_value(wt.sw) AS sw
         FROM __reg_clong x
@@ -642,6 +651,11 @@ __reg_cfg AS (
                                 ELSE 1.0 / (f.d + 1)
                            END)
            END AS step,
+           -- Larger linear offset units must not change the documented L1
+           -- penalty based on the outcome's own standard deviation.
+           CASE WHEN family='linear'
+                THEN __reg_mul_div(l1,(SELECT native_yunit FROM __reg_ystats),(SELECT sd_y FROM __reg_ystats))
+                ELSE l1 END AS l1_internal,
            -- Negative-binomial dispersion on the mean-scaled internal problem:
            -- dividing y by its mean adds ln(mean) to the effective log dispersion.
            ln(alpha) + ln((SELECT sd_y FROM __reg_ystats)) AS log_alpha_int
@@ -679,7 +693,7 @@ __reg_irls(it, betas, move) AS (
         SELECT it, betas,
                __reg_irls_step(betas, CASE WHEN l1 = 0.0
                     THEN list_transform(__reg_matinv(XWXpen), lambda invrow: list_dot_product(invrow, XWr))
-                    ELSE __reg_cd(XWXpen, XWr, betas, sumw * l1, len(betas), 100)
+                    ELSE __reg_cd(XWXpen, XWr, betas, sumw * __reg_penalty.l1_internal, len(betas), 100)
                END, step_rows, family) AS betas_new
         FROM (
             SELECT it, betas, XWr, XWXpen, sumw
@@ -740,6 +754,7 @@ __reg_irls(it, betas, move) AS (
                 )
             )
         )
+        CROSS JOIN __reg_cfg __reg_penalty
         CROSS JOIN (SELECT list_transform(rows, lambda rw: struct_pack(xs := rw.xs, w := rw.sw)) AS step_rows FROM __reg_packed) __reg_step_data
     )
 ),
@@ -790,7 +805,7 @@ __reg_gd AS (
                    CASE WHEN j = 1 THEN zj
                         ELSE __reg_ridge_div(sign(zj) * greatest(abs(zj) - threshl1, 0.0),prox_step,l2) END) AS newbetas
         FROM (
-            SELECT it, betas, look, step * (l1 / damp) AS threshl1, step/damp AS prox_step,
+            SELECT it, betas, look, step * ((SELECT l1_internal FROM __reg_cfg) / damp) AS threshl1, step/damp AS prox_step,
                    -- Smooth data-loss gradient; both penalties are proximal.
                    list_transform(look, lambda b, j:
                        b + step * ((list_sum(list_transform(res, lambda ob: ob.xs[j] * ob.r)) / sumw) / damp)) AS zstep
@@ -2810,6 +2825,15 @@ __reg_rows0 AS (
   FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc
        CROSS JOIN __reg_weightscale ws CROSS JOIN __reg_beta beta WHERE wc.ok
 ),
+-- A common Tweedie response unit cancels from coefficient uncertainty and
+-- standardized diagnostics. Remove extreme units before information powers
+-- or Pearson squares overflow; restore raw diagnostic residual units at output.
+__reg_responseunits AS (
+  SELECT CASE WHEN family='tweedie' AND isfinite(anchor) AND abs((2.0-power)*anchor)>600.0
+              THEN anchor ELSE 0.0 END AS shift
+  FROM (SELECT arg_min(eta,struct_pack(weight := -sw,magnitude := abs(eta),value := eta)) FILTER (WHERE sw>0) AS anchor
+        FROM (SELECT sw,__reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0))
+),
 -- Linear uncertainty is accumulated in root-weighted residual units and restored only
 -- after square roots. This preserves small/large finite response scales.
 __reg_resunits AS (
@@ -2843,7 +2867,9 @@ __reg_rww AS (
              WHEN 'nbinom' THEN r.sw*__reg_nb_pearson(r.y,r.eta,alpha) END,2) AS pearson
   FROM (SELECT *, CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                              WHEN 'linear' THEN eta ELSE exp(eta) END AS mu
-        FROM (SELECT *, __reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0)) r
+        FROM (SELECT r.* REPLACE (__reg_response_scale(y,tu.shift) AS y),
+                     __reg_dot(xs || [off],bvec || [1.0])-tu.shift AS eta
+              FROM __reg_rows0 r CROSS JOIN __reg_responseunits tu)) r
   CROSS JOIN __reg_xunits u
 ),
 -- Remove the common Fisher-information scale before accumulation/inversion;
@@ -3157,6 +3183,15 @@ __reg_rows0 AS (
   FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc
        CROSS JOIN __reg_weightscale ws CROSS JOIN __reg_beta beta WHERE wc.ok
 ),
+-- A common Tweedie response unit cancels from coefficient uncertainty and
+-- standardized diagnostics. Remove extreme units before information powers
+-- or Pearson squares overflow; restore raw diagnostic residual units at output.
+__reg_responseunits AS (
+  SELECT CASE WHEN family='tweedie' AND isfinite(anchor) AND abs((2.0-power)*anchor)>600.0
+              THEN anchor ELSE 0.0 END AS shift
+  FROM (SELECT arg_min(eta,struct_pack(weight := -sw,magnitude := abs(eta),value := eta)) FILTER (WHERE sw>0) AS anchor
+        FROM (SELECT sw,__reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0))
+),
 -- Linear uncertainty is accumulated in root-weighted residual units and restored only
 -- after square roots. This preserves small/large finite response scales.
 __reg_resunits AS (
@@ -3190,7 +3225,9 @@ __reg_rww AS (
              WHEN 'nbinom' THEN r.sw*__reg_nb_pearson(r.y,r.eta,alpha) END,2) AS pearson
   FROM (SELECT *, CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                              WHEN 'linear' THEN eta ELSE exp(eta) END AS mu
-        FROM (SELECT *, __reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0)) r
+        FROM (SELECT r.* REPLACE (__reg_response_scale(y,tu.shift) AS y),
+                     __reg_dot(xs || [off],bvec || [1.0])-tu.shift AS eta
+              FROM __reg_rows0 r CROSS JOIN __reg_responseunits tu)) r
   CROSS JOIN __reg_xunits u
 ),
 -- Remove the common Fisher-information scale before accumulation/inversion;
@@ -3411,6 +3448,15 @@ __reg_rows0 AS (
   FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc
        CROSS JOIN __reg_weightscale ws CROSS JOIN __reg_beta beta WHERE wc.ok
 ),
+-- A common Tweedie response unit cancels from coefficient uncertainty and
+-- standardized diagnostics. Remove extreme units before information powers
+-- or Pearson squares overflow; restore raw diagnostic residual units at output.
+__reg_responseunits AS (
+  SELECT CASE WHEN family='tweedie' AND isfinite(anchor) AND abs((2.0-power)*anchor)>600.0
+              THEN anchor ELSE 0.0 END AS shift
+  FROM (SELECT arg_min(eta,struct_pack(weight := -sw,magnitude := abs(eta),value := eta)) FILTER (WHERE sw>0) AS anchor
+        FROM (SELECT sw,__reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0))
+),
 -- Linear uncertainty is accumulated in root-weighted residual units and restored only
 -- after square roots. This preserves small/large finite response scales.
 __reg_resunits AS (
@@ -3449,7 +3495,9 @@ __reg_pr AS (
   FROM (SELECT __reg_rid__, xs, wt, sw, y, eta,
                CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                            WHEN 'linear' THEN eta ELSE exp(eta) END AS mu
-        FROM (SELECT __reg_rid__, xs, wt, sw, y, __reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0)) r CROSS JOIN __reg_xunits u CROSS JOIN __reg_resunits ru
+        FROM (SELECT __reg_rid__,xs,wt,sw,__reg_response_scale(y,tu.shift) AS y,
+                     __reg_dot(xs || [off],bvec || [1.0])-tu.shift AS eta
+              FROM __reg_rows0 CROSS JOIN __reg_responseunits tu)) r CROSS JOIN __reg_xunits u CROSS JOIN __reg_resunits ru
 ),
 __reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_pr),
 __reg_idx AS (SELECT unnest(range(1, (SELECT d FROM __reg_dims)+1)) AS i),
@@ -3503,8 +3551,12 @@ __reg_diag AS (
   FROM __reg_pr p JOIN __reg_lev l ON l.__reg_rid__ = p.__reg_rid__ CROSS JOIN __reg_disp dp
 )
 SELECT n.* EXCLUDE (__reg_rid__), d.hat,
-       (d.pearson_resid*sqrt(ws.wscale))*(SELECT runit FROM __reg_resunits) AS pearson_resid,
-       (d.deviance_resid*sqrt(ws.wscale))*(SELECT runit FROM __reg_resunits) AS deviance_resid,
+       __reg_mul_div(d.pearson_resid*sqrt(ws.wscale),
+         (SELECT CASE WHEN family='tweedie' THEN exp((1.0-power/2.0)*shift) ELSE runit END
+          FROM __reg_resunits CROSS JOIN __reg_responseunits),1.0) AS pearson_resid,
+       __reg_mul_div(d.deviance_resid*sqrt(ws.wscale),
+         (SELECT CASE WHEN family='tweedie' THEN exp((1.0-power/2.0)*shift) ELSE runit END
+          FROM __reg_resunits CROSS JOIN __reg_responseunits),1.0) AS deviance_resid,
        d.std_resid*(CASE WHEN family IN ('linear','gamma','tweedie') THEN 1.0 ELSE sqrt(ws.wscale) END) AS std_resid,
        d.cooks_distance*(CASE WHEN family IN ('linear','gamma','tweedie') THEN 1.0 ELSE ws.wscale END) AS cooks_distance
 FROM __reg_num n JOIN __reg_diag d ON d.__reg_rid__ = n.__reg_rid__
