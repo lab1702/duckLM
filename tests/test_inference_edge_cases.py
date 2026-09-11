@@ -679,3 +679,53 @@ def test_inference_weight_validation_ignores_incomplete_rows(con, operation):
         assert actual.iloc[-1][['prediction','conf_low','conf_high']].isna().all()
         actual = actual.iloc[:-1]
     pd.testing.assert_frame_equal(actual, expected)
+
+
+@pytest.mark.parametrize('family', ['logit','poisson','nbinom'])
+def test_fixed_dispersion_inference_preserves_extreme_weight_scale(con, family):
+    model(con)
+    data = training().assign(w=np.linspace(0.25, 1.0, 48))
+    if family == 'logit':
+        data['y'] = (data.y > 1).astype(float)
+    errors, diagnostics = [], []
+    for scale in [1.0, 1e-308, 1e308]:
+        load(con, 'fixed_weights', data.assign(w=data.w*scale))
+        se = con.execute(f"SELECT std_error FROM {family}_summary('edge_model','fixed_weights','y',weights_col:='w')").df()['std_error'].to_numpy()
+        assert np.isfinite(se).all()
+        errors.append(se*np.sqrt(scale))
+        ci = con.execute(f"SELECT prediction,conf_low,conf_high FROM {family}_predict_ci('edge_model','fixed_weights','y',weights_col:='w')").df()
+        assert not ci.isna().any().any()
+        if scale < 1:
+            assert (ci.conf_low == 0.0).all()
+            assert (ci.conf_high == (1.0 if family=='logit' else np.inf)).all()
+        elif scale > 1:
+            np.testing.assert_array_equal(ci.conf_low, ci.prediction)
+            np.testing.assert_array_equal(ci.conf_high, ci.prediction)
+        diag = con.execute(f"SELECT hat,pearson_resid,deviance_resid,std_resid,cooks_distance FROM {family}_influence('edge_model','fixed_weights','y',weights_col:='w')").df()
+        assert np.isfinite(diag.to_numpy()).all()
+        diag[['pearson_resid','deviance_resid','std_resid']] /= np.sqrt(scale)
+        diag['cooks_distance'] /= scale
+        diagnostics.append(diag.to_numpy())
+    np.testing.assert_allclose(errors[1:], np.stack([errors[0],errors[0]]), rtol=1e-10)
+    np.testing.assert_allclose(diagnostics[1:], np.stack([diagnostics[0],diagnostics[0]]), rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize('family,power', [('gamma',2.0), ('tweedie',1.5)])
+@pytest.mark.parametrize('scale', [1e-305, 1e305])
+def test_log_link_inference_preserves_finite_means_beyond_old_clipping_range(con, family, power, scale):
+    model(con)
+    model(con, name='scaled_model')
+    con.execute("UPDATE scaled_model SET coefficient=coefficient+ln(?) WHERE feature='(Intercept)'", [scale])
+    data = training().assign(y=training().y+0.2)
+    load(con, 'base_response', data)
+    load(con, 'scaled_response', data.assign(y=data.y*scale))
+    errors, intervals, diagnostics = [], [], []
+    for mdl, table, factor in [('edge_model','base_response',1.0), ('scaled_model','scaled_response',scale)]:
+        errors.append(con.execute(f"SELECT std_error FROM {family}_summary('{mdl}','{table}','y')").df()['std_error'].to_numpy())
+        intervals.append(con.execute(f"SELECT prediction,conf_low,conf_high FROM {family}_predict_ci('{mdl}','{table}','y')").df().to_numpy()/factor)
+        diag = con.execute(f"SELECT hat,pearson_resid,deviance_resid,std_resid,cooks_distance FROM {family}_influence('{mdl}','{table}','y')").df()
+        diag[['pearson_resid','deviance_resid']] /= factor**(1-power/2)
+        diagnostics.append(diag.to_numpy())
+    for observed in [errors, intervals, diagnostics]:
+        assert np.isfinite(observed).all()
+        np.testing.assert_allclose(observed[1], observed[0], rtol=1e-9, atol=1e-11)

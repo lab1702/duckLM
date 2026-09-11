@@ -2591,9 +2591,15 @@ __reg_weightcheck AS (
               THEN error(caller || ': weights must be non-negative')
               ELSE true END AS ok
 ),
+-- Remove the common weight scale before information/score accumulation;
+-- restore it in fixed-dispersion uncertainty and weighted residual outputs.
+__reg_weightscale AS (
+  SELECT coalesce(nullif(max(wt),0.0),1.0) AS wscale FROM __reg_rowsraw
+),
 __reg_rows0 AS (
-  SELECT r.* REPLACE (CASE WHEN robust != 'none' OR cluster_col IS NOT NULL OR family IN ('linear','gamma','tweedie') THEN wt/nullif(max(wt) OVER (),0.0) ELSE wt END AS wt)
-  FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc WHERE wc.ok
+  SELECT r.* REPLACE (wt/ws.wscale AS wt)
+  FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc
+       CROSS JOIN __reg_weightscale ws WHERE wc.ok
 ),
 -- Normalize feature units before any cross-products. The original vectors
 -- still form eta; covariance uses these units and is transformed back below.
@@ -2618,11 +2624,10 @@ __reg_rww AS (
                    WHEN 'tweedie'  THEN pow((r.y-mu)/mu * pow(mu,1.0-power/2.0),2)
                    WHEN 'nbinom'   THEN (r.y-mu)*(r.y-mu)/(mu*(1.0+alpha*mu)) END) AS pearson
   FROM (
-    -- eta clamped to [-700, 700] (as the fit does) so mu = exp(eta) never overflows
     SELECT __reg_rid__, xs, y, wt, eta,
            CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0, least(eta, 700.0))))
                        WHEN 'linear'   THEN eta
-                       ELSE exp(greatest(-700.0, least(eta, 700.0))) END AS mu
+                       ELSE exp(eta) END AS mu
     FROM (SELECT __reg_rid__, xs, y, wt, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0)
   ) r CROSS JOIN __reg_xunits u
 ),
@@ -2768,7 +2773,7 @@ __reg_robchk AS (
               ELSE true END AS ok
 ),
 __reg_final AS (
-  SELECT b.names AS names, b.bvec AS bvec, c.Rinv AS Rinv, s.dsc AS dsc, rv.rv AS rv, u.units AS units,
+  SELECT b.names AS names, b.bvec AS bvec, c.Rinv AS Rinv, s.dsc AS dsc, rv.rv AS rv, u.units AS units, ws.wscale AS wscale,
          dp.phi AS phi, dp.est AS est, dp.df AS df,
          (robust != 'none' OR cluster_col IS NOT NULL) AS robactive,
          (dp.est AND dp.df > 0.0 AND robust = 'none' AND cluster_col IS NULL) AS uset,
@@ -2776,7 +2781,7 @@ __reg_final AS (
                 THEN -t_ppf((1.0-conf_level)/2.0, dp.df)
               ELSE -norm_ppf((1.0-conf_level)/2.0) END AS crit
   FROM __reg_beta b CROSS JOIN __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_disp dp CROSS JOIN __reg_robvar rv
-       CROSS JOIN __reg_robchk rc CROSS JOIN __reg_xunits u WHERE rc.ok
+       CROSS JOIN __reg_robchk rc CROSS JOIN __reg_xunits u CROSS JOIN __reg_weightscale ws WHERE rc.ok
 ),
 -- per-coefficient SE with guards: NULL when the covariance is singular / non-finite / non-positive
 __reg_percoef AS (
@@ -2788,7 +2793,7 @@ __reg_percoef AS (
                 CASE WHEN Rinv IS NOT NULL AND df > 0.0 AND isfinite(rv[gs.i]) AND rv[gs.i] > 0.0 THEN sqrt(rv[gs.i]) / units[gs.i] ELSE NULL END
               ELSE
                 CASE WHEN Rinv IS NOT NULL AND isfinite(phi * Rinv[gs.i][gs.i]) AND phi * Rinv[gs.i][gs.i] > 0.0
-                     THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] / units[gs.i] ELSE NULL END
+                     THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] / units[gs.i] / (CASE WHEN est THEN 1.0 ELSE sqrt(wscale) END) ELSE NULL END
          END AS std_error
   FROM __reg_final, unnest(range(1, len(bvec)+1)) AS gs(i)
 )
@@ -2905,9 +2910,15 @@ __reg_weightcheck AS (
               THEN error(caller || ': weights must be non-negative')
               ELSE true END AS ok
 ),
+-- Remove the common weight scale before information/score accumulation;
+-- restore it in fixed-dispersion uncertainty and weighted residual outputs.
+__reg_weightscale AS (
+  SELECT coalesce(nullif(max(wt),0.0),1.0) AS wscale FROM __reg_rowsraw
+),
 __reg_rows0 AS (
-  SELECT r.* REPLACE (CASE WHEN family IN ('linear','gamma','tweedie') THEN wt/nullif(max(wt) OVER (),0.0) ELSE wt END AS wt)
-  FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc WHERE wc.ok
+  SELECT r.* REPLACE (wt/ws.wscale AS wt)
+  FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc
+       CROSS JOIN __reg_weightscale ws WHERE wc.ok
 ),
 -- Normalize feature units before any cross-products. The original vectors
 -- still form eta; covariance uses these units and is transformed back below.
@@ -2928,7 +2939,7 @@ __reg_rww AS (
                    WHEN 'tweedie' THEN pow((r.y-mu)/mu * pow(mu,1.0-power/2.0),2)
                    WHEN 'nbinom' THEN (r.y-mu)*(r.y-mu)/(mu*(1.0+alpha*mu)) END) AS pearson
   FROM (SELECT xs, y, wt, eta, CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
-                            WHEN 'linear' THEN eta ELSE exp(greatest(-700.0,least(eta,700.0))) END AS mu
+                            WHEN 'linear' THEN eta ELSE exp(eta) END AS mu
         FROM (SELECT xs, y, wt, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0)) r CROSS JOIN __reg_xunits u
 ),
 __reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_rww),
@@ -2970,9 +2981,10 @@ __reg_disp AS (
 ),
 __reg_cparams AS (
   SELECT c.Rinv AS Rinv, s.dsc AS dsc, u.units AS units, dp.phi AS phi, dp.uset AS uset, dp.df AS df,
+         CASE WHEN family IN ('linear','gamma','tweedie') THEN 1.0 ELSE sqrt(ws.wscale) END AS se_weight_scale,
          CASE WHEN dp.uset THEN -t_ppf((1.0-conf_level)/2.0, dp.df)
               ELSE -norm_ppf((1.0-conf_level)/2.0) END AS crit
-  FROM __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_disp dp CROSS JOIN __reg_xunits u
+  FROM __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_disp dp CROSS JOIN __reg_xunits u CROSS JOIN __reg_weightscale ws
 ),
 -- === score newdata (default = tbl) ===
 __reg_snum AS (SELECT row_number() OVER () AS __reg_srid__, * FROM query_table(coalesce(newdata, tbl))),
@@ -3001,7 +3013,7 @@ __reg_scored AS (
                        list_transform(sf.xs, lambda v, a: (v / cp.units[a]) / cp.dsc[a]),
                        lambda va, a: va * list_dot_product(cp.Rinv[a], list_transform(sf.xs, lambda v2, a2: (v2 / cp.units[a2]) / cp.dsc[a2]))))
               END AS var_eta,
-         cp.crit AS crit
+         cp.crit AS crit, cp.se_weight_scale AS se_weight_scale
   FROM __reg_snum sn
   LEFT JOIN __reg_sfeat sf ON sf.__reg_srid__ = sn.__reg_srid__
   LEFT JOIN __reg_soff so ON so.__reg_srid__ = sn.__reg_srid__
@@ -3010,13 +3022,13 @@ __reg_scored AS (
 SELECT sn.* EXCLUDE (__reg_srid__),
        CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-s.eta)) WHEN 'linear' THEN s.eta ELSE exp(s.eta) END AS prediction,
        CASE WHEN s.var_eta IS NULL OR NOT isfinite(s.var_eta) OR s.var_eta < 0.0 THEN NULL
-            ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta - s.crit*sqrt(s.var_eta))))
-                              WHEN 'linear' THEN s.eta - s.crit*sqrt(s.var_eta)
-                              ELSE exp(s.eta - s.crit*sqrt(s.var_eta)) END) END AS conf_low,
+            ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta - s.crit*(sqrt(s.var_eta)/s.se_weight_scale))))
+                              WHEN 'linear' THEN s.eta - s.crit*(sqrt(s.var_eta)/s.se_weight_scale)
+                              ELSE exp(s.eta - s.crit*(sqrt(s.var_eta)/s.se_weight_scale)) END) END AS conf_low,
        CASE WHEN s.var_eta IS NULL OR NOT isfinite(s.var_eta) OR s.var_eta < 0.0 THEN NULL
-            ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta + s.crit*sqrt(s.var_eta))))
-                              WHEN 'linear' THEN s.eta + s.crit*sqrt(s.var_eta)
-                              ELSE exp(s.eta + s.crit*sqrt(s.var_eta)) END) END AS conf_high
+            ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta + s.crit*(sqrt(s.var_eta)/s.se_weight_scale))))
+                              WHEN 'linear' THEN s.eta + s.crit*(sqrt(s.var_eta)/s.se_weight_scale)
+                              ELSE exp(s.eta + s.crit*(sqrt(s.var_eta)/s.se_weight_scale)) END) END AS conf_high
 FROM __reg_scored s JOIN __reg_snum sn ON sn.__reg_srid__ = s.__reg_srid__
 CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok
 ORDER BY s.__reg_srid__;
@@ -3109,9 +3121,15 @@ __reg_weightcheck AS (
               THEN error(caller || ': weights must be non-negative')
               ELSE true END AS ok
 ),
+-- Remove the common weight scale before information/score accumulation;
+-- restore it in fixed-dispersion uncertainty and weighted residual outputs.
+__reg_weightscale AS (
+  SELECT coalesce(nullif(max(wt),0.0),1.0) AS wscale FROM __reg_rowsraw
+),
 __reg_rows0 AS (
-  SELECT r.* REPLACE (wt AS wt)
-  FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc WHERE wc.ok
+  SELECT r.* REPLACE (wt/ws.wscale AS wt)
+  FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc
+       CROSS JOIN __reg_weightscale ws WHERE wc.ok
 ),
 -- Normalize feature units before any cross-products. The original vectors
 -- still form eta; covariance uses these units and is transformed back below.
@@ -3140,7 +3158,7 @@ __reg_pr AS (
             WHEN 'nbinom'   THEN 2.0*__reg_nb_halfdev(y,eta,alpha) END) AS udev
   FROM (SELECT __reg_rid__, xs, wt, y, eta,
                CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
-                           WHEN 'linear' THEN eta ELSE exp(greatest(-700.0,least(eta,700.0))) END AS mu
+                           WHEN 'linear' THEN eta ELSE exp(eta) END AS mu
         FROM (SELECT __reg_rid__, xs, wt, y, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0)) r CROSS JOIN __reg_xunits u
 ),
 __reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_pr),
@@ -3187,9 +3205,13 @@ __reg_diag AS (
                    ELSE (pearson_resid*pearson_resid/dp.phi) * l.h / (dp.d*(1.0-l.h)*(1.0-l.h)) END END AS cooks_distance
   FROM __reg_pr p JOIN __reg_lev l ON l.__reg_rid__ = p.__reg_rid__ CROSS JOIN __reg_disp dp
 )
-SELECT n.* EXCLUDE (__reg_rid__), d.hat, d.pearson_resid, d.deviance_resid, d.std_resid, d.cooks_distance
+SELECT n.* EXCLUDE (__reg_rid__), d.hat,
+       d.pearson_resid*sqrt(ws.wscale) AS pearson_resid,
+       d.deviance_resid*sqrt(ws.wscale) AS deviance_resid,
+       d.std_resid*(CASE WHEN family IN ('linear','gamma','tweedie') THEN 1.0 ELSE sqrt(ws.wscale) END) AS std_resid,
+       d.cooks_distance*(CASE WHEN family IN ('linear','gamma','tweedie') THEN 1.0 ELSE ws.wscale END) AS cooks_distance
 FROM __reg_num n JOIN __reg_diag d ON d.__reg_rid__ = n.__reg_rid__
-CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok ORDER BY n.__reg_rid__;
+CROSS JOIN __reg_inputcheck CROSS JOIN __reg_weightscale ws WHERE __reg_inputcheck.ok ORDER BY n.__reg_rid__;
 
 CREATE OR REPLACE MACRO logit_influence(model, tbl, outcome, offset_col := NULL, weights_col := NULL) AS TABLE
 SELECT * FROM __reg_influence(model, tbl, outcome, 'logistic', 'logit_influence', offset_col, weights_col, NULL, NULL);
