@@ -239,11 +239,33 @@ CREATE OR REPLACE MACRO __reg_ridge_div(value, step, penalty) AS (
        WHEN isfinite(step*penalty) THEN value/(1.0+step*penalty)
        ELSE __reg_mul_div(value,1.0/penalty,step+1.0/penalty) END
 );
+-- If a finite sum overflows during accumulation, choose the next term with
+-- the opposite sign to the running total. Neumaier compensation retains
+-- small surviving terms without rescaling them out of DOUBLE range.
+CREATE OR REPLACE MACRO __reg_balanced_sum(vs) AS (
+  list_transform([struct_pack(pos := list_reverse_sort(list_filter(vs,lambda v: v >= 0)),
+                             neg := list_sort(list_filter(vs,lambda v: v < 0)))], lambda parts:
+    list_transform([list_reduce(
+      [struct_pack(pi := 1, ni := 1, s := 0.0::DOUBLE, c := 0.0::DOUBLE)]
+      || list_transform(range(len(vs)),lambda i: struct_pack(pi := 1, ni := 1, s := 0.0::DOUBLE, c := 0.0::DOUBLE)),
+      (acc,unused) -> list_transform([acc.ni <= len(parts.neg) AND (acc.s >= 0 OR acc.pi > len(parts.pos))], lambda take_neg:
+        list_transform([CASE WHEN take_neg THEN parts.neg[acc.ni] ELSE parts.pos[acc.pi] END], lambda term:
+          list_transform([acc.s+term], lambda total:
+            struct_pack(pi := acc.pi+CASE WHEN take_neg THEN 0 ELSE 1 END,
+                        ni := acc.ni+CASE WHEN take_neg THEN 1 ELSE 0 END,
+                        s := total,
+                        c := acc.c+CASE WHEN abs(acc.s) >= abs(term) THEN (acc.s-total)+term ELSE (term-total)+acc.s END)
+          )[1])[1])[1]
+    )], lambda result: result.s+result.c)[1]
+  )[1]
+);
 -- Sum large terms before small ones, with compensation, so cancellation does
 -- not discard a finite intercept or another smaller contribution.
 CREATE OR REPLACE MACRO __reg_fsum(vs) AS (
-  list_aggregate(list_transform(list_reverse_sort(list_transform(vs,
-    lambda zv: struct_pack(magnitude := abs(zv), value := zv))), lambda zv: zv.value), 'fsum')
+  list_transform([list_aggregate(list_transform(list_reverse_sort(list_transform(vs,
+    lambda zv: struct_pack(magnitude := abs(zv), value := zv))), lambda zv: zv.value), 'fsum')], lambda total:
+      CASE WHEN isfinite(total) OR len(list_filter(vs,lambda v: v IS NULL OR NOT isfinite(v))) > 0 THEN total
+           ELSE __reg_balanced_sum(vs) END)[1]
 );
 CREATE OR REPLACE MACRO __reg_scaled_dot(va, vb) AS (
   list_transform([struct_pack(sa := list_max(list_transform(va,lambda zv: abs(zv))),
@@ -1353,7 +1375,8 @@ SELECT
     a.eunit * sqrt(a.sse / a.n) AS rmse,
     a.eunit * (a.sae / a.n) AS mae,
     CASE WHEN family = 'linear' THEN 1.0 - a.sse / nu.sst END AS r2,
-    CASE WHEN family = 'linear' THEN 1.0 - (a.sse / (a.n - m.kparams)) / (nu.sst / (a.n - 1)) END AS adj_r2,
+    CASE WHEN family = 'linear' AND a.n > m.kparams AND a.n > 1
+         THEN 1.0 - (a.sse / (a.n - m.kparams)) / (nu.sst / (a.n - 1)) END AS adj_r2,
     a.accuracy AS accuracy,
     au.auc AS auc,
     CASE WHEN family = 'logistic' THEN -a.ll_bin / a.n END AS log_loss,
@@ -2242,17 +2265,24 @@ __reg_nbd_stats AS MATERIALIZED (
   GROUP BY col
 ),
 __reg_nbd_feats AS MATERIALIZED (SELECT count(*)::INT AS d FROM __reg_nbd_stats),
-__reg_nbd_ys AS (
+__reg_nbd_ys AS MATERIALIZED (
   SELECT CASE WHEN mu=0.0 THEN 1.0 ELSE mu END AS sd_y
   FROM (SELECT CASE WHEN isfinite(avg(y-ybase)) THEN min(ybase)+avg(y-ybase)
                     ELSE max(yscale)*avg(y/nullif(yscale,0.0)) END AS mu
         FROM (SELECT *,min(y) OVER () AS ybase,max(abs(y)) OVER () AS yscale FROM __reg_nbd_yraw))
+  CROSS JOIN __reg_nbd_ycheck chk WHERE chk.ok
 ),
 __reg_nbd_n AS (SELECT count(*)::DOUBLE AS n FROM __reg_nbd_yraw),
 -- one model per grid alpha (no folds); log_alpha_int = ln(alpha) + ln(mean(y))
 __reg_nbd_marr AS (
   SELECT list(logalpi ORDER BY g) AS mlogalp_int, count(*)::INT AS M
-  FROM (SELECT g, ln(alpha_grid[g]) + ln((SELECT sd_y FROM __reg_nbd_ys)) AS logalpi FROM range(1,len(alpha_grid)+1) t(g))
+  -- Check each logarithm argument directly: independent projections can be
+  -- scheduled before the separate configuration validation in parallel plans.
+  FROM (SELECT g, ln(CASE WHEN alpha_grid[g] IS NULL OR NOT isfinite(alpha_grid[g])
+                          THEN error('nbinom_dispersion: alpha values must be non-NULL and finite')
+                         WHEN alpha_grid[g] <= 0 THEN error('nbinom_dispersion: alpha values must be > 0')
+                         ELSE alpha_grid[g] END)
+                       + ln((SELECT sd_y FROM __reg_nbd_ys)) AS logalpi FROM range(1,len(alpha_grid)+1) t(g))
 ),
 __reg_nbd_rows AS MATERIALIZED (
   SELECT x.rid, any_value(yr.y) AS y, any_value(yr.y) / any_value(ys.sd_y) AS yt,

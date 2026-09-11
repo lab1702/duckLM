@@ -629,3 +629,42 @@ def test_multinomial_scoring_keeps_intercept_after_overflowing_slope_cancellatio
     con.execute('CREATE TABLE cancelling_multidata AS SELECT 2.0 x,2.0 z')
     probabilities = con.execute("SELECT probs FROM multinom_predict('cancelling_multinomial','cancelling_multidata')").fetchone()[0]
     assert probabilities['b'] == pytest.approx(1/(1+np.exp(-1)), abs=1e-12)
+
+
+@pytest.mark.parametrize('n', [1, 2, 3, 4])
+def test_adjusted_r_squared_requires_positive_residual_degrees_of_freedom(con, n):
+    con.execute("CREATE TABLE model AS SELECT * FROM (VALUES ('(Intercept)',0.),('x',0.),('z',0.))t(feature,coefficient)")
+    con.execute(f'CREATE TABLE observations AS SELECT i::DOUBLE x,0.0 z,i+1.0 y FROM range({n})t(i)')
+    # Excluded rows must not create apparent residual degrees of freedom.
+    con.execute('INSERT INTO observations VALUES (NULL,0,5),(5,0,NULL)')
+    metrics = _metrics(con, "linreg_evaluate('model','observations','y')")
+    y = np.arange(1., n+1.)
+    assert metrics['n'] == n
+    assert metrics['rmse'] == pytest.approx(np.sqrt(np.mean(y*y)))
+    assert metrics['mae'] == pytest.approx(y.mean())
+    assert np.isfinite(metrics['loglik'])
+    if n > 1:
+        r2 = 1 - np.sum(y*y)/np.sum((y-y.mean())**2)
+        assert metrics['r2'] == pytest.approx(r2)
+    if n <= 3:
+        assert metrics['adj_r2'] is None
+    else:
+        assert metrics['adj_r2'] == pytest.approx(1-(1-r2)*(n-1)/(n-3))
+
+
+@pytest.mark.parametrize('pairs', [2, 4])
+@pytest.mark.parametrize('family,coordinate', [('linreg',1e308),('linreg',1e138),('logit',1e308),('poisson',1e308)])
+def test_scoring_preserves_small_products_when_finite_product_sum_overflows(con, pairs, family, coordinate):
+    coefficients = [('(Intercept)',0.)] + [(f'p{i}',1e308) for i in range(pairs)] + [(f'n{i}',-1e308) for i in range(pairs)] + [('small',1e-308)]
+    con.execute('CREATE TABLE model(feature VARCHAR,coefficient DOUBLE)')
+    con.executemany('INSERT INTO model VALUES (?,?)',coefficients)
+    columns = ','.join(f'1.0 {feature}' for feature,_ in coefficients[1:-1])
+    con.execute(f'CREATE TABLE observations AS SELECT {columns},?::DOUBLE small',[coordinate])
+    expected = coordinate*1e-308
+    if family == 'logit':
+        expected = 1/(1+np.exp(-expected))
+    elif family == 'poisson':
+        expected = np.exp(expected)
+    column = 'prob' if family == 'logit' else 'prediction'
+    prediction = con.execute(f"SELECT {column} FROM {family}_predict('model','observations')").fetchone()[0]
+    assert prediction == pytest.approx(expected,rel=1e-12,abs=0.)

@@ -225,3 +225,21 @@ def test_tuning_rejects_invalid_grid_candidates(con,bad,kind):
     else:call=f"cv_{kind}('balanced','y','linear',{grid})"
     with pytest.raises(duckdb.Error,match='non-NULL and finite'):
         con.execute('SELECT * FROM '+call).fetchall()
+
+
+@pytest.mark.parametrize('threads', [1, 4, 24])
+@pytest.mark.parametrize('macro', ['nbinom_dispersion','nbinom_dispersion_refine'])
+@pytest.mark.parametrize('alpha', [-1., 0.])
+def test_dispersion_validates_alpha_before_logarithms(con, threads, macro, alpha):
+    con.execute(f'SET threads={threads}')
+    with pytest.raises(duckdb.Error,match='nbinom_dispersion: alpha values must be > 0'):
+        con.execute(f"SELECT * FROM {macro}('balanced','y',[{alpha},1.])").fetchall()
+
+
+@pytest.mark.parametrize('threads', [1, 4, 24])
+@pytest.mark.parametrize('macro', ['nbinom_dispersion','nbinom_dispersion_refine'])
+def test_dispersion_validates_outcomes_before_logarithms(con, threads, macro):
+    con.execute(f'SET threads={threads}')
+    con.execute('CREATE TABLE bad_domain AS SELECT i::DOUBLE x,-1.0 y FROM range(12)t(i)')
+    with pytest.raises(duckdb.Error,match='nbinom_dispersion: outcome must'):
+        con.execute(f"SELECT * FROM {macro}('bad_domain','y',[.5,1.])").fetchall()
