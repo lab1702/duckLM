@@ -416,8 +416,8 @@ __reg_ystats AS (
     SELECT CASE WHEN family = 'linear' THEN mu ELSE 0.0 END AS mu_y,
            CASE WHEN family = 'logistic' THEN 1.0
                 WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom')
-                  THEN (CASE WHEN mu < 1e-300 THEN 1.0 ELSE mu END)
-                ELSE (CASE WHEN coalesce(sd,0.0) < 1e-300 THEN 1.0 ELSE sd END)
+                  THEN (CASE WHEN mu = 0.0 THEN 1.0 ELSE mu END)
+                ELSE (CASE WHEN coalesce(sd,0.0) = 0.0 THEN 1.0 ELSE sd END)
            END AS sd_y
     FROM __reg_ystdev
 ),
@@ -1125,11 +1125,24 @@ __reg_auc AS (
                      / (sum(y) * (count(*) - sum(y))) END AS auc
     FROM __reg_ranked
 ),
+-- Accumulate residual squares in finite units. The same units for SSE and
+-- SST cancel in R-squared; RMSE and Gaussian log-likelihood restore the scale
+-- after the square root or in log space, so representable metrics stay finite.
+__reg_errorunits AS (
+    SELECT coalesce(nullif(max(CASE WHEN isfinite(y) AND isfinite(yhat)
+                                   THEN __reg_center_scale(y,yhat) ELSE 0.0 END),0.0),
+                    nullif(max(abs(y)),0.0),1.0) AS eunit,
+           coalesce(nullif(max(abs(y)),0.0),1.0) AS yunit
+    FROM __reg_rows
+),
 __reg_agg AS (
     SELECT count(*)::DOUBLE AS n,
-           avg(y) AS ybar,
-           sum((y - yhat) * (y - yhat)) AS sse,
-           sum(abs(y - yhat)) AS sae,
+           CASE WHEN min(y) = max(y) THEN min(y)
+                WHEN isfinite(avg(y)) THEN avg(y)
+                ELSE any_value(yunit)*avg(y/yunit) END AS ybar,
+           any_value(eunit) AS eunit,
+           sum(pow(__reg_centered(y,yhat,eunit),2)) AS sse,
+           sum(abs(__reg_centered(y,yhat,eunit))) AS sae,
            sum(-y*greatest(-z,0.0) - (1-y)*greatest(z,0.0) - __reg_log1p(exp(-abs(z)))) AS ll_bin,
            avg(CASE WHEN (yhat >= 0.5) = (y >= 0.5) THEN 1.0 ELSE 0.0 END) AS accuracy,
            sum(CASE WHEN y = 0 THEN -exp(z)
@@ -1146,7 +1159,7 @@ __reg_agg AS (
            sum(__reg_nb_ll(y,z,alpha)) AS ll_nb,
            sum(__reg_nb_halfdev(y,z,alpha)) AS dev_nb_half,
            sum((y - yhat) * (y - yhat) / (yhat + alpha * yhat * yhat)) AS pearson_nb
-    FROM __reg_rows
+    FROM __reg_rows CROSS JOIN __reg_errorunits
 ),
 -- Fit the intercept-only null on the evaluated rows, retaining their offsets.
 -- The score changes sign at the unique intercept-only optimum.
@@ -1212,7 +1225,7 @@ __reg_null_rows AS (
     FROM __reg_rows r, __reg_agg a
 ),
 __reg_null AS (
-    SELECT sum((y - a.ybar) * (y - a.ybar)) AS sst,
+    SELECT sum(pow(__reg_centered(y,a.ybar,a.eunit),2)) AS sst,
            -- lim(p -> 0+) p*ln(p) = 0, including one-class holdouts.
            sum(CASE WHEN a.ybar IN (0, 1) THEN 0.0
                     ELSE -y*greatest(-r.z0,0.0) - (1-y)*greatest(r.z0,0.0)
@@ -1227,15 +1240,15 @@ __reg_null AS (
 )
 SELECT
     a.n::BIGINT AS n,
-    sqrt(a.sse / a.n) AS rmse,
-    a.sae / a.n AS mae,
+    a.eunit * sqrt(a.sse / a.n) AS rmse,
+    a.eunit * (a.sae / a.n) AS mae,
     CASE WHEN family = 'linear' THEN 1.0 - a.sse / nu.sst END AS r2,
     CASE WHEN family = 'linear' THEN 1.0 - (a.sse / (a.n - m.kparams)) / (nu.sst / (a.n - 1)) END AS adj_r2,
     a.accuracy AS accuracy,
     au.auc AS auc,
     CASE WHEN family = 'logistic' THEN -a.ll_bin / a.n END AS log_loss,
     CASE family WHEN 'linear'   THEN CASE WHEN a.sse = 0 THEN 'Infinity'::DOUBLE
-                                         ELSE -a.n / 2.0 * (ln(2 * pi()) + ln(a.sse / a.n) + 1.0) END
+                                         ELSE -a.n / 2.0 * (ln(2 * pi()) + 2.0*ln(a.eunit) + ln(a.sse / a.n) + 1.0) END
                 WHEN 'logistic' THEN a.ll_bin
                 WHEN 'poisson'  THEN a.ll_pois
                 WHEN 'nbinom'   THEN a.ll_nb END AS loglik,
@@ -1737,8 +1750,8 @@ __reg_cv_feats AS MATERIALIZED (SELECT count(*)::INT AS d FROM __reg_cv_stats),
 __reg_cv_ys AS (
   SELECT CASE WHEN family='linear' THEN mu ELSE 0.0 END AS mu_y,
          CASE WHEN family='logistic' THEN 1.0
-              WHEN family IN ('poisson','gamma','tweedie','nbinom') THEN (CASE WHEN mu<1e-300 THEN 1.0 ELSE mu END)
-              WHEN coalesce(sd,0)<1e-300 THEN 1.0 ELSE sd END AS sd_y
+              WHEN family IN ('poisson','gamma','tweedie','nbinom') THEN (CASE WHEN mu=0.0 THEN 1.0 ELSE mu END)
+              WHEN coalesce(sd,0)=0.0 THEN 1.0 ELSE sd END AS sd_y
   FROM (SELECT any_value(mu_raw) AS mu,max(scale)*sqrt(avg(pow(__reg_centered(y,mu_raw,nullif(scale,0.0)),2))) AS sd
         FROM (SELECT *,max(__reg_center_scale(y,mu_raw)) OVER () AS scale
               FROM (SELECT *,CASE WHEN isfinite(avg(y-ybase) OVER ())
@@ -2117,7 +2130,7 @@ __reg_nbd_stats AS MATERIALIZED (
 ),
 __reg_nbd_feats AS MATERIALIZED (SELECT count(*)::INT AS d FROM __reg_nbd_stats),
 __reg_nbd_ys AS (
-  SELECT CASE WHEN mu<1e-300 THEN 1.0 ELSE mu END AS sd_y
+  SELECT CASE WHEN mu=0.0 THEN 1.0 ELSE mu END AS sd_y
   FROM (SELECT CASE WHEN isfinite(avg(y-ybase)) THEN min(ybase)+avg(y-ybase)
                     ELSE max(yscale)*avg(y/nullif(yscale,0.0)) END AS mu
         FROM (SELECT *,min(y) OVER () AS ybase,max(abs(y)) OVER () AS yscale FROM __reg_nbd_yraw))
@@ -2597,7 +2610,12 @@ __reg_weightscale AS (
   SELECT coalesce(nullif(max(wt),0.0),1.0) AS wscale FROM __reg_rowsraw
 ),
 __reg_rows0 AS (
-  SELECT r.* REPLACE (wt/ws.wscale AS wt)
+  -- Keep zero-weight rows in the analytic-weight sample size, but give them
+  -- harmless inputs before exponentials and cross-products: 0*Infinity is NaN.
+  SELECT r.* REPLACE (wt/ws.wscale AS wt,
+         CASE WHEN wt = 0 THEN list_transform(xs, lambda v: 0.0) ELSE xs END AS xs,
+         CASE WHEN wt = 0 THEN 1.0 ELSE y END AS y,
+         CASE WHEN wt = 0 THEN 0.0 ELSE off END AS off)
   FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc
        CROSS JOIN __reg_weightscale ws WHERE wc.ok
 ),
@@ -2916,7 +2934,12 @@ __reg_weightscale AS (
   SELECT coalesce(nullif(max(wt),0.0),1.0) AS wscale FROM __reg_rowsraw
 ),
 __reg_rows0 AS (
-  SELECT r.* REPLACE (wt/ws.wscale AS wt)
+  -- Keep zero-weight rows in the analytic-weight sample size, but give them
+  -- harmless inputs before exponentials and cross-products: 0*Infinity is NaN.
+  SELECT r.* REPLACE (wt/ws.wscale AS wt,
+         CASE WHEN wt = 0 THEN list_transform(xs, lambda v: 0.0) ELSE xs END AS xs,
+         CASE WHEN wt = 0 THEN 1.0 ELSE y END AS y,
+         CASE WHEN wt = 0 THEN 0.0 ELSE off END AS off)
   FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc
        CROSS JOIN __reg_weightscale ws WHERE wc.ok
 ),
@@ -3127,7 +3150,12 @@ __reg_weightscale AS (
   SELECT coalesce(nullif(max(wt),0.0),1.0) AS wscale FROM __reg_rowsraw
 ),
 __reg_rows0 AS (
-  SELECT r.* REPLACE (wt/ws.wscale AS wt)
+  -- Keep zero-weight rows in the analytic-weight sample size, but give them
+  -- harmless inputs before exponentials and cross-products: 0*Infinity is NaN.
+  SELECT r.* REPLACE (wt/ws.wscale AS wt,
+         CASE WHEN wt = 0 THEN list_transform(xs, lambda v: 0.0) ELSE xs END AS xs,
+         CASE WHEN wt = 0 THEN 1.0 ELSE y END AS y,
+         CASE WHEN wt = 0 THEN 0.0 ELSE off END AS off)
   FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc
        CROSS JOIN __reg_weightscale ws WHERE wc.ok
 ),

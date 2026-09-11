@@ -537,3 +537,29 @@ def test_subnormal_nb_dispersion_preserves_poisson_scoring_limit(con,alpha,eta):
     for name in ['loglik','deviance','null_deviance','aic','bic']:
         assert np.isfinite(actual[name])
         assert actual[name]==pytest.approx(expected[name],rel=1e-12,abs=1e-11)
+
+
+@pytest.mark.parametrize('scale', [1e160, 1e-170, 1e-305, 4e307])
+def test_linear_metrics_preserve_extreme_finite_residual_units(con, scale):
+    con.execute("CREATE TABLE model AS SELECT '(Intercept)' feature,0.0 coefficient UNION ALL SELECT 'x',0.0")
+    con.execute('CREATE TABLE observations AS SELECT i::DOUBLE x,(1+i)*? y FROM range(4)t(i)', [scale])
+    metrics = _metrics(con, "linreg_evaluate('model','observations','y')")
+    expected_ll = -2 * (np.log(2*np.pi) + 2*np.log(scale) + np.log(7.5) + 1)
+    assert metrics['rmse']/scale == pytest.approx(np.sqrt(7.5), rel=1e-12)
+    assert metrics['mae']/scale == pytest.approx(2.5, rel=1e-12)
+    assert metrics['r2'] == pytest.approx(-5.0, abs=1e-12)
+    assert metrics['adj_r2'] == pytest.approx(-8.0, abs=1e-12)
+    assert metrics['loglik'] == pytest.approx(expected_ll, abs=1e-10)
+    assert metrics['aic'] == pytest.approx(-2*expected_ll + 4, abs=1e-10)
+    assert metrics['bic'] == pytest.approx(-2*expected_ll + 2*np.log(4), abs=1e-10)
+
+
+@pytest.mark.parametrize('scale', [1e160, 1e-170, 1e-305])
+def test_exact_linear_fit_retains_r_squared_at_extreme_units(con, scale):
+    con.execute("CREATE TABLE model AS SELECT '(Intercept)' feature,0.0 coefficient UNION ALL SELECT 'x',1.0")
+    con.execute('CREATE TABLE observations AS SELECT i*? x,i*? y FROM range(4)t(i)', [scale, scale])
+    metrics = _metrics(con, "linreg_evaluate('model','observations','y')")
+    assert metrics['rmse'] == 0.0
+    assert metrics['r2'] == 1.0
+    assert metrics['adj_r2'] == 1.0
+    assert metrics['loglik'] == np.inf

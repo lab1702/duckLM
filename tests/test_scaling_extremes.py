@@ -14,6 +14,27 @@ def con():
         yield connection
 
 
+@pytest.mark.parametrize('scale', [1e-305, 1e-310])
+@pytest.mark.parametrize('solver', ['auto', 'gd'])
+@pytest.mark.parametrize('weighted', [False, True])
+def test_tiny_linear_outcomes_remain_standardized_in_gradient_fallback(con, scale, solver, weighted):
+    weight = ',(i+1)::DOUBLE w' if weighted else ''
+    argument = ",weights_col:='w'" if weighted else ''
+    con.execute(f'CREATE TABLE tiny AS SELECT i::DOUBLE x,1.0 constant,(1.0+2*i)*? y{weight} FROM range(4)t(i)', [scale])
+    con.execute(f"CREATE TABLE tiny_model AS SELECT * FROM linreg_fit('tiny','y',solver:='{solver}'{argument})")
+    predictions = con.execute("SELECT prediction/? AS scaled_prediction FROM linreg_predict('tiny_model','tiny') ORDER BY x", [scale]).fetchnumpy()['scaled_prediction']
+    np.testing.assert_allclose(predictions, [1, 3, 5, 7], rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize('family', ['poisson', 'gamma', 'tweedie', 'nbinom'])
+@pytest.mark.parametrize('scale', [1e-305, 1e-310])
+def test_tiny_log_link_outcomes_keep_positive_mean_scaling(con, family, scale):
+    con.execute('CREATE TABLE tiny AS SELECT i::DOUBLE x,exp(.2+.1*i)*? y FROM range(6)t(i)', [scale])
+    coefficients = dict(con.execute(f"SELECT * FROM {family}_fit('tiny','y',max_iter:=1000)").fetchall())
+    assert coefficients['x'] == pytest.approx(.1, abs=1e-9)
+    assert coefficients['(Intercept)'] == pytest.approx(.2+np.log(scale), abs=1e-9)
+
+
 @pytest.mark.parametrize('scale', [1e-170,1e170])
 @pytest.mark.parametrize('family', ['linreg','logit','poisson','gamma','tweedie','nbinom'])
 @pytest.mark.parametrize('weighted', [False,True])

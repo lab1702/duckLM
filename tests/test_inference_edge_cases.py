@@ -35,6 +35,36 @@ def training():
     return pd.DataFrame({"x": x, "y": rng.poisson(np.exp(0.3 + 0.2 * x)).astype(float)})
 
 
+@pytest.mark.parametrize('family', ['linreg', 'logit', 'poisson', 'gamma', 'tweedie', 'nbinom'])
+@pytest.mark.parametrize('extreme_column', ['x', 'expo', 'y'])
+def test_zero_weight_extremes_cannot_contaminate_inference(con, family, extreme_column):
+    model(con)
+    outcome = 'i%2' if family == 'logit' else '1.0+i%3'
+    con.execute(f'CREATE TABLE positive AS SELECT i/10.0 x,({outcome})::DOUBLE y,0.0::DOUBLE expo,1.0 w,i%3 grp FROM range(12)t(i)')
+    con.execute('CREATE TABLE benign AS SELECT * FROM positive UNION ALL SELECT 0,1,0,0,0')
+    con.execute('CREATE TABLE extreme AS SELECT * FROM benign')
+    # Logistic outcomes stay binary; the other families allow large positive y.
+    value = 1.0 if family == 'logit' and extreme_column == 'y' else 1e308
+    con.execute(f'UPDATE extreme SET {extreme_column}=? WHERE w=0', [value])
+    args = "weights_col:='w',offset_col:='expo'"
+    # Compare the same analytic-weight row count and cluster membership.
+    for extra in ["robust:='none'", "robust:='hc0'", "robust:='hc1'", "robust:='hc2'", "robust:='hc3'", "cluster_col:='grp'"]:
+        expected = con.execute(f"SELECT * FROM {family}_summary('edge_model','benign','y',{args},{extra})").df()
+        actual = con.execute(f"SELECT * FROM {family}_summary('edge_model','extreme','y',{args},{extra})").df()
+        assert np.isfinite(actual['std_error']).all()
+        pd.testing.assert_frame_equal(actual, expected)
+    intervals = []
+    diagnostics = []
+    for table in ['benign', 'extreme']:
+        intervals.append(con.execute(f"SELECT prediction,conf_low,conf_high FROM {family}_predict_ci('edge_model','{table}','y',newdata:='positive',{args})").df())
+        diagnostics.append(con.execute(f"SELECT hat,pearson_resid,deviance_resid,std_resid,cooks_distance FROM {family}_influence('edge_model','{table}','y',{args})").df())
+    pd.testing.assert_frame_equal(intervals[0], intervals[1])
+    pd.testing.assert_frame_equal(diagnostics[0], diagnostics[1])
+    assert np.isfinite(intervals[1].to_numpy()).all()
+    assert np.isfinite(diagnostics[1].to_numpy()).all()
+    assert (diagnostics[1].iloc[-1] == 0.0).all()
+
+
 @pytest.mark.parametrize("macro", ["linreg_summary", "linreg_predict_ci", "linreg_influence", "multinom_summary"])
 @pytest.mark.parametrize("table_name", ["mdl", "beta", "num", "final"])
 @pytest.mark.parametrize("table_role", ["training", "model"])
