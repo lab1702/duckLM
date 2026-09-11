@@ -215,3 +215,23 @@ def test_logit_null_likelihood_stays_finite_with_extreme_offsets(con):
     con.execute('CREATE TABLE extreme_null_data AS SELECT * FROM (VALUES (0.0,100.0),(1.0,-100.0)) t(y,expo)')
     result = _metrics(con,"logit_evaluate('extreme_null_model','extreme_null_data','y',offset_col:='expo')")
     assert result['null_deviance'] == pytest.approx(400.0)
+    assert result['deviance'] == pytest.approx(400.0)
+    assert result['loglik'] == pytest.approx(-200.0)
+    assert result['log_loss'] == pytest.approx(100.0)
+    assert result['pseudo_r2'] == pytest.approx(0.0)
+    assert result['aic'] == pytest.approx(402.0)
+    assert result['bic'] == pytest.approx(400.0+np.log(2))
+
+
+def test_multinomial_scoring_reuses_one_snapshot(con):
+    con.execute('SELECT setseed(.42)')
+    con.execute("CREATE TABLE snapshot_model AS SELECT * FROM (VALUES ('a','(Intercept)',0.),('a','x',0.),('b','(Intercept)',0.),('b','x',1.))t(class,feature,coefficient)")
+    con.execute("CREATE VIEW changing_order AS SELECT i::DOUBLE-10 x, CASE WHEN i>=10 THEN 'b' ELSE 'a' END y FROM range(20)t(i) ORDER BY random()")
+    scored = con.execute("SELECT x,probs['b'] FROM multinom_predict('snapshot_model','changing_order')").fetchall()
+    for x, probability in scored:
+        assert probability == pytest.approx(1/(1+np.exp(-x)),abs=1e-14)
+    metrics = _metrics(con,"multinom_evaluate('snapshot_model','changing_order','y')")
+    assert metrics['n'] == 20
+    # The x=0 tie may choose either class; every other label must match.
+    assert metrics['accuracy'] in (.95,1.0)
+    assert metrics['log_loss'] == pytest.approx(np.logaddexp(0,-np.abs(np.arange(20)-10)).mean())

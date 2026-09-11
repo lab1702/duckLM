@@ -291,3 +291,39 @@ def test_student_t_quantile_boundaries(con):
     assert con.execute("SELECT isnan(t_ppf(-.1,2)),isnan(t_ppf(.5,0)),isnan(t_ppf(.5,'NaN'::DOUBLE))").fetchone() == (True,True,True)
     assert con.execute('SELECT t_ppf(0,2),t_ppf(1,2)').fetchone() == (-float('inf'),float('inf'))
     assert con.execute("SELECT t_ppf(.975,'Infinity'::DOUBLE)").fetchone()[0] == pytest.approx(norm.ppf(.975))
+
+
+@pytest.mark.parametrize('family,expected_se', [('linreg',1/6),('logit',np.sqrt(.4)),('poisson',1/np.sqrt(20)),('gamma',1/6),('tweedie',1/6),('nbinom',np.sqrt(3/20))])
+def test_intercept_only_inference_retains_observations(con,family,expected_se):
+    from scipy.stats import norm,t
+    b0 = .5 if family=='linreg' else 0.0 if family=='logit' else np.log(2)
+    con.execute("CREATE TABLE only_intercept AS SELECT '(Intercept)' feature,?::DOUBLE coefficient",[b0])
+    yexpr = 'i%2' if family in ('linreg','logit') else '1+2*(i%2)'
+    con.execute(f'CREATE TABLE intercept_data AS SELECT i x,({yexpr})::DOUBLE y FROM range(10)t(i)')
+    summary = con.execute(f"SELECT * FROM {family}_summary('only_intercept','intercept_data','y')").fetchall()
+    assert len(summary)==1
+    assert summary[0][2] == pytest.approx(expected_se)
+    critical=t.ppf(.975,9) if family in ('linreg','gamma','tweedie') else norm.ppf(.975)
+    assert summary[0][-2:] == pytest.approx((b0-critical*expected_se,b0+critical*expected_se))
+    ci=con.execute(f"SELECT prediction,conf_low,conf_high FROM {family}_predict_ci('only_intercept','intercept_data','y')").fetchall()
+    assert len(ci)==10
+    inverse=(lambda z:z) if family=='linreg' else (lambda z:1/(1+np.exp(-z))) if family=='logit' else np.exp
+    assert ci[0] == pytest.approx(tuple(inverse(z) for z in [b0,b0-critical*expected_se,b0+critical*expected_se]))
+    leverage=con.execute(f"SELECT hat FROM {family}_influence('only_intercept','intercept_data','y')").fetchnumpy()['hat']
+    assert len(leverage)==10
+    assert leverage.sum() == pytest.approx(1.0)
+
+
+def test_normal_quantile_boundaries(con):
+    assert con.execute('SELECT norm_ppf(0),norm_ppf(1),norm_ppf(NULL)').fetchone()==(-float('inf'),float('inf'),None)
+    assert con.execute("SELECT isnan(norm_ppf(-.1)),isnan(norm_ppf(1.1)),isnan(norm_ppf('NaN'::DOUBLE))").fetchone()==(True,True,True)
+    assert con.execute("SELECT t_ppf(0,'Infinity'::DOUBLE),t_ppf(1,'Infinity'::DOUBLE)").fetchone()==(-float('inf'),float('inf'))
+
+
+def test_multinomial_intercept_only_summary(con):
+    con.execute("CREATE TABLE class_intercepts AS SELECT * FROM (VALUES ('a','(Intercept)',0.),('b','(Intercept)',0.)) t(class,feature,coefficient)")
+    con.execute("CREATE TABLE class_data AS SELECT i x,CASE WHEN i%2=0 THEN 'a' ELSE 'b' END y FROM range(10)t(i)")
+    rows=con.execute("SELECT class,feature,std_error FROM multinom_summary('class_intercepts','class_data','y')").fetchall()
+    assert len(rows)==1
+    assert rows[0][:2]==('b','(Intercept)')
+    assert rows[0][2]==pytest.approx(np.sqrt(.4))

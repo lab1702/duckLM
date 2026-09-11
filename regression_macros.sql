@@ -966,7 +966,7 @@ __reg_agg AS (
            avg(y) AS ybar,
            sum((y - yhat) * (y - yhat)) AS sse,
            sum(abs(y - yhat)) AS sae,
-           sum(y * ln(greatest(yhat, 1e-15)) + (1 - y) * ln(greatest(1 - yhat, 1e-15))) AS ll_bin,
+           sum(-y*greatest(-z,0.0) - (1-y)*greatest(z,0.0) - ln(1.0+exp(-abs(z)))) AS ll_bin,
            avg(CASE WHEN (yhat >= 0.5) = (y >= 0.5) THEN 1.0 ELSE 0.0 END) AS accuracy,
            sum(y * ln(yhat) - yhat - lgamma(y + 1)) AS ll_pois,
            sum((CASE WHEN y > 0 THEN y * ln(y / yhat) ELSE 0.0 END) - (y - yhat)) AS dev_pois_half,
@@ -1363,9 +1363,10 @@ ORDER BY class, (feature = '(Intercept)') DESC, feature;
 
 -- Shared softmax scorer used by multinom_predict / multinom_evaluate: returns
 -- (rid, class, p) with p the class probability (NULL if a feature is missing).
+-- tbl is the caller's materialized relation with __reg_rid__ already assigned.
 CREATE OR REPLACE MACRO __reg_msoftmax(model, tbl) AS TABLE
 WITH
-__reg_mnum AS (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+__reg_mnum AS MATERIALIZED (SELECT * FROM query_table(tbl)),
 __reg_mlong AS (
   SELECT __reg_rid__ AS rid, name AS col, value AS v
   FROM (UNPIVOT (SELECT __reg_rid__, TRY_CAST(COLUMNS(* EXCLUDE (__reg_rid__)) AS DOUBLE) FROM __reg_mnum)
@@ -1389,7 +1390,7 @@ SELECT rid, class,
 FROM __reg_meta2;
 
 CREATE OR REPLACE MACRO multinom_predict(model, tbl) AS TABLE
-WITH __reg_mnum AS (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+WITH __reg_minput AS MATERIALIZED (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
 __reg_mncheck AS (
   SELECT CASE WHEN coalesce(bool_or(lower(colname) IN ('pred', 'probs')), false)
               THEN error('multinom_predict: the input table already has a "pred" or "probs" column; rename or drop it first (e.g. SELECT * EXCLUDE (pred, probs))')
@@ -1400,26 +1401,26 @@ __reg_mncheck AS (
 ),
 __reg_magg AS (
   SELECT rid, arg_max(class, p) AS pred, map(list(class ORDER BY class), list(p ORDER BY class)) AS probs
-  FROM __reg_msoftmax(model, tbl) GROUP BY rid
+  FROM __reg_msoftmax(model, '__reg_minput') GROUP BY rid
 )
 SELECT n.* EXCLUDE (__reg_rid__), a.pred AS pred, a.probs AS probs
-FROM __reg_mnum n LEFT JOIN __reg_magg a ON a.rid = n.__reg_rid__
+FROM __reg_minput n LEFT JOIN __reg_magg a ON a.rid = n.__reg_rid__
 WHERE (SELECT ok FROM __reg_mncheck)
 ORDER BY n.__reg_rid__;
 
 CREATE OR REPLACE MACRO multinom_evaluate(model, tbl, outcome) AS TABLE
 WITH
-__reg_mnum AS (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+__reg_minput AS MATERIALIZED (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
 __reg_mtrue AS (
   SELECT __reg_rid__ AS rid, val AS lab
-  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != '__reg_rid__') AS VARCHAR) FROM __reg_mnum)
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != '__reg_rid__') AS VARCHAR) FROM __reg_minput)
         ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE val)
   WHERE name = outcome
 ),
 __reg_mrm AS (
   SELECT s.rid, max(CASE WHEN s.class = t.lab THEN s.p END) AS p_true,
          arg_max(s.class, s.p) AS pred, any_value(t.lab) AS truelab
-  FROM __reg_msoftmax(model, tbl) s JOIN __reg_mtrue t ON t.rid = s.rid
+  FROM __reg_msoftmax(model, '__reg_minput') s JOIN __reg_mtrue t ON t.rid = s.rid
   WHERE s.p IS NOT NULL GROUP BY s.rid
 )
 SELECT count(*)::BIGINT AS n,
@@ -1505,6 +1506,13 @@ __reg_cv_chk AS (
       THEN error('cv: no complete (non-NULL) rows to train on')
     WHEN family NOT IN ('linear','logistic','poisson','gamma','tweedie','nbinom')
       THEN error('cv: unsupported family ' || family)
+    WHEN family = 'logistic' AND EXISTS (SELECT 1 FROM __reg_cv_yraw WHERE y NOT IN (0,1))
+      THEN error('cv: outcome must be binary (0/1 or boolean)')
+    WHEN family IN ('poisson','nbinom','tweedie') AND EXISTS (SELECT 1 FROM __reg_cv_yraw WHERE y < 0)
+      THEN error('cv: outcome must be non-negative')
+    WHEN (family = 'gamma' OR (family = 'tweedie' AND sweep = 'power' AND list_aggregate(grid,'max') >= 2))
+         AND EXISTS (SELECT 1 FROM __reg_cv_yraw WHERE y <= 0)
+      THEN error('cv: outcome must be strictly positive for Gamma or Tweedie power >= 2')
     WHEN k < 2 THEN error('cv: k must be >= 2')
     WHEN len(grid) < 1 THEN error('cv: grid must be non-empty')
     WHEN sweep IN ('l2','l1') AND list_aggregate(grid,'min') < 0 THEN error('cv: penalty values must be >= 0')
@@ -2084,8 +2092,12 @@ CREATE OR REPLACE MACRO __reg_norm_ppf_halley(x0, p) AS (
 -- evaluated once and the body refers to a cheap lambda variable. Same result to
 -- the last bit; binding drops to ~6ms.
 CREATE OR REPLACE MACRO norm_ppf(p) AS (
-  list_transform([p::DOUBLE], pp ->
-    list_transform([__reg_norm_ppf_raw(pp)], x0 -> __reg_norm_ppf_halley(x0, pp))[1]
+  list_transform([p::DOUBLE], lambda pp:
+    CASE WHEN pp IS NULL THEN NULL
+         WHEN isnan(pp) OR pp < 0 OR pp > 1 THEN 'NaN'::DOUBLE
+         WHEN pp = 0 THEN '-Infinity'::DOUBLE
+         WHEN pp = 1 THEN 'Infinity'::DOUBLE
+         ELSE list_transform([__reg_norm_ppf_raw(pp)], lambda x0: __reg_norm_ppf_halley(x0, pp))[1] END
   )[1]
 );
 
@@ -2212,9 +2224,9 @@ __reg_mdlj AS (SELECT feature, row_number() OVER (ORDER BY feature) AS j
          FROM __reg_mdl WHERE feature != '(Intercept)'),
 __reg_beta AS (
   SELECT ([ coalesce((SELECT coefficient FROM __reg_mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
-          || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS bvec,
+          || coalesce(list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)'), []::DOUBLE[])) AS bvec,
          ([ '(Intercept)' ]
-          || list(feature ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS names,
+          || coalesce(list(feature ORDER BY feature) FILTER (WHERE feature != '(Intercept)'), []::VARCHAR[])) AS names,
          (count(*) FILTER (WHERE feature != '(Intercept)'))::INT AS k
   FROM __reg_mdl CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok
 ),
@@ -2239,6 +2251,9 @@ __reg_feat AS (
   SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
   FROM __reg_alllong l JOIN __reg_mdlj m ON m.feature = l.col
   GROUP BY l.__reg_rid__
+  UNION ALL
+  SELECT __reg_rid__, [1.0::DOUBLE], 0::INT FROM __reg_num
+  WHERE NOT EXISTS (SELECT 1 FROM __reg_mdlj)
 ),
 __reg_rows0 AS (
   SELECT f.__reg_rid__, f.xs, y.y,
@@ -2510,7 +2525,7 @@ __reg_mdlj AS (SELECT feature, row_number() OVER (ORDER BY feature) AS j
          FROM __reg_mdl WHERE feature != '(Intercept)'),
 __reg_beta AS (
   SELECT ([ coalesce((SELECT coefficient FROM __reg_mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
-          || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS bvec,
+          || coalesce(list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)'), []::DOUBLE[])) AS bvec,
          (count(*) FILTER (WHERE feature != '(Intercept)'))::INT AS k
   FROM __reg_mdl CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok
 ),
@@ -2528,6 +2543,9 @@ __reg_feat AS (
   SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
   FROM __reg_alllong l JOIN __reg_mdlj m ON m.feature = l.col
   GROUP BY l.__reg_rid__
+  UNION ALL
+  SELECT __reg_rid__, [1.0::DOUBLE], 0::INT FROM __reg_num
+  WHERE NOT EXISTS (SELECT 1 FROM __reg_mdlj)
 ),
 __reg_rows0 AS (
   SELECT f.__reg_rid__, f.xs, y.y,
@@ -2606,6 +2624,9 @@ __reg_sfeat AS (
   SELECT l.__reg_srid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
   FROM __reg_salllong l JOIN __reg_mdlj m ON m.feature = l.col
   GROUP BY l.__reg_srid__
+  UNION ALL
+  SELECT __reg_srid__, [1.0::DOUBLE], 0::INT FROM __reg_snum
+  WHERE NOT EXISTS (SELECT 1 FROM __reg_mdlj)
 ),
 __reg_scored AS (
   SELECT sn.__reg_srid__,
@@ -2686,7 +2707,7 @@ __reg_mdlj AS (SELECT feature, row_number() OVER (ORDER BY feature) AS j
          FROM __reg_mdl WHERE feature != '(Intercept)'),
 __reg_beta AS (
   SELECT ([ coalesce((SELECT coefficient FROM __reg_mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
-          || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS bvec,
+          || coalesce(list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)'), []::DOUBLE[])) AS bvec,
          (count(*) FILTER (WHERE feature != '(Intercept)'))::INT AS k
   FROM __reg_mdl CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok
 ),
@@ -2702,6 +2723,9 @@ __reg_wv AS (SELECT __reg_rid__, v AS wt FROM __reg_alllong WHERE col = weights_
 __reg_feat AS (
   SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
   FROM __reg_alllong l JOIN __reg_mdlj m ON m.feature = l.col GROUP BY l.__reg_rid__
+  UNION ALL
+  SELECT __reg_rid__, [1.0::DOUBLE], 0::INT FROM __reg_num
+  WHERE NOT EXISTS (SELECT 1 FROM __reg_mdlj)
 ),
 __reg_rows0 AS (
   SELECT f.__reg_rid__, f.xs, y.y,
@@ -2810,14 +2834,14 @@ __reg_mdl AS (SELECT class, feature, coefficient FROM query_table(model)
               CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok),
 __reg_refc AS (SELECT min(class) AS ref FROM __reg_mdl),
 __reg_featnames AS (
-  SELECT [ '(Intercept)' ] || list(DISTINCT feature ORDER BY feature) FILTER (WHERE feature != '(Intercept)') AS fn
+  SELECT [ '(Intercept)' ] || coalesce(list(DISTINCT feature ORDER BY feature) FILTER (WHERE feature != '(Intercept)'), []::VARCHAR[]) AS fn
   FROM __reg_mdl
 ),
 -- beta vector per class ([intercept, features sorted]); non-reference classes ordered
 __reg_bpc AS (
   SELECT class,
          [ coalesce(max(coefficient) FILTER (WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
-         || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)') AS bvec
+         || coalesce(list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)'), []::DOUBLE[]) AS bvec
   FROM __reg_mdl GROUP BY class
 ),
 __reg_bmat AS (
@@ -2845,6 +2869,9 @@ __reg_feat AS (
   SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
   FROM __reg_alllong l JOIN __reg_mdlj m ON m.feature = l.col
   GROUP BY l.__reg_rid__
+  UNION ALL
+  SELECT __reg_rid__, [1.0::DOUBLE], 0::INT FROM __reg_num
+  WHERE NOT EXISTS (SELECT 1 FROM __reg_mdlj)
 ),
 -- per-row softmax probabilities for the non-reference classes
 __reg_probs AS (
