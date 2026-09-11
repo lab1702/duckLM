@@ -203,6 +203,19 @@ CREATE OR REPLACE MACRO __reg_cd(A, bvec, b0, g, d1, sweeps) AS (
   )
 );
 
+-- Limit nonlinear IRLS steps to five units of linear predictor change.
+-- A tiny initial mean can otherwise produce a huge finite Fisher step;
+-- later unit corrections then round away and falsely signal convergence.
+CREATE OR REPLACE MACRO __reg_irls_step(betas, proposed, rows, family) AS (
+  CASE WHEN family = 'linear' THEN proposed
+       ELSE list_transform([list_transform(proposed, lambda v,j: v-betas[j])], lambda delta:
+         list_transform([greatest(1.0,list_max(list_transform(rows,
+           lambda ob: CASE WHEN ob.w > 0 THEN abs(list_dot_product(ob.xs,delta)) ELSE 0.0 END))/5.0)], lambda damp:
+           CASE WHEN isfinite(damp) THEN list_transform(delta, lambda v,j: betas[j]+v/damp) END
+         )[1]
+       )[1] END
+);
+
 CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1, alpha, solver) AS TABLE
 WITH RECURSIVE
 -- Every column cast to DOUBLE, with a synthetic row id.
@@ -498,10 +511,10 @@ __reg_irls(it, betas, move) AS (
         -- the current iterate. The threshold is on the sum scale, matching the
         -- mean-loss objective the gd path minimises.
         SELECT it, betas,
-               CASE WHEN l1 = 0.0
+               __reg_irls_step(betas, CASE WHEN l1 = 0.0
                     THEN list_transform(__reg_matinv(XWXpen), lambda invrow: list_dot_product(invrow, XWr))
                     ELSE __reg_cd(XWXpen, XWr, betas, sumw * l1, len(betas), 100)
-               END AS betas_new
+               END, step_rows, family) AS betas_new
         FROM (
             SELECT it, betas, XWr, XWXpen, sumw
             FROM (
@@ -561,14 +574,15 @@ __reg_irls(it, betas, move) AS (
                 )
             )
         )
+        CROSS JOIN (SELECT rows AS step_rows FROM __reg_packed) __reg_step_data
     )
 ),
 -- Last irls iterate, and whether it converged and can be trusted. A singular X'WX (a constant
--- or perfectly collinear feature) returns NULL coefficients; complete
--- separation drives them to ~1e305. Both are rejected here, which is what makes
+-- or perfectly collinear feature) returns NULL coefficients; divergent or
+-- unconverged iterates are also rejected here, which is what makes
 -- solver := 'auto' fall back to gradient descent instead of returning garbage.
 -- Empty (=> ok false) when irls did not run at all, which is exactly the gate gd
--- wants: solver := 'gd' and the l1 > 0 path both need gd to run.
+-- wants: solver := 'gd' needs gd to run.
 __reg_irls_beta AS (SELECT betas, move FROM __reg_irls ORDER BY it DESC LIMIT 1),
 __reg_irls_ok AS (
     SELECT coalesce(
@@ -1056,7 +1070,9 @@ __reg_agg AS (
            sum(abs(y - yhat)) AS sae,
            sum(-y*greatest(-z,0.0) - (1-y)*greatest(z,0.0) - ln(1.0+exp(-abs(z)))) AS ll_bin,
            avg(CASE WHEN (yhat >= 0.5) = (y >= 0.5) THEN 1.0 ELSE 0.0 END) AS accuracy,
-           sum(y * z - yhat - lgamma(y + 1)) AS ll_pois,
+           sum(CASE WHEN y = 0 THEN -exp(z)
+                    ELSE -__reg_stirlerr(y)-0.5*(1.8378770664093453+ln(y))
+                         -__reg_tw_halfdev(y,z,1.0) END) AS ll_pois,
            sum(__reg_tw_halfdev(y,z,1.0)) AS dev_pois_half,
            sum(__reg_tw_halfdev(y,z,2.0)) AS dev_gam_half,
            sum(((y - yhat) / yhat) * ((y - yhat) / yhat)) AS pearson_gam,

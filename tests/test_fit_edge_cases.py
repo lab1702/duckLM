@@ -178,3 +178,29 @@ def test_fit_rejects_missing_and_nonfinite_penalties(con,family,penalty,value):
     con.execute(f'CREATE OR REPLACE TABLE penalty_data AS SELECT i::DOUBLE x,{outcome} y FROM range(6)t(i)')
     with pytest.raises(duckdb.Error,match=penalty+' must be.*finite'):
         con.execute(f"SELECT * FROM {family}_fit('penalty_data','y',{penalty}:={value})").fetchall()
+
+
+@pytest.mark.parametrize('family', ['poisson','gamma','tweedie','nbinom'])
+@pytest.mark.parametrize('solver', ['auto','irls'])
+@pytest.mark.parametrize('offset', [-40.,-100.])
+@pytest.mark.parametrize('l1', [0.,.1])
+def test_irls_does_not_false_converge_after_negative_offset_overshoot(con,family,solver,offset,l1):
+    con.execute('CREATE OR REPLACE TABLE offset_base AS SELECT i::DOUBLE x,1.0+i y,0.0 expo FROM range(4)t(i)')
+    con.execute(f'CREATE OR REPLACE TABLE offset_shifted AS SELECT x,y,{offset} expo FROM offset_base')
+    coefficients=[]
+    for table in ['offset_base','offset_shifted']:
+        con.execute(f"CREATE OR REPLACE TABLE offset_model AS SELECT * FROM {family}_fit('{table}','y',offset_col:='expo',solver:='{solver}',l1:={l1},max_iter:=300)")
+        coefficients.append(dict(con.execute('SELECT * FROM offset_model').fetchall()))
+        predictions=con.execute(f"SELECT prediction FROM {family}_predict('offset_model','{table}',offset_col:='expo')").fetchnumpy()['prediction']
+        assert np.isfinite(predictions).all()
+    coefficients[1]['(Intercept)']+=offset
+    assert coefficients[1]==pytest.approx(coefficients[0],rel=1e-7,abs=1e-7)
+
+
+@pytest.mark.parametrize('family', ['gamma','tweedie','nbinom'])
+def test_zero_weight_outlier_does_not_limit_irls_steps(con,family):
+    con.execute('CREATE OR REPLACE TABLE weighted_offsets AS SELECT i::DOUBLE x,1.0+i y,-40.0 expo,1.0 wt FROM range(4)t(i)')
+    call=f"SELECT * FROM {family}_fit('weighted_offsets','y',offset_col:='expo',weights_col:='wt')"
+    expected=dict(con.execute(call).fetchall())
+    con.execute('INSERT INTO weighted_offsets VALUES (1e100,1.,-40.,0.)')
+    assert dict(con.execute(call).fetchall())==pytest.approx(expected,rel=1e-10,abs=1e-10)

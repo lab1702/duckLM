@@ -472,3 +472,21 @@ def test_large_count_negative_binomial_likelihood_retains_normalization(con,y,r,
     metrics=_metrics(con,f"nbinom_evaluate('model','observations','y',alpha:={1/r})")
     assert metrics['loglik']==pytest.approx(expected,rel=1e-12,abs=1e-10)
     assert metrics['aic']==pytest.approx(-2*expected+2,rel=1e-12,abs=1e-10)
+
+
+@pytest.mark.parametrize('mean', [1e8,1e12,1e16])
+@pytest.mark.parametrize('relative_error', [0.,1e-7])
+def test_large_count_poisson_likelihood_retains_normalization(con,mean,relative_error):
+    eta=float(np.log(mean));y=float(mean*(1+relative_error))
+    con.execute("CREATE TABLE model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient",[eta])
+    con.execute('CREATE TABLE observations AS SELECT ?::DOUBLE y',[y])
+    with localcontext() as context:
+        context.prec=90
+        yy,zz=Decimal.from_float(y),Decimal.from_float(eta)
+        log2pi=Decimal('1.837877066409345483560659472811235279722794947275566825634303081')
+        logfactorial=(yy+Decimal('.5'))*yy.ln()-yy+log2pi/2+1/(12*yy)-1/(360*yy**3)
+        expected=float(yy*zz-zz.exp()-logfactorial)
+    metrics=_metrics(con,"poisson_evaluate('model','observations','y')")
+    assert metrics['loglik']==pytest.approx(expected,rel=1e-7,abs=1e-10)
+    assert metrics['aic']==pytest.approx(-2*expected+2,rel=1e-7,abs=1e-10)
+    assert metrics['bic']==pytest.approx(-2*expected,rel=1e-7,abs=1e-10)
