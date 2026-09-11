@@ -905,28 +905,41 @@ CREATE OR REPLACE MACRO __reg_log1p(x) AS (
 CREATE OR REPLACE MACRO __reg_softplus(x) AS (
   greatest(x,0.0) + __reg_log1p(exp(-abs(x)))
 );
-CREATE OR REPLACE MACRO __reg_nb_ll(y, eta, alpha) AS (
-  list_transform([y::DOUBLE], lambda yy:
-    list_transform([1.0/alpha], lambda r:
-      -- Stirling's gamma-ratio expansion avoids subtracting two huge lgammas.
-      (CASE WHEN r >= 1e6 THEN
-         (r+yy-0.5)*__reg_log1p(yy/r)-yy
-         + (1.0/(r+yy)-1.0/r)/12.0
-         - (pow(1.0/(r+yy),3)-pow(1.0/r,3))/360.0
-       ELSE lgamma(r+yy)-lgamma(r)-yy*ln(r) END)
-      - lgamma(yy+1.0) + yy*eta - (r+yy)*__reg_softplus(eta-ln(r))
-    )[1]
-  )[1]
+-- The remainder after Stirling's leading log-gamma terms. Keeping it
+-- separate preserves likelihood normalization when counts are very large.
+CREATE OR REPLACE MACRO __reg_stirlerr(x) AS (
+  CASE WHEN x < 16.0 THEN lgamma(x)-(x-0.5)*ln(x)+x-0.9189385332046727
+       ELSE list_transform([1.0/x/x], lambda v:
+         (1.0/12.0-v*(1.0/360.0-v*(1.0/1260.0-v*(1.0/1680.0
+          -v*(1.0/1188.0-v*(691.0/360360.0-v/156.0))))))/x)[1] END
+);
+-- Poisson half-deviance from a log mean/observation ratio, including tiny
+-- ratios that would be lost by first adding them to log(observation).
+CREATE OR REPLACE MACRO __reg_bd0_log(a, q) AS (
+  CASE WHEN abs(q) < 1e-3 THEN a*q*q*(0.5+q*(1.0/6.0+q*(1.0/24.0+q*(1.0/120.0+q/720.0))))
+       ELSE exp(ln(a)+q)-a-a*q END
 );
 CREATE OR REPLACE MACRO __reg_nb_halfdev(y, eta, alpha) AS (
-  list_transform([exp(eta)], lambda mu:
-    list_transform([alpha*(y-mu)/(1.0+alpha*mu)], lambda delta:
-      (CASE WHEN y > 0 THEN y*(ln(y)-eta) ELSE 0.0 END)
-      - (y+1.0/alpha) * (CASE WHEN isfinite(delta) AND abs(delta) < 0.5
-          THEN __reg_log1p(delta)
-          ELSE __reg_log1p(alpha*y)-__reg_softplus(ln(alpha)+eta) END)
-    )[1]
+  list_transform([1.0/alpha], lambda r:
+    CASE WHEN y = 0 THEN r*__reg_softplus(eta-ln(r))
+         ELSE list_transform([struct_pack(t := ln(y)-eta,
+                   w := 1.0/(1.0+exp(ln(y)-ln(r))),
+                   h := least(y,r)/(1.0+exp(-abs(ln(y)-ln(r)))))], lambda z:
+           CASE WHEN abs(z.t) < 1e-3 THEN z.h*z.t*z.t*(0.5+z.t*((1.0-2.0*z.w)/6.0
+                +z.t*((1.0-6.0*z.w+6.0*z.w*z.w)/24.0
+                +z.t*(1.0-2.0*z.w)*(1.0-12.0*z.w+12.0*z.w*z.w)/120.0)))
+                ELSE __reg_bd0_log(y,__reg_softplus(ln(r)-ln(y))-__reg_softplus(ln(r)-eta))
+                    +__reg_bd0_log(r,__reg_softplus(ln(y)-ln(r))-__reg_softplus(eta-ln(r))) END
+         )[1] END
   )[1]
+);
+CREATE OR REPLACE MACRO __reg_nb_ll(y, eta, alpha) AS (
+  list_transform([1.0/alpha], lambda r:
+    CASE WHEN y = 0 THEN -r*__reg_softplus(eta-ln(r))
+         ELSE __reg_stirlerr(y+r)-__reg_stirlerr(y)-__reg_stirlerr(r)
+              -0.5*(1.8378770664093453+ln(y)+__reg_softplus(ln(y)-ln(r)))
+              -__reg_nb_halfdev(y,eta,alpha) END
+    )[1]
 );
 
 -- exp(s) * (exp(a*x)-1)/a, continuous at a=0. Expand the small
@@ -1025,10 +1038,10 @@ __reg_evalcheck AS (
                 THEN error(caller || ': outcome must be strictly positive')
                 ELSE true END AS ok
 ),
--- AUC via the Mann-Whitney statistic on average ranks of yhat (logistic only).
+-- Rank the logits so sigmoid rounding cannot create artificial AUC ties.
 __reg_ranked AS (
-    SELECT y, avg(rn) OVER (PARTITION BY yhat) AS rk
-    FROM (SELECT y, yhat, row_number() OVER (ORDER BY yhat) AS rn FROM __reg_rows)
+    SELECT y, avg(rn) OVER (PARTITION BY z) AS rk
+    FROM (SELECT y, z, row_number() OVER (ORDER BY z) AS rn FROM __reg_rows)
 ),
 __reg_auc AS (
     SELECT CASE WHEN sum(y) = 0 OR sum(y) = count(*) THEN NULL
@@ -1044,8 +1057,8 @@ __reg_agg AS (
            sum(-y*greatest(-z,0.0) - (1-y)*greatest(z,0.0) - ln(1.0+exp(-abs(z)))) AS ll_bin,
            avg(CASE WHEN (yhat >= 0.5) = (y >= 0.5) THEN 1.0 ELSE 0.0 END) AS accuracy,
            sum(y * z - yhat - lgamma(y + 1)) AS ll_pois,
-           sum((CASE WHEN y > 0 THEN y * (ln(y) - z) ELSE 0.0 END) - (y - yhat)) AS dev_pois_half,
-           sum(-ln(y) + z + y * exp(-z) - 1.0) AS dev_gam_half,
+           sum(__reg_tw_halfdev(y,z,1.0)) AS dev_pois_half,
+           sum(__reg_tw_halfdev(y,z,2.0)) AS dev_gam_half,
            sum(((y - yhat) / yhat) * ((y - yhat) / yhat)) AS pearson_gam,
            -- Tweedie unit half-deviance and Pearson chi-square (power = p).
            sum(__reg_tw_halfdev(y,z,power)) AS dev_tw_half,
@@ -1070,7 +1083,7 @@ __reg_null_bounds(it, lo, hi) AS (
            (CASE WHEN family = 'logistic' THEN ln(a.ybar/(1.0-a.ybar)) ELSE ln(a.ybar) END) - d.omax,
            (CASE WHEN family = 'logistic' THEN ln(a.ybar/(1.0-a.ybar)) ELSE ln(a.ybar) END) - d.omin
     FROM __reg_agg a, __reg_null_data d
-    WHERE offset_col IS NOT NULL AND family NOT IN ('linear','tweedie') AND a.ybar > 0
+    WHERE offset_col IS NOT NULL AND family NOT IN ('linear','poisson','gamma','tweedie') AND a.ybar > 0
       AND (family != 'logistic' OR a.ybar < 1)
     UNION ALL
     SELECT it+1, CASE WHEN score > 0 THEN mid ELSE lo END,
@@ -1089,32 +1102,33 @@ __reg_null_bounds(it, lo, hi) AS (
             WHERE it < 80 AND lo < hi) b, __reg_null_data d
     )
 ),
--- Tweedie's intercept-only score has an analytic root for every power:
+-- The power-variance families have an analytic intercept-only score root:
 -- exp(b) = sum(y*exp((1-p)*offset)) / sum(exp((2-p)*offset)).
+-- Poisson and Gamma are the p=1 and p=2 cases.
 -- Shift each exponential sum by its maximum to keep extreme offsets finite.
 __reg_tw_null_terms AS (
-    SELECT CASE WHEN y > 0 THEN ln(y)+(1.0-power)*o END AS lognum,
-           (2.0-power)*o AS logden
-    FROM __reg_rows
-    WHERE family = 'tweedie' AND offset_col IS NOT NULL
+    SELECT CASE WHEN y > 0 THEN ln(y)+(1.0-pw)*o END AS lognum,
+           (2.0-pw)*o AS logden
+    FROM __reg_rows, (SELECT CASE family WHEN 'poisson' THEN 1.0 WHEN 'gamma' THEN 2.0 ELSE power END AS pw)
+    WHERE family IN ('poisson','gamma','tweedie') AND offset_col IS NOT NULL
       AND (SELECT ybar FROM __reg_agg) > 0
 ),
 __reg_null_intercept AS (
     (SELECT lo/2.0+hi/2.0 AS b FROM __reg_null_bounds ORDER BY it DESC LIMIT 1)
     UNION ALL
-    SELECT max(nmax)+ln(sum(exp(lognum-nmax)))
-           -max(dmax)-ln(sum(exp(logden-dmax))) AS b
+    SELECT (max(nmax)-max(dmax))
+           +(ln(sum(exp(lognum-nmax)))-ln(sum(exp(logden-dmax)))) AS b
     FROM (SELECT *, max(lognum) OVER () AS nmax, max(logden) OVER () AS dmax
           FROM __reg_tw_null_terms)
     HAVING count(*) > 0
 ),
 __reg_null_rows AS (
-    SELECT r.*, CASE WHEN offset_col IS NULL OR family = 'linear' OR a.ybar = 0
-                              OR (family = 'logistic' AND a.ybar = 1) THEN a.ybar
-                    WHEN family = 'logistic' THEN 1.0/(1.0+exp(-((SELECT b FROM __reg_null_intercept)+r.o)))
-                    ELSE exp((SELECT b FROM __reg_null_intercept)+r.o) END AS mu0,
-           CASE WHEN family = 'logistic' AND a.ybar > 0 AND a.ybar < 1
-                THEN CASE WHEN offset_col IS NULL THEN ln(a.ybar/(1.0-a.ybar))
+    SELECT r.*, CASE WHEN family = 'logistic'
+                THEN CASE WHEN a.ybar > 0 AND a.ybar < 1
+                          THEN CASE WHEN offset_col IS NULL THEN ln(a.ybar/(1.0-a.ybar))
+                                    ELSE (SELECT b FROM __reg_null_intercept)+r.o END END
+                WHEN family != 'linear' THEN CASE WHEN a.ybar = 0 THEN '-Infinity'::DOUBLE
+                          WHEN offset_col IS NULL THEN ln(a.ybar)
                           ELSE (SELECT b FROM __reg_null_intercept)+r.o END END AS z0
     FROM __reg_rows r, __reg_agg a
 ),
@@ -1124,12 +1138,12 @@ __reg_null AS (
            sum(CASE WHEN a.ybar IN (0, 1) THEN 0.0
                     ELSE -y*greatest(-r.z0,0.0) - (1-y)*greatest(r.z0,0.0)
                          - ln(1.0+exp(-abs(r.z0))) END) AS ll0_bin,
-           sum((CASE WHEN y > 0 THEN y * ln(y / r.mu0) ELSE 0.0 END) - (y - r.mu0)) AS null_dev_pois_half,
-           sum(-ln(y / r.mu0) + (y - r.mu0) / r.mu0) AS null_dev_gam_half,
-           sum(CASE WHEN y = 0 AND r.mu0 = 0 THEN 0.0
-                    ELSE __reg_tw_halfdev(y,ln(r.mu0),power) END) AS null_dev_tw_half,
-           sum(CASE WHEN y = 0 AND r.mu0 = 0 THEN 0.0
-                    ELSE __reg_nb_halfdev(y,ln(r.mu0),alpha) END) AS null_dev_nb_half
+           sum(__reg_tw_halfdev(y,r.z0,1.0)) AS null_dev_pois_half,
+           sum(__reg_tw_halfdev(y,r.z0,2.0)) AS null_dev_gam_half,
+           sum(CASE WHEN y = 0 AND r.z0 = '-Infinity'::DOUBLE THEN 0.0
+                    ELSE __reg_tw_halfdev(y,r.z0,power) END) AS null_dev_tw_half,
+           sum(CASE WHEN y = 0 AND r.z0 = '-Infinity'::DOUBLE THEN 0.0
+                    ELSE __reg_nb_halfdev(y,r.z0,alpha) END) AS null_dev_nb_half
     FROM __reg_null_rows r, __reg_agg a
 )
 SELECT
@@ -1161,9 +1175,10 @@ SELECT
                 WHEN 'gamma'    THEN 1.0 - a.dev_gam_half / nullif(greatest(0.0, nu.null_dev_gam_half), 0.0)
                 WHEN 'tweedie'  THEN 1.0 - a.dev_tw_half / nullif(greatest(0.0, nu.null_dev_tw_half), 0.0)
                 WHEN 'nbinom'   THEN 1.0 - a.dev_nb_half / nullif(greatest(0.0, nu.null_dev_nb_half), 0.0) END AS pseudo_r2,
-    CASE WHEN family = 'gamma'   THEN a.pearson_gam / (a.n - m.kparams)
+    CASE WHEN a.n > m.kparams THEN CASE
+         WHEN family = 'gamma'   THEN a.pearson_gam / (a.n - m.kparams)
          WHEN family = 'tweedie' THEN a.pearson_tw / (a.n - m.kparams)
-         WHEN family = 'nbinom'  THEN a.pearson_nb / (a.n - m.kparams) END AS dispersion,
+         WHEN family = 'nbinom'  THEN a.pearson_nb / (a.n - m.kparams) END END AS dispersion,
     CASE family WHEN 'linear'   THEN -2.0 * loglik + 2.0 * m.kparams
                 WHEN 'logistic' THEN -2.0 * a.ll_bin  + 2.0 * m.kparams
                 WHEN 'poisson'  THEN -2.0 * a.ll_pois + 2.0 * m.kparams
@@ -1888,9 +1903,9 @@ SELECT grid[g] AS param,
        sum(CASE family
              WHEN 'linear'   THEN pow(y - (mu_y + sd_y * eta), 2)
              WHEN 'logistic' THEN 2.0 * (y*greatest(-eta,0.0) + (1-y)*greatest(eta,0.0) + __reg_log1p(exp(-abs(eta))))
-             WHEN 'poisson'  THEN 2.0 * ((CASE WHEN y>0 THEN y*(ln(y)-z) ELSE 0.0 END) - (y - exp(z)))
-             WHEN 'gamma'    THEN 2.0 * (-ln(y) + z + y*exp(-z) - 1.0)
-             WHEN 'tweedie'  THEN 2.0 * (pow(greatest(y,0.0),2.0-pw)/((1.0-pw)*(2.0-pw)) - (CASE WHEN y=0 THEN 0.0 ELSE y*exp((1.0-pw)*z) END)/(1.0-pw) + exp((2.0-pw)*z)/(2.0-pw))
+             WHEN 'poisson'  THEN 2.0 * __reg_tw_halfdev(y,z,1.0)
+             WHEN 'gamma'    THEN 2.0 * __reg_tw_halfdev(y,z,2.0)
+             WHEN 'tweedie'  THEN 2.0 * __reg_tw_halfdev(y,z,pw)
              WHEN 'nbinom'   THEN 2.0 * __reg_nb_halfdev(y,z,al)
            END) / (SELECT n FROM __reg_cv_n) AS cv_deviance
 FROM __reg_cv_score
@@ -2591,8 +2606,8 @@ __reg_final AS (
          (robust != 'none' OR cluster_col IS NOT NULL) AS robactive,
          (dp.est AND dp.df > 0.0 AND robust = 'none' AND cluster_col IS NULL) AS uset,
          CASE WHEN dp.est AND dp.df > 0.0 AND robust = 'none' AND cluster_col IS NULL
-                THEN t_ppf(1.0-(1.0-conf_level)/2.0, dp.df)
-              ELSE norm_ppf(1.0-(1.0-conf_level)/2.0) END AS crit
+                THEN -t_ppf((1.0-conf_level)/2.0, dp.df)
+              ELSE -norm_ppf((1.0-conf_level)/2.0) END AS crit
   FROM __reg_beta b CROSS JOIN __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_disp dp CROSS JOIN __reg_robvar rv
        CROSS JOIN __reg_robchk rc WHERE rc.ok
 ),
@@ -2769,8 +2784,8 @@ __reg_disp AS (
 ),
 __reg_cparams AS (
   SELECT c.Rinv AS Rinv, s.dsc AS dsc, dp.phi AS phi, dp.uset AS uset, dp.df AS df,
-         CASE WHEN dp.uset THEN t_ppf(1.0-(1.0-conf_level)/2.0, dp.df)
-              ELSE norm_ppf(1.0-(1.0-conf_level)/2.0) END AS crit
+         CASE WHEN dp.uset THEN -t_ppf((1.0-conf_level)/2.0, dp.df)
+              ELSE -norm_ppf((1.0-conf_level)/2.0) END AS crit
   FROM __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_disp dp
 ),
 -- === score newdata (default = tbl) ===
@@ -2914,8 +2929,8 @@ __reg_pr AS (
          (CASE family
             WHEN 'logistic' THEN 2.0*(y*greatest(-eta,0.0)+(1-y)*greatest(eta,0.0)+__reg_log1p(exp(-abs(eta))))
             WHEN 'linear'   THEN (y-mu)*(y-mu)
-            WHEN 'poisson'  THEN 2.0*((CASE WHEN y>0 THEN y*(ln(y)-eta) ELSE 0.0 END) - y + exp(eta))
-            WHEN 'gamma'    THEN 2.0*(-ln(y)+eta+y*exp(-eta)-1.0)
+            WHEN 'poisson'  THEN 2.0*__reg_tw_halfdev(y,eta,1.0)
+            WHEN 'gamma'    THEN 2.0*__reg_tw_halfdev(y,eta,2.0)
             WHEN 'tweedie'  THEN 2.0*__reg_tw_halfdev(y,eta,power)
             WHEN 'nbinom'   THEN 2.0*__reg_nb_halfdev(y,eta,alpha) END) AS udev
   FROM (SELECT __reg_rid__, xs, wt, y, eta,
@@ -3121,7 +3136,7 @@ __reg_covinv AS (
 ),
 __reg_final AS (
   SELECT bm.B AS B, bm.cls AS cls, fn.fn AS fn, c.Rinv AS Rinv, s.dsc AS dsc,
-         dm.d AS d, norm_ppf(1.0-(1.0-conf_level)/2.0) AS crit
+         dm.d AS d, -norm_ppf((1.0-conf_level)/2.0) AS crit
   FROM __reg_bmat bm CROSS JOIN __reg_featnames fn CROSS JOIN __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_dims dm
 ),
 __reg_percoef AS (

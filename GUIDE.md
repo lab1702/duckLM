@@ -266,6 +266,9 @@ Linear R² retains the usual constant-mean baseline.
 and `bic` use *k* = number of model coefficients (intercept included). Gamma's
 log-likelihood/AIC depend on the dispersion parameter, so it reports deviance,
 deviance-based pseudo-R², and the Pearson `dispersion` instead.
+Gamma, Tweedie, and negative-binomial `dispersion` is `NULL` when the number
+of evaluated rows is no greater than the number of model coefficients, because
+the residual degrees of freedom are nonpositive. Other metrics remain available.
 
 A single-class logistic holdout still returns its accuracy and log loss;
 `auc` and `pseudo_r2` are undefined and returned as `NULL`. An exact linear

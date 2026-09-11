@@ -402,3 +402,73 @@ def test_tweedie_offset_null_deviance_matches_analytic_optimum(con, power, offse
     assert metrics['deviance'] == pytest.approx(expected, rel=1e-9)
     assert metrics['null_deviance'] == pytest.approx(expected, rel=1e-9)
     assert metrics['pseudo_r2'] == pytest.approx(0.0, abs=1e-9)
+
+
+@pytest.mark.parametrize('scores', [(40.,50.),(-800.,-750.),(800.,850.)])
+@pytest.mark.parametrize('labels,expected', [((0,1),1.),((1,0),0.),((0,1),.5)])
+def test_logistic_auc_preserves_extreme_score_order(con,scores,labels,expected):
+    if expected==.5:
+        scores=(scores[0],scores[0])
+    con.execute("CREATE TABLE model AS SELECT * FROM (VALUES ('(Intercept)',0.),('x',1.))t(feature,coefficient)")
+    con.execute('CREATE TABLE observations(x DOUBLE,y DOUBLE)')
+    con.executemany('INSERT INTO observations VALUES (?,?)',list(zip(scores,labels)))
+    assert _metrics(con,"logit_evaluate('model','observations','y')")['auc']==expected
+
+
+@pytest.mark.parametrize('family', ['gamma','tweedie','nbinom'])
+@pytest.mark.parametrize('n', [1,2])
+def test_holdout_dispersion_is_undefined_without_residual_degrees_of_freedom(con,family,n):
+    con.execute("CREATE TABLE model AS SELECT * FROM (VALUES ('(Intercept)',ln(2.)),('x',0.))t(feature,coefficient)")
+    con.execute(f'CREATE TABLE observations AS SELECT i::DOUBLE x,1.0 y FROM range({n})t(i)')
+    metrics=_metrics(con,f"{family}_evaluate('model','observations','y')")
+    assert metrics['dispersion'] is None
+    assert np.isfinite(metrics['deviance'])
+
+
+@pytest.mark.parametrize('mean', [1e12,1e16])
+@pytest.mark.parametrize('relative_error', [0.,1e-7])
+def test_poisson_deviance_is_stable_near_large_means(con,mean,relative_error):
+    eta=float(np.log(mean))
+    y=float(mean*(1+relative_error))
+    con.execute("CREATE TABLE model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient",[eta])
+    con.execute('CREATE TABLE observations AS SELECT ?::DOUBLE y',[y])
+    with localcontext() as context:
+        context.prec=80
+        yy,zz=Decimal.from_float(y),Decimal.from_float(eta)
+        expected=float(2*(yy*(yy.ln()-zz)-yy+zz.exp()))
+    actual=_metrics(con,"poisson_evaluate('model','observations','y')")['deviance']
+    assert actual>=0
+    assert actual==pytest.approx(expected,rel=1e-7,abs=1e-12)
+    residual=con.execute("SELECT deviance_resid FROM poisson_influence('model','observations','y')").fetchone()[0]
+    assert residual*residual==pytest.approx(expected,rel=1e-7,abs=1e-12)
+
+
+@pytest.mark.parametrize('family,power', [('poisson',None),('gamma',None),('nbinom',None),('tweedie',1.),('tweedie',2.)])
+def test_offset_null_deviance_preserves_extreme_log_scores(con,family,power):
+    y=.1 if family=='nbinom' else 1.
+    intercept=np.log(2*y/(1-y)) if family=='nbinom' else 800-np.log(2) if family=='gamma' or power==2 else np.log(2)
+    con.execute("CREATE TABLE model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient",[float(intercept)])
+    con.execute('CREATE TABLE observations AS SELECT ?::DOUBLE y,expo FROM (VALUES (-800.),(0.))t(expo)',[y])
+    extra='' if power is None else f',power:={power}'
+    metrics=_metrics(con,f"{family}_evaluate('model','observations','y',offset_col:='expo'{extra})")
+    assert np.isfinite(metrics['deviance'])
+    assert metrics['null_deviance']==pytest.approx(metrics['deviance'],rel=1e-10)
+    assert metrics['pseudo_r2']==pytest.approx(0.,abs=1e-10)
+
+
+@pytest.mark.parametrize('y', [1e8,1e12,1e16,1e100])
+@pytest.mark.parametrize('r', [1,2,10])
+@pytest.mark.parametrize('log_ratio', [-1.,0.,1.])
+def test_large_count_negative_binomial_likelihood_retains_normalization(con,y,r,log_ratio):
+    eta=float(np.log(y)+log_ratio)
+    con.execute("CREATE TABLE model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient",[eta])
+    con.execute('CREATE TABLE observations AS SELECT ?::DOUBLE y',[y])
+    with localcontext() as context:
+        context.prec=160
+        yy,rr,zz=Decimal.from_float(y),Decimal(r),Decimal.from_float(eta)
+        # For integer r, the gamma ratio is an exact short product even at huge y.
+        logcomb=sum(((yy+j)/j).ln() for j in range(1,r))
+        expected=float(logcomb+rr*(rr.ln()-(rr+zz.exp()).ln())+yy*(zz-(rr+zz.exp()).ln()))
+    metrics=_metrics(con,f"nbinom_evaluate('model','observations','y',alpha:={1/r})")
+    assert metrics['loglik']==pytest.approx(expected,rel=1e-12,abs=1e-10)
+    assert metrics['aic']==pytest.approx(-2*expected+2,rel=1e-12,abs=1e-10)

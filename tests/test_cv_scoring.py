@@ -38,6 +38,14 @@ def test_cv_alpha_equal_predictions_have_equal_scores(con):
     assert [score for _, score in rows] == pytest.approx([expected] * 5, rel=1e-9)
 
 
+@pytest.mark.parametrize('family', ['poisson','gamma','tweedie','nbinom'])
+@pytest.mark.parametrize('sweep', ['l1','l2'])
+def test_cv_deviance_stays_zero_for_perfect_large_count_predictions(con,family,sweep):
+    con.execute('CREATE TABLE large_constant AS SELECT (i%4)::DOUBLE x,1e16::DOUBLE y FROM range(16)t(i)')
+    rows=con.execute(f"SELECT cv_deviance FROM cv_{sweep}('large_constant','y','{family}',[0.,1.],k:=2)").fetchall()
+    np.testing.assert_allclose(rows,0.,atol=1e-10)
+
+
 @pytest.mark.parametrize("sweep,grid", [("power", "[1.0,1.5,2.0]"), ("alpha", "[0.1,1.0,10.0]")])
 def test_refinement_retains_the_same_scoring_scale(con, sweep, grid):
     coarse = con.execute(f"SELECT cv_deviance FROM cv_{sweep}('balanced','y',{grid})").fetchall()

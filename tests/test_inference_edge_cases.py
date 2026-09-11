@@ -451,3 +451,34 @@ def test_gamma_inference_is_invariant_to_outcome_scale(con,scale,family):
             if kind==1:
                 actual=actual/scale
             np.testing.assert_allclose(actual,expected,rtol=1e-8,atol=1e-10)
+
+
+@pytest.mark.parametrize('family', ['poisson','linreg','gamma','tweedie'])
+def test_intervals_preserve_confidence_levels_immediately_below_one(con,family):
+    from scipy.stats import norm,t
+    level=float(np.nextafter(1.,0.))
+    normal=family=='poisson'
+    critical=-norm.ppf((1-level)/2) if normal else -t.ppf((1-level)/2,11)
+    usual=norm.ppf(.975) if normal else t.ppf(.975,11)
+    coefficient=2. if family=='linreg' else np.log(2.)
+    con.execute('CREATE TABLE wide_data AS SELECT (1+i%3)::DOUBLE y FROM range(12)t(i)')
+    con.execute("CREATE TABLE wide_model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient",[float(coefficient)])
+    beta,se,lo,hi=con.execute(f"SELECT coefficient,std_error,conf_low,conf_high FROM {family}_summary('wide_model','wide_data','y',conf_level:=?)",[level]).fetchone()
+    np.testing.assert_allclose([lo,hi],[beta-critical*se,beta+critical*se],rtol=1e-10)
+    intervals=[]
+    for confidence in [.95,level]:
+        row=con.execute(f"SELECT prediction,conf_low,conf_high FROM {family}_predict_ci('wide_model','wide_data','y',conf_level:=?) LIMIT 1",[confidence]).fetchone()
+        intervals.append(np.array(row) if family=='linreg' else np.log(row))
+    prediction,low,high=intervals[0]
+    width=(high-low)/2/usual*critical
+    np.testing.assert_allclose(intervals[1],[prediction,prediction-width,prediction+width],rtol=1e-10)
+
+
+def test_multinomial_summary_preserves_confidence_level_immediately_below_one(con):
+    from scipy.stats import norm
+    level=float(np.nextafter(1.,0.))
+    con.execute("CREATE TABLE wide_multi_data AS SELECT CASE WHEN i%2=0 THEN 'a' ELSE 'b' END y FROM range(12)t(i)")
+    con.execute("CREATE TABLE wide_multi_model AS SELECT * FROM (VALUES ('a','(Intercept)',0.),('b','(Intercept)',0.))t(class,feature,coefficient)")
+    beta,se,lo,hi=con.execute("SELECT coefficient,std_error,conf_low,conf_high FROM multinom_summary('wide_multi_model','wide_multi_data','y',conf_level:=?)",[level]).fetchone()
+    critical=-norm.ppf((1-level)/2)
+    np.testing.assert_allclose([lo,hi],[beta-critical*se,beta+critical*se],rtol=1e-10)
