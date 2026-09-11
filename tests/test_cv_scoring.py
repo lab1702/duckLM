@@ -39,6 +39,44 @@ def test_linear_cv_scales_before_squaring_individual_residuals(con):
     assert actual/1e155/1e155 == pytest.approx(baseline, rel=1e-10)
 
 
+@pytest.mark.parametrize('sweep', ['l1', 'l2'])
+@pytest.mark.parametrize('scale', [1e153, 1e308])
+def test_linear_cv_does_not_reconstruct_overflowing_centered_predictions(con, sweep, scale):
+    con.execute('CREATE TABLE mixed_extremes AS SELECT CASE WHEN i%3=0 THEN -1. ELSE 1. END x,CASE WHEN i%3=0 THEN -1.5*? ELSE 1.5*? END y FROM range(12)t(i)', [scale, scale])
+    score = con.execute(f"SELECT cv_deviance FROM cv_{sweep}('mixed_extremes','y','linear',[0.],k:=2)").fetchone()[0]
+    # Squared roundoff residuals at 1e308 may exceed DOUBLE range. They may
+    # produce +Infinity, but must never turn a valid non-negative MSE into NaN.
+    assert score >= 0.0
+    if scale == 1e153:
+        assert np.isfinite(score)
+        assert score/scale/scale < 1e-28
+
+
+@pytest.mark.parametrize('lo,hi', [(0., 1e308), (-1e308, 1e308), (1e308, 0.)])
+@pytest.mark.parametrize('n', [3, 5, 7])
+def test_grid_interpolation_preserves_finite_extreme_bounds(con, lo, hi, n):
+    from decimal import Decimal, localcontext
+
+    with localcontext() as context:
+        context.prec = 80
+        expected = [float(Decimal(str(lo))*(1-Decimal(i)/(n-1)) + Decimal(str(hi))*Decimal(i)/(n-1)) for i in range(n)]
+    actual = con.execute('SELECT reg_grid(?,?,?)', [lo, hi, n]).fetchone()[0]
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(np.array(actual)/1e308, np.array(expected)/1e308, atol=1e-14)
+    assert actual[0] == lo and actual[-1] == hi
+
+
+@pytest.mark.parametrize('grid,winner,expected', [
+    ([0.,1e308], 0., [0.,2.5e307,5e307,7.5e307,1e308]),
+    ([-1e308,0.,1e308], 0., [-1e308,-5e307,0.,5e307,1e308]),
+])
+def test_refinement_interpolates_large_neighbors_and_retains_winner(con, grid, winner, expected):
+    actual = con.execute('SELECT __reg_refine_grid(?,?,5)', [grid, winner]).fetchone()[0]
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(np.array(actual)/1e308, np.array(expected)/1e308, atol=1e-14)
+    assert winner in actual
+
+
 def test_cv_power_equal_predictions_have_equal_scores_including_endpoints(con):
     rows = con.execute(
         "SELECT * FROM cv_power('balanced','y',[1.0,1.3,1.5,1.7,2.0])"

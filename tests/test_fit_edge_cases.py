@@ -7,6 +7,38 @@ import numpy as np
 import pytest
 
 
+def test_multinomial_high_leverage_logits_match_stable_likelihood():
+    from scipy.optimize import minimize
+    from scipy.special import logsumexp
+
+    counts = [(-1., 0, 7), (-1., 1, 3), (-1., 2, 1),
+              (0., 0, 4), (0., 1, 4), (0., 2, 4),
+              (1., 0, 1), (1., 1, 3), (1., 2, 7)]
+    observations = [(x, cl) for x, cl, n in counts for _ in range(n)] + [(1000., 2)]
+    x = np.column_stack([np.ones(len(observations)), [row[0] for row in observations]])
+    y = np.array([row[1] for row in observations])
+
+    def objective(beta):
+        logits = np.column_stack([np.zeros(len(y)), x @ beta.reshape(2, 2).T])
+        log_prob = logits - logsumexp(logits, axis=1, keepdims=True)
+        residual = np.exp(log_prob) - np.eye(3)[y]
+        return -log_prob[np.arange(len(y)), y].sum(), (residual[:, 1:].T @ x).ravel()
+
+    reference = minimize(objective, np.zeros(4), jac=True, method='BFGS', options={'gtol': 1e-9})
+    assert np.max(np.abs(reference.jac)) < 1e-6
+    with duckdb.connect() as connection:
+        connection.execute((Path(__file__).resolve().parents[1] / 'regression_macros.sql').read_text())
+        connection.execute('CREATE TABLE large_logits(x DOUBLE,y VARCHAR)')
+        connection.executemany('INSERT INTO large_logits VALUES (?,?)', [(v, str(cl)) for v, cl in observations])
+        rows = connection.execute("SELECT class,feature,coefficient FROM multinom_fit('large_logits','y')").fetchall()
+    coefficients = {(cl, feature): value for cl, feature, value in rows}
+    actual = np.array([coefficients[cl, feature] for cl in ['1', '2'] for feature in ['(Intercept)', 'x']])
+    # The default iteration cap can leave a small optimization error on this
+    # ill-conditioned sample, but class probabilities must use the true logits.
+    assert objective(actual)[0] <= reference.fun + 1e-5
+    assert np.max(np.abs(objective(actual)[1])) < .01
+
+
 @pytest.fixture(scope="module")
 def con():
     connection = duckdb.connect()

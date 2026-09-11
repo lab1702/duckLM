@@ -1632,10 +1632,12 @@ __reg_mgd AS (
         SELECT it, B, n, step, look,
              list_transform(rows, lambda rw: struct_pack(
                  xs := rw.xs,
-                 r := list_transform(rw.yv, lambda yvk, k:
-                        yvk - exp(least(list_dot_product(rw.xs, look[k]), 700.0))
-                              / (1.0 + list_sum(list_transform(look,
-                                    lambda bj: exp(least(list_dot_product(rw.xs, bj), 700.0)))))))) AS res
+                 -- Include the reference logit before shifting every class
+                 -- by the same maximum; separate clipping changes the odds.
+                 r := list_transform([list_transform(look,
+                        lambda bj: list_dot_product(rw.xs,bj)) || [0.0::DOUBLE]], lambda logits:
+                      list_transform([list_transform(logits,lambda v: exp(v-list_max(logits)))], lambda mass:
+                        list_transform(rw.yv,lambda yvk,k: yvk-mass[k]/list_sum(mass)))[1])[1])) AS res
       FROM (
         SELECT g.it, g.B, p.rows, p.n, c.step,
                list_transform(g.B, lambda bk, k:
@@ -2105,7 +2107,7 @@ __reg_cv_sol AS (
               ELSE (SELECT B FROM __reg_cv_irls_beta) END AS B
 ),
 __reg_cv_score AS (
-  SELECT gg.g AS g, r.y AS y,
+  SELECT gg.g AS g, r.y AS y, r.yt AS yt,
          list_dot_product(r.xs, s.B[(gg.g - 1) * k + r.fold + 1]) AS eta,
          ys.mu_y AS mu_y, ys.sd_y AS sd_y,
          eta + ln(ys.sd_y) AS z,
@@ -2117,14 +2119,17 @@ __reg_cv_score AS (
   FROM __reg_cv_sol s, __reg_cv_rows r, __reg_cv_ys ys, range(1, len(grid)+1) gg(g)
 ),
 __reg_cv_errorunits AS (
-  SELECT *, coalesce(nullif(max(__reg_center_scale(y,mu_y+sd_y*eta))
+  -- Compute linear residuals before restoring outcome units. Reconstructing
+  -- mu_y + sd_y*eta can overflow even when the final prediction is finite.
+  SELECT *, coalesce(nullif(max(__reg_center_scale(yt,eta))
                            OVER (PARTITION BY g),0.0),1.0) AS eunit
   FROM __reg_cv_score
 )
 SELECT grid[g] AS param,
        CASE WHEN family = 'linear'
-            THEN (sum(pow(__reg_centered(y,mu_y+sd_y*eta,eunit),2))
-                  / (SELECT n FROM __reg_cv_n) * max(eunit)) * max(eunit)
+            THEN CASE WHEN sum(pow(__reg_centered(yt,eta,eunit),2)) = 0 THEN 0.0
+                 ELSE pow(__reg_mul_div(max(eunit),max(sd_y),
+                      1.0/sqrt(sum(pow(__reg_centered(yt,eta,eunit),2))/(SELECT n FROM __reg_cv_n))),2) END
             ELSE sum(CASE family
              WHEN 'logistic' THEN 2.0 * (y*greatest(-eta,0.0) + (1-y)*greatest(eta,0.0) + __reg_log1p(exp(-abs(eta))))
              WHEN 'poisson'  THEN 2.0 * __reg_tw_halfdev(y,z,1.0)
@@ -2332,11 +2337,22 @@ ORDER BY alpha;
 -- (widen it if the best lands on an endpoint and you expect the optimum beyond).
 -- ---------------------------------------------------------------------------
 
+-- Stable interpolation of finite bounds, including opposite-sign endpoints
+-- whose difference is outside DOUBLE range. Preserve endpoints exactly.
+CREATE OR REPLACE MACRO __reg_lerp(lo, hi, fraction) AS (
+  CASE WHEN fraction = 0 THEN lo::DOUBLE WHEN fraction = 1 THEN hi::DOUBLE
+       WHEN isfinite(hi::DOUBLE-lo::DOUBLE) THEN lo::DOUBLE+(hi::DOUBLE-lo::DOUBLE)*fraction
+       ELSE lo::DOUBLE*(1.0-fraction)+hi::DOUBLE*fraction END
+);
+CREATE OR REPLACE MACRO __reg_interval_fraction(lo, hi, value) AS (
+  CASE WHEN isfinite(hi-lo) THEN (value-lo)/(hi-lo)
+       ELSE (value/2.0-lo/2.0)/(hi/2.0-lo/2.0) END
+);
 -- linear or log-spaced grid of n points spanning [lo, hi]
 CREATE OR REPLACE MACRO reg_grid(lo, hi, n, log_spaced := false) AS (
   CASE WHEN n < 2 THEN [lo::DOUBLE]
-       WHEN log_spaced THEN list_transform(range(n), lambda i: exp(ln(lo) + (ln(hi)-ln(lo))*i/(n-1.0)))
-       ELSE list_transform(range(n), lambda i: lo + (hi-lo)*i/(n-1.0)) END
+       WHEN log_spaced THEN list_transform(range(n), lambda i: exp(__reg_lerp(ln(lo),ln(hi),i/(n-1.0))))
+       ELSE list_transform(range(n), lambda i: __reg_lerp(lo,hi,i/(n-1.0))) END
 );
 
 -- a finer grid of n points bracketing `best` between its neighbours in `grid`
@@ -2352,8 +2368,8 @@ CREATE OR REPLACE MACRO __reg_refine_grid(grid, best, n) AS (
                 THEN CASE WHEN winner-lo < hi-winner THEN [winner::DOUBLE,hi] ELSE [lo,winner::DOUBLE] END
               ELSE list_transform(range(n), lambda i:
                 CASE WHEN winner > lo AND winner < hi
-                           AND i = greatest(1,least(n-2,round((winner-lo)/(hi-lo)*(n-1))))
-                     THEN winner::DOUBLE ELSE lo + (hi-lo)*i/(n-1.0) END) END
+                           AND i = greatest(1,least(n-2,round(__reg_interval_fraction(lo,hi,winner)*(n-1))))
+                     THEN winner::DOUBLE ELSE __reg_lerp(lo,hi,i/(n-1.0)) END) END
   FROM nb
 );
 
