@@ -133,8 +133,11 @@
 -- Gauss-Jordan elimination folded over columns 1..d with list_reduce (the
 -- accumulator carries the augmented [A|I]). No pivoting -- intended for the
 -- symmetric positive-definite X'WX of the IRLS solver, whose pivots stay
--- positive. Used inside the IRLS recursive CTE, where a recursive-CTE inverse
--- cannot be nested.
+-- positive. A pivot at or below 1e-12 of its original diagonal signals
+-- numerical rank deficiency; return NULL rather than a finite but invalid
+-- inverse. The relative test is invariant to rescaling individual features.
+-- Used inside the IRLS recursive CTE, where a recursive-CTE inverse cannot
+-- be nested.
 CREATE OR REPLACE MACRO __reg_matinv(A) AS (
   list_transform(
     list_reduce(
@@ -142,9 +145,13 @@ CREATE OR REPLACE MACRO __reg_matinv(A) AS (
             row || list_transform(row, lambda v, j: CASE WHEN i = j THEN 1.0 ELSE 0.0 END))) ]
       || list_transform(range(1, len(A)+1), lambda i: struct_pack(k := i, M := [[0.0]]::DOUBLE[][])),
       (acc, e) -> struct_pack(k := e.k, M :=
-        list_transform(acc.M, lambda row, i:
-          CASE WHEN i = e.k THEN list_transform(acc.M[e.k], lambda v, j: v / acc.M[e.k][e.k])
-               ELSE list_transform(row, lambda v, j: v - row[e.k]*(acc.M[e.k][j]/acc.M[e.k][e.k])) END))
+        CASE WHEN acc.M IS NULL OR NOT isfinite(acc.M[e.k][e.k])
+                    OR acc.M[e.k][e.k] <= 1e-12 * abs(A[e.k][e.k])
+               THEN NULL::DOUBLE[][]
+             ELSE list_transform(acc.M, lambda row, i:
+               CASE WHEN i = e.k THEN list_transform(acc.M[e.k], lambda v, j: v / acc.M[e.k][e.k])
+                    ELSE list_transform(row, lambda v, j: v - row[e.k]*(acc.M[e.k][j]/acc.M[e.k][e.k])) END)
+        END)
     ).M,
     lambda row: list_slice(row, len(A)+1, 2*len(A))
   )
@@ -375,7 +382,9 @@ __reg_ystats AS (
 -- offset), and w (sample weight). sumw is the total weight; the gradient is
 -- (1/sumw) * sum_i w_i xs_ij r_i.
 __reg_packed AS MATERIALIZED (
-    SELECT list(struct_pack(y := y, xs := xs, o := o, w := w)) AS rows,
+    -- Zero-weight observations do not participate in optimization, including
+    -- the curvature maximum that damps gradient steps for log-link families.
+    SELECT list(struct_pack(y := y, xs := xs, o := o, w := w)) FILTER (WHERE w > 0) AS rows,
            count(*)::DOUBLE AS n,
            sum(w) AS sumw
     FROM (
@@ -557,7 +566,7 @@ __reg_irls(it, betas, move) AS (
     )
 ),
 -- Last irls iterate, and whether it can be trusted. A singular X'WX (a constant
--- or perfectly collinear feature) drives the coefficients to NaN; complete
+-- or perfectly collinear feature) returns NULL coefficients; complete
 -- separation drives them to ~1e305. Both are rejected here, which is what makes
 -- solver := 'auto' fall back to gradient descent instead of returning garbage.
 -- Empty (=> ok false) when irls did not run at all, which is exactly the gate gd
@@ -566,7 +575,7 @@ __reg_irls_beta AS (SELECT betas FROM __reg_irls ORDER BY it DESC LIMIT 1),
 __reg_irls_ok AS (
     SELECT coalesce(
              (SELECT list_aggregate(
-                        list_transform(betas, lambda v: isfinite(v) AND abs(v) < 1e100),
+                        list_transform(betas, lambda v: coalesce(isfinite(v) AND abs(v) < 1e100, false)),
                         'bool_and')
               FROM __reg_irls_beta),
              false) AS ok
@@ -1356,9 +1365,9 @@ CREATE OR REPLACE MACRO multinom_evaluate(model, tbl, outcome) AS TABLE
 WITH
 __reg_mnum AS (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
 __reg_mtrue AS (
-  SELECT rid, val AS lab
-  FROM (UNPIVOT (SELECT __reg_rid__ AS rid, CAST(COLUMNS(c -> c != '__reg_rid__') AS VARCHAR) FROM __reg_mnum)
-        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE val)
+  SELECT __reg_rid__ AS rid, val AS lab
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != '__reg_rid__') AS VARCHAR) FROM __reg_mnum)
+        ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE val)
   WHERE name = outcome
 ),
 __reg_mrm AS (
@@ -1619,8 +1628,8 @@ __reg_cv_irls_beta AS (SELECT B FROM __reg_cv_irls ORDER BY it DESC LIMIT 1),
 __reg_cv_irls_ok AS (
   SELECT coalesce(
            (SELECT list_aggregate(list_transform(B, lambda bm:
-                      list_aggregate(list_transform(bm,
-                          lambda v: isfinite(v) AND abs(v) < 1e100), 'bool_and')), 'bool_and')
+                      bm IS NOT NULL AND coalesce(list_aggregate(list_transform(bm,
+                          lambda v: coalesce(isfinite(v) AND abs(v) < 1e100, false)), 'bool_and'), false)), 'bool_and')
             FROM __reg_cv_irls_beta),
            false) AS ok
 ),
@@ -2357,9 +2366,10 @@ __reg_final AS (
 __reg_percoef AS (
   SELECT gs.i AS i, names[gs.i] AS feature, bvec[gs.i] AS coefficient, uset, df, crit,
          CASE WHEN robactive THEN
+                -- A singular design cannot identify coefficient uncertainty.
                 -- df <= 0 (saturated): robust variance is undefined; at n==d the
                 -- leverage h->1 makes hc2/hc3's sc^2/(1-h)^k a 0/0 finite artifact
-                CASE WHEN df > 0.0 AND isfinite(rv[gs.i]) AND rv[gs.i] > 0.0 THEN sqrt(rv[gs.i]) ELSE NULL END
+                CASE WHEN Rinv IS NOT NULL AND df > 0.0 AND isfinite(rv[gs.i]) AND rv[gs.i] > 0.0 THEN sqrt(rv[gs.i]) ELSE NULL END
               ELSE
                 CASE WHEN Rinv IS NOT NULL AND isfinite(phi * Rinv[gs.i][gs.i]) AND phi * Rinv[gs.i][gs.i] > 0.0
                      THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] ELSE NULL END
@@ -2420,6 +2430,10 @@ __reg_inputcheck AS (
               THEN error(caller || ': column names beginning with "__reg_" are reserved for internal use; please rename')
               WHEN EXISTS (SELECT 1 FROM __reg_scorecols WHERE starts_with(lower(colname), '__reg_'))
               THEN error(caller || ': column names beginning with "__reg_" are reserved for internal use; please rename')
+              WHEN EXISTS (SELECT 1 FROM __reg_scorecols WHERE lower(colname) IN ('prediction','conf_low','conf_high'))
+              THEN error(caller || ': input column "' ||
+                         (SELECT min(colname) FROM __reg_scorecols WHERE lower(colname) IN ('prediction','conf_low','conf_high')) ||
+                         '" collides with the output columns; rename or drop it first')
               WHEN weights_col IS NOT NULL AND weights_col NOT IN (SELECT colname FROM __reg_cols)
               THEN error(caller || ': weights column "' || weights_col || '" not found')
               ELSE true END AS ok
@@ -2592,6 +2606,10 @@ __reg_inputcheck AS (
               THEN error(caller || ': table names beginning with "__reg_" are reserved for internal use; please rename')
               WHEN EXISTS (SELECT 1 FROM __reg_cols WHERE starts_with(lower(colname), '__reg_'))
               THEN error(caller || ': column names beginning with "__reg_" are reserved for internal use; please rename')
+              WHEN EXISTS (SELECT 1 FROM __reg_cols WHERE lower(colname) IN ('hat','pearson_resid','deviance_resid','std_resid','cooks_distance'))
+              THEN error(caller || ': input column "' ||
+                         (SELECT min(colname) FROM __reg_cols WHERE lower(colname) IN ('hat','pearson_resid','deviance_resid','std_resid','cooks_distance')) ||
+                         '" collides with the output columns; rename or drop it first')
               WHEN weights_col IS NOT NULL AND weights_col NOT IN (SELECT colname FROM __reg_cols)
               THEN error(caller || ': weights column "' || weights_col || '" not found')
               ELSE true END AS ok

@@ -206,3 +206,72 @@ def test_cluster_summary_ignores_unknown_groups_on_excluded_rows(con):
     actual = con.execute("SELECT * FROM poisson_summary('edge_model', 'edge_train', 'y', cluster_col := 'grp')").df()
     expected = con.execute("SELECT * FROM poisson_summary('edge_model', 'edge_complete', 'y', cluster_col := 'grp')").df()
     pd.testing.assert_frame_equal(actual, expected)
+
+
+def rank_deficient_data(con):
+    i = np.arange(20)
+    x = i / 10.0
+    z = ((i * 7) % 11) / 10.0
+    data = pd.DataFrame({"x": x, "z": z, "u": x + z,
+                         "y": 1.0 + 2.0 * x + 3.0 * z + 0.1 * (i % 3)})
+    coefficients = pd.DataFrame({"feature": ["(Intercept)", "u", "x", "z"],
+                                 "coefficient": [1.0, 0.5, 1.5, 2.5]})
+    load(con, "edge_train", data)
+    load(con, "edge_model", coefficients)
+    return data, coefficients
+
+
+@pytest.mark.parametrize("robust", ["hc0", "hc1", "hc2", "hc3", "cluster"])
+def test_rank_deficiency_nulls_robust_inference(con, robust):
+    data, coefficients = rank_deficient_data(con)
+    if robust == "cluster":
+        load(con, "edge_train", data.assign(grp=np.arange(len(data)) % 4))
+        extra = "cluster_col := 'grp'"
+    else:
+        extra = f"robust := '{robust}'"
+    result = con.execute(f"SELECT * FROM linreg_summary('edge_model', 'edge_train', 'y', {extra})").df()
+    assert result["feature"].tolist() == coefficients["feature"].tolist()
+    np.testing.assert_array_equal(result["coefficient"], coefficients["coefficient"])
+    assert result[["std_error", "statistic", "p_value", "conf_low", "conf_high"]].isna().all().all()
+
+
+def test_rank_deficiency_nulls_leverage_but_preserves_residuals_and_predictions(con):
+    data, _ = rank_deficient_data(con)
+    result = con.execute("SELECT * FROM linreg_influence('edge_model', 'edge_train', 'y')").df()
+    assert len(result) == len(data)
+    assert result[["hat", "std_resid", "cooks_distance"]].isna().all().all()
+    assert np.isfinite(result[["pearson_resid", "deviance_resid"]].to_numpy()).all()
+    predicted = con.execute("SELECT * FROM linreg_predict_ci('edge_model', 'edge_train', 'y')").df()
+    np.testing.assert_allclose(predicted["prediction"], 1 + 2 * data.x + 3 * data.z)
+    assert predicted[["conf_low", "conf_high"]].isna().all().all()
+
+
+@pytest.mark.parametrize("column", ["prediction", "conf_low", "conf_high"])
+@pytest.mark.parametrize("uppercase", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("newdata", [False, True])
+def test_prediction_ci_rejects_output_column_collisions(con, column, uppercase, empty, newdata):
+    model(con)
+    load(con, "edge_train", training())
+    name = column.upper() if uppercase else column
+    data = training().assign(**{name: 999.0})
+    if empty:
+        data = data.iloc[:0]
+    load(con, "edge_score" if newdata else "edge_train", data)
+    extra = ", newdata := 'edge_score'" if newdata else ""
+    with pytest.raises(duckdb.Error, match="collides with the output"):
+        con.execute(f"SELECT * FROM linreg_predict_ci('edge_model', 'edge_train', 'y'{extra})").fetchall()
+
+
+@pytest.mark.parametrize("column", ["hat", "pearson_resid", "deviance_resid", "std_resid", "cooks_distance"])
+@pytest.mark.parametrize("uppercase", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+def test_influence_rejects_output_column_collisions(con, column, uppercase, empty):
+    model(con)
+    name = column.upper() if uppercase else column
+    data = training().assign(**{name: 999.0})
+    if empty:
+        data = data.iloc[:0]
+    load(con, "edge_train", data)
+    with pytest.raises(duckdb.Error, match="collides with the output"):
+        con.execute("SELECT * FROM linreg_influence('edge_model', 'edge_train', 'y')").fetchall()

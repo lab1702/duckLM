@@ -224,6 +224,8 @@ SELECT * FROM poisson_predict_ci('model', 'policies', 'n_claims', newdata := 'ne
 The interval is on the **mean** (like the coefficient CIs, it is z-based for
 fixed-dispersion families and Student-t for the estimated-dispersion ones). A
 singular `XᵀWX` yields a finite `prediction` but NULL band.
+The scoring table must not already contain `prediction`, `conf_low`, or
+`conf_high` columns (case-insensitive); rename or drop those columns first.
 
 ## Evaluating
 
@@ -370,6 +372,9 @@ alongside the input columns — for spotting outliers and high-leverage points:
 These match **statsmodels** `GLMInfluence` to machine precision (leverage and
 Cook's distance use the observed-information hat matrix, as statsmodels does).
 Rows near `cooks_distance > 4/n` or with high `hat` are the influential ones.
+The input table must not already contain any of the five diagnostic column
+names listed above (case-insensitive); rename or drop them before calling the
+macro.
 
 ```sql
 SELECT * FROM poisson_influence('claims_model', 'policies', 'n_claims')
@@ -554,7 +559,7 @@ DuckDB; qualified and quoted names are supported.
   case-insensitively; a *feature* named `(Intercept)` is rejected at fit time
   (as the outcome it's fine); `prob`/`pred` columns (any case) are rejected by
   `logit_predict` and `prediction` by
-  `linreg_predict`/`poisson_predict`/`gamma_predict` — drop them first with
+  all single-outcome `*_predict` log-link/linear wrappers — drop them first with
   `SELECT * EXCLUDE (...)`.
 - Prediction matches model features to columns by exact, case-sensitive name
   string — score with the same column spellings you trained with.

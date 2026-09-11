@@ -160,3 +160,17 @@ def test_dummy_encoding_preserves_null_exclusion_without_dummy_columns(con, leve
         coefficients = dict(con.execute("SELECT * FROM linreg_fit('encoded', 'y')").fetchall())
         assert coefficients["(Intercept)"] == pytest.approx(1)
         assert coefficients["x"] == pytest.approx(2)
+
+
+def test_multinomial_evaluation_preserves_rid_outcome(con):
+    con.execute("""
+        CREATE TABLE observations AS
+        SELECT i AS x, CASE WHEN i%2=0 THEN 'a' ELSE 'b' END AS rid
+        FROM range(8) q(i)
+    """)
+    con.execute("CREATE TABLE model AS SELECT * FROM multinom_fit('observations', 'rid')")
+    scores = con.execute("SELECT rid, pred, probs FROM multinom_predict('model', 'observations')").fetchall()
+    actual = _metrics(con, "multinom_evaluate('model', 'observations', 'rid')")
+    assert actual["n"] == len(scores) == 8
+    assert actual["accuracy"] == pytest.approx(np.mean([label == pred for label, pred, _ in scores]))
+    assert actual["log_loss"] == pytest.approx(-np.mean([np.log(probs[label]) for label, _, probs in scores]))
