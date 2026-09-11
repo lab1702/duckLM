@@ -216,6 +216,15 @@ CREATE OR REPLACE MACRO __reg_irls_step(betas, proposed, rows, family) AS (
        )[1] END
 );
 
+-- Preserve precise centering at ordinary scales and divide before subtracting
+-- when opposite-sign finite values would overflow their difference.
+CREATE OR REPLACE MACRO __reg_centered(v, mu, scale) AS (
+  CASE WHEN isfinite(v-mu) THEN (v-mu)/scale ELSE v/scale-mu/scale END
+);
+CREATE OR REPLACE MACRO __reg_center_scale(v, mu) AS (
+  CASE WHEN isfinite(v-mu) THEN abs(v-mu) ELSE greatest(abs(v),abs(mu)) END
+);
+
 CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1, alpha, solver) AS TABLE
 WITH RECURSIVE
 -- Every column cast to DOUBLE, with a synthetic row id.
@@ -356,7 +365,7 @@ __reg_means AS MATERIALIZED (
 -- overflow or underflow the variance calculation.
 __reg_scales AS MATERIALIZED (
     SELECT m.col, m.mu, m.constant,
-           max(abs(s.v-m.mu)) FILTER (WHERE w.w > 0) AS scale
+           max(__reg_center_scale(s.v,m.mu)) FILTER (WHERE w.w > 0) AS scale
     FROM __reg_means m JOIN __reg_clong s ON s.col = m.col
     JOIN __reg_w w ON w.rid = s.rid
     GROUP BY m.col, m.mu, m.constant
@@ -366,7 +375,7 @@ __reg_scales AS MATERIALIZED (
 __reg_stats AS MATERIALIZED (
     SELECT m.col, row_number() OVER (ORDER BY m.col) AS j, m.mu,
            CASE WHEN m.constant THEN 1.0
-                ELSE m.scale*sqrt(sum(w.w * ((s.v-m.mu)/nullif(m.scale,0.0)) ^ 2) FILTER (WHERE w.w > 0)
+                ELSE m.scale*sqrt(sum(w.w * __reg_centered(s.v,m.mu,nullif(m.scale,0.0)) ^ 2) FILTER (WHERE w.w > 0)
                           / sum(w.w) FILTER (WHERE w.w > 0)) END AS sigma
     FROM __reg_scales m JOIN __reg_clong s ON s.col = m.col
     JOIN __reg_w w ON w.rid = s.rid
@@ -392,15 +401,15 @@ __reg_ymean AS (
     FROM __reg_moments WHERE col = outcome
 ),
 __reg_ycenter AS (
-    SELECT m.mu, s.v-m.mu AS delta, w.w,
-           max(abs(s.v-m.mu)) OVER () AS scale
+    SELECT m.mu, s.v, w.w,
+           max(__reg_center_scale(s.v,m.mu)) OVER () AS scale
     FROM __reg_clong s JOIN __reg_w w ON w.rid = s.rid
     CROSS JOIN __reg_ymean m
     WHERE s.col = outcome AND w.w > 0
 ),
 __reg_ystdev AS (
     SELECT any_value(mu) AS mu,
-           any_value(scale)*sqrt(sum(w*pow(delta/nullif(scale,0.0),2))/sum(w)) AS sd
+           any_value(scale)*sqrt(sum(w*pow(__reg_centered(v,mu,nullif(scale,0.0)),2))/sum(w)) AS sd
     FROM __reg_ycenter
 ),
 __reg_ystats AS (
@@ -439,8 +448,8 @@ __reg_packed AS MATERIALIZED (
         -- collect unordered and sort the little list in list-land. list_sort orders
         -- a struct list lexicographically by field, hence j first.
         SELECT x.rid,
-               (any_value(yv.v) - any_value(ys.mu_y)) / any_value(ys.sd_y) AS y,
-               [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := (x.v - s.mu) / s.sigma))), zp -> zp.v) AS xs,
+               __reg_centered(any_value(yv.v),any_value(ys.mu_y),any_value(ys.sd_y)) AS y,
+               [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), zp -> zp.v) AS xs,
                coalesce(any_value(ov.v), 0.0)
                  / (CASE WHEN family = 'linear' THEN any_value(ys.sd_y) ELSE 1.0 END) AS o,
                any_value(wt.w) AS w
@@ -772,9 +781,9 @@ FROM (
     SELECT '(Intercept)' AS feature,
            CASE WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom')
                 THEN ln(ys.sd_y) + (s.betas[1] - coalesce(list_sum(list_transform(f.names,
-                     lambda nm, j: s.betas[j + 1] * f.mus[j] / f.sigmas[j])), 0.0))
+                     lambda nm, j: s.betas[j + 1] * (f.mus[j] / f.sigmas[j]))), 0.0))
                 ELSE ys.mu_y + ys.sd_y * (s.betas[1] - coalesce(list_sum(list_transform(f.names,
-                     lambda nm, j: s.betas[j + 1] * f.mus[j] / f.sigmas[j])), 0.0))
+                     lambda nm, j: s.betas[j + 1] * (f.mus[j] / f.sigmas[j]))), 0.0))
            END AS coefficient
     FROM __reg_sol s, __reg_feats f, __reg_ystats ys
     UNION ALL
@@ -950,6 +959,10 @@ CREATE OR REPLACE MACRO __reg_log1p(x) AS (
     CASE WHEN abs(v) < 1e-4 THEN v*(1.0-v*(0.5-v*(1.0/3.0-v*(0.25-v/5.0))))
          ELSE ln(1.0+v) END)[1]
 );
+CREATE OR REPLACE MACRO __reg_logit_resid(y, eta) AS (
+  CASE WHEN eta >= 0 THEN (y-1.0)+exp(-eta)/(1.0+exp(-eta))
+       ELSE y-exp(eta)/(1.0+exp(eta)) END
+);
 CREATE OR REPLACE MACRO __reg_softplus(x) AS (
   greatest(x,0.0) + __reg_log1p(exp(-abs(x)))
 );
@@ -1117,7 +1130,7 @@ __reg_agg AS (
            avg(y) AS ybar,
            sum((y - yhat) * (y - yhat)) AS sse,
            sum(abs(y - yhat)) AS sae,
-           sum(-y*greatest(-z,0.0) - (1-y)*greatest(z,0.0) - ln(1.0+exp(-abs(z)))) AS ll_bin,
+           sum(-y*greatest(-z,0.0) - (1-y)*greatest(z,0.0) - __reg_log1p(exp(-abs(z)))) AS ll_bin,
            avg(CASE WHEN (yhat >= 0.5) = (y >= 0.5) THEN 1.0 ELSE 0.0 END) AS accuracy,
            sum(CASE WHEN y = 0 THEN -exp(z)
                     ELSE -__reg_stirlerr(y)-0.5*(1.8378770664093453+ln(y))
@@ -1151,15 +1164,16 @@ __reg_null_bounds(it, lo, hi) AS (
     WHERE offset_col IS NOT NULL AND family NOT IN ('linear','poisson','gamma','tweedie') AND a.ybar > 0
       AND (family != 'logistic' OR a.ybar < 1)
     UNION ALL
-    SELECT it+1, CASE WHEN score > 0 THEN mid ELSE lo END,
-                 CASE WHEN score > 0 THEN hi ELSE mid END
+    SELECT it+1, CASE WHEN score >= 0 THEN mid ELSE lo END,
+                 CASE WHEN score <= 0 THEN mid ELSE hi END
     FROM (
       SELECT it, lo, hi, mid,
              list_sum(list_transform(d.rows, lambda r:
                list_transform([CASE WHEN family = 'logistic'
                  THEN 1.0/(1.0+exp(-greatest(-700.0,least(700.0,mid+r.o))))
                  ELSE exp(greatest(-700.0,least(700.0,mid+r.o))) END], lambda mu:
-                 CASE family WHEN 'gamma' THEN r.y/mu-1.0
+                 CASE family WHEN 'logistic' THEN __reg_logit_resid(r.y,mid+r.o)
+                   WHEN 'gamma' THEN r.y/mu-1.0
                    WHEN 'tweedie' THEN (r.y-mu)*pow(mu,1.0-power)
                    WHEN 'nbinom' THEN (r.y-mu)/(1.0+alpha*mu)
                    ELSE r.y-mu END)[1])) AS score
@@ -1202,7 +1216,7 @@ __reg_null AS (
            -- lim(p -> 0+) p*ln(p) = 0, including one-class holdouts.
            sum(CASE WHEN a.ybar IN (0, 1) THEN 0.0
                     ELSE -y*greatest(-r.z0,0.0) - (1-y)*greatest(r.z0,0.0)
-                         - ln(1.0+exp(-abs(r.z0))) END) AS ll0_bin,
+                         - __reg_log1p(exp(-abs(r.z0))) END) AS ll0_bin,
            sum(__reg_tw_halfdev(y,r.z0,1.0)) AS null_dev_pois_half,
            sum(__reg_tw_halfdev(y,r.z0,2.0)) AS null_dev_gam_half,
            sum(CASE WHEN y = 0 AND r.z0 = '-Infinity'::DOUBLE THEN 0.0
@@ -1410,8 +1424,8 @@ __reg_mstats AS MATERIALIZED (
          row_number() OVER (ORDER BY col) AS j,
          CASE WHEN min(v) = max(v) THEN min(v) ELSE any_value(mu_raw) END AS mu,
          CASE WHEN min(v) = max(v) THEN 1.0
-              ELSE max(scale)*sqrt(avg(pow((v-mu_raw)/nullif(scale,0.0),2))) END AS sigma
-  FROM (SELECT *,max(abs(v-mu_raw)) OVER (PARTITION BY col) AS scale
+              ELSE max(scale)*sqrt(avg(pow(__reg_centered(v,mu_raw,nullif(scale,0.0)),2))) END AS sigma
+  FROM (SELECT *,max(__reg_center_scale(v,mu_raw)) OVER (PARTITION BY col) AS scale
         FROM (SELECT *,CASE WHEN isfinite(avg(v-vbase) OVER (PARTITION BY col))
                             THEN vbase+avg(v-vbase) OVER (PARTITION BY col)
                             ELSE vscale*avg(v/nullif(vscale,0.0)) OVER (PARTITION BY col) END AS mu_raw
@@ -1454,7 +1468,7 @@ __reg_mpacked AS MATERIALIZED (
          any_value(len(yv)) AS K1, any_value(len(xs)) AS D1
   FROM (
     SELECT x.rid,
-           [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := (x.v - s.mu) / s.sigma))), zp -> zp.v) AS xs,
+           [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), zp -> zp.v) AS xs,
            list_transform(any_value(nr.nrf),
              lambda cl: CASE WHEN any_value(yl.lab) = cl THEN 1.0 ELSE 0.0 END) AS yv
     FROM __reg_mflong x
@@ -1517,7 +1531,7 @@ __reg_msol AS (SELECT B FROM __reg_mgd ORDER BY it DESC LIMIT 1)
 SELECT class, feature, coefficient FROM (
   SELECT nr.nrf[k] AS class, '(Intercept)' AS feature,
          s.B[k][1] - coalesce(list_sum(list_transform(f.names,
-             lambda nm, j: s.B[k][j + 1] * f.mus[j] / f.sigmas[j])), 0.0) AS coefficient
+             lambda nm, j: s.B[k][j + 1] * (f.mus[j] / f.sigmas[j]))), 0.0) AS coefficient
   FROM __reg_msol s, __reg_mfeats f, __reg_mnonref nr, range(1, len(nr.nrf) + 1) AS gk(k)
   UNION ALL
   SELECT nr.nrf[k], f.names[j], s.B[k][j + 1] / f.sigmas[j]
@@ -1710,8 +1724,8 @@ __reg_cv_stats AS MATERIALIZED (
   SELECT col, row_number() OVER (ORDER BY col) AS j,
          CASE WHEN min(v)=max(v) THEN min(v) ELSE any_value(mu_raw) END AS mu,
          CASE WHEN min(v)=max(v) THEN 1.0
-              ELSE max(scale)*sqrt(avg(pow((v-mu_raw)/nullif(scale,0.0),2))) END AS sigma
-  FROM (SELECT *,max(abs(v-mu_raw)) OVER (PARTITION BY col) AS scale
+              ELSE max(scale)*sqrt(avg(pow(__reg_centered(v,mu_raw,nullif(scale,0.0)),2))) END AS sigma
+  FROM (SELECT *,max(__reg_center_scale(v,mu_raw)) OVER (PARTITION BY col) AS scale
         FROM (SELECT *,CASE WHEN isfinite(avg(v-vbase) OVER (PARTITION BY col))
                             THEN vbase+avg(v-vbase) OVER (PARTITION BY col)
                             ELSE vscale*avg(v/nullif(vscale,0.0)) OVER (PARTITION BY col) END AS mu_raw
@@ -1725,8 +1739,8 @@ __reg_cv_ys AS (
          CASE WHEN family='logistic' THEN 1.0
               WHEN family IN ('poisson','gamma','tweedie','nbinom') THEN (CASE WHEN mu<1e-300 THEN 1.0 ELSE mu END)
               WHEN coalesce(sd,0)<1e-300 THEN 1.0 ELSE sd END AS sd_y
-  FROM (SELECT any_value(mu_raw) AS mu,max(scale)*sqrt(avg(pow((y-mu_raw)/nullif(scale,0.0),2))) AS sd
-        FROM (SELECT *,max(abs(y-mu_raw)) OVER () AS scale
+  FROM (SELECT any_value(mu_raw) AS mu,max(scale)*sqrt(avg(pow(__reg_centered(y,mu_raw,nullif(scale,0.0)),2))) AS sd
+        FROM (SELECT *,max(__reg_center_scale(y,mu_raw)) OVER () AS scale
               FROM (SELECT *,CASE WHEN isfinite(avg(y-ybase) OVER ())
                                   THEN ybase+avg(y-ybase) OVER ()
                                   ELSE yscale*avg(y/nullif(yscale,0.0)) OVER () END AS mu_raw
@@ -1751,8 +1765,8 @@ __reg_cv_marr AS (
 ),
 __reg_cv_rows AS MATERIALIZED (
   SELECT x.rid, any_value(yr.fold) AS fold, any_value(yr.y) AS y,
-         (any_value(yr.y) - any_value(ys.mu_y)) / any_value(ys.sd_y) AS yt,
-         [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := (x.v - s.mu)/s.sigma))), zp -> zp.v) AS xs
+         __reg_centered(any_value(yr.y),any_value(ys.mu_y),any_value(ys.sd_y)) AS yt,
+         [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), zp -> zp.v) AS xs
   FROM __reg_cv_flong x JOIN __reg_cv_stats s ON s.col=x.col JOIN __reg_cv_yraw yr ON yr.rid=x.rid
   CROSS JOIN __reg_cv_ys ys GROUP BY x.rid
 ),
@@ -2092,8 +2106,8 @@ __reg_nbd_stats AS MATERIALIZED (
   SELECT col, row_number() OVER (ORDER BY col) AS j,
          CASE WHEN min(v)=max(v) THEN min(v) ELSE any_value(mu_raw) END AS mu,
          CASE WHEN min(v)=max(v) THEN 1.0
-              ELSE max(scale)*sqrt(avg(pow((v-mu_raw)/nullif(scale,0.0),2))) END AS sigma
-  FROM (SELECT *,max(abs(v-mu_raw)) OVER (PARTITION BY col) AS scale
+              ELSE max(scale)*sqrt(avg(pow(__reg_centered(v,mu_raw,nullif(scale,0.0)),2))) END AS sigma
+  FROM (SELECT *,max(__reg_center_scale(v,mu_raw)) OVER (PARTITION BY col) AS scale
         FROM (SELECT *,CASE WHEN isfinite(avg(v-vbase) OVER (PARTITION BY col))
                             THEN vbase+avg(v-vbase) OVER (PARTITION BY col)
                             ELSE vscale*avg(v/nullif(vscale,0.0)) OVER (PARTITION BY col) END AS mu_raw
@@ -2116,7 +2130,7 @@ __reg_nbd_marr AS (
 ),
 __reg_nbd_rows AS MATERIALIZED (
   SELECT x.rid, any_value(yr.y) AS y, any_value(yr.y) / any_value(ys.sd_y) AS yt,
-         [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := (x.v - s.mu)/s.sigma))), zp -> zp.v) AS xs
+         [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), zp -> zp.v) AS xs
   FROM __reg_nbd_flong x JOIN __reg_nbd_stats s ON s.col=x.col JOIN __reg_nbd_yraw yr ON yr.rid=x.rid
   CROSS JOIN __reg_nbd_ys ys GROUP BY x.rid
 ),
@@ -2478,10 +2492,6 @@ CREATE OR REPLACE MACRO t_ppf(p, df) AS ( __reg_t_ppf(p::DOUBLE, df::DOUBLE) );
 CREATE OR REPLACE MACRO __reg_logit_var(eta) AS (
   exp(-abs(eta))/pow(1.0+exp(-abs(eta)),2.0)
 );
-CREATE OR REPLACE MACRO __reg_logit_resid(y, eta) AS (
-  CASE WHEN eta >= 0 THEN (y-1.0)+exp(-eta)/(1.0+exp(-eta))
-       ELSE y-exp(eta)/(1.0+exp(eta)) END
-);
 CREATE OR REPLACE MACRO __reg_logit_pearson(y, eta) AS (
   CASE WHEN y = 1 THEN exp(-eta/2.0) WHEN y = 0 THEN -exp(eta/2.0)
        ELSE __reg_logit_resid(y,eta)/sqrt(__reg_logit_var(eta)) END
@@ -2564,10 +2574,10 @@ __reg_feat AS (
 __reg_rows0 AS (
   SELECT f.__reg_rid__, f.xs, y.y,
          CASE WHEN offset_col IS NULL THEN 0.0 ELSE o.o END AS off,
-         -- Sandwich covariance is invariant to a common weight scale. Remove
-         -- it before both the bread and score products can overflow/underflow.
+         -- A common weight scale cancels in sandwich covariance and in
+         -- model-based covariance when dispersion is estimated.
          CASE WHEN weights_col IS NULL THEN 1.0
-              WHEN robust != 'none' OR cluster_col IS NOT NULL
+              WHEN robust != 'none' OR cluster_col IS NOT NULL OR family IN ('linear','gamma','tweedie')
                 THEN w.wt / nullif(max(w.wt) OVER (),0.0)
               ELSE w.wt END AS wt
   FROM __reg_feat f
@@ -2868,7 +2878,10 @@ __reg_feat AS (
 __reg_rows0 AS (
   SELECT f.__reg_rid__, f.xs, y.y,
          CASE WHEN offset_col IS NULL THEN 0.0 ELSE o.o END AS off,
-         CASE WHEN weights_col IS NULL THEN 1.0 ELSE w.wt END AS wt
+         CASE WHEN weights_col IS NULL THEN 1.0
+              WHEN family IN ('linear','gamma','tweedie')
+                THEN w.wt / nullif(max(w.wt) OVER (),0.0)
+              ELSE w.wt END AS wt
   FROM __reg_feat f JOIN __reg_yv y ON y.__reg_rid__ = f.__reg_rid__
   LEFT JOIN __reg_ov o ON o.__reg_rid__ = f.__reg_rid__ LEFT JOIN __reg_wv w ON w.__reg_rid__ = f.__reg_rid__ CROSS JOIN __reg_beta
   WHERE f.nf = __reg_beta.k AND y.y IS NOT NULL AND (offset_col IS NULL OR o.o IS NOT NULL)

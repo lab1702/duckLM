@@ -24,6 +24,18 @@ def _metrics(con, call):
     return dict(zip([column[0] for column in result.description], result.fetchone()))
 
 
+@pytest.mark.parametrize('logit', [40.0, 100.0, 700.0])
+def test_logistic_tail_loss_matches_offset_null(con, logit):
+    con.execute("CREATE TABLE tail_model AS SELECT '(Intercept)' feature,0.::DOUBLE coefficient")
+    con.execute(f'CREATE TABLE tail_rows AS SELECT * FROM (VALUES ({logit},1.),(-{logit},0.))t(expo,y)')
+    metrics = _metrics(con, "logit_evaluate('tail_model','tail_rows','y',offset_col:='expo')")
+    expected_loss = np.logaddexp(0.0, -logit)
+    assert metrics['log_loss'] == pytest.approx(expected_loss, rel=1e-12, abs=0.0)
+    assert metrics['deviance'] == pytest.approx(4*expected_loss, rel=1e-12, abs=0.0)
+    assert metrics['null_deviance'] == pytest.approx(4*expected_loss, rel=1e-12, abs=0.0)
+    assert metrics['pseudo_r2'] == pytest.approx(0.0, abs=1e-12)
+
+
 @pytest.mark.parametrize("power", [1.0, 2.0])
 def test_tweedie_evaluation_at_poisson_and_gamma_endpoints(con, power):
     con.execute(

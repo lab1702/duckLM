@@ -121,3 +121,43 @@ def test_batch_outcome_means_remain_finite_when_sum_overflows(con):
     expected = -3 * (np.log(2*np.pi) + np.log(1e308) + np.log(2.0))
     assert np.isfinite(loglik)
     assert loglik == pytest.approx(expected, abs=1e-9)
+
+
+@pytest.mark.parametrize('family', ['linreg','logit','poisson','gamma','tweedie','nbinom'])
+@pytest.mark.parametrize('l2', [0.0, 0.1])
+def test_fits_preserve_extreme_mixed_sign_feature_units(con, family, l2):
+    outcome = 'i%2' if family == 'logit' else '1.0+i%3'
+    con.execute(f'CREATE TABLE base AS SELECT CASE WHEN i%3=0 THEN -1.5 ELSE 1.5 END x,{outcome} y FROM range(12)t(i)')
+    con.execute('CREATE TABLE scaled AS SELECT x*1e308 x,y FROM base')
+    models = []
+    for table in ['base', 'scaled']:
+        coefficients = dict(con.execute(f"SELECT * FROM {family}_fit('{table}','y',l2:={l2},max_iter:=300)").fetchall())
+        assert np.isfinite(list(coefficients.values())).all()
+        models.append(coefficients)
+    models[1]['x'] *= 1e308
+    assert models[1] == pytest.approx(models[0], rel=1e-8, abs=1e-9)
+
+
+def test_linear_fit_preserves_extreme_mixed_sign_outcome_units(con):
+    con.execute('CREATE TABLE extremes AS SELECT * FROM (VALUES (-1.,-1.5e308),(1.,1.5e308),(1.,1.5e308))t(x,y)')
+    coefficients = dict(con.execute("SELECT * FROM linreg_fit('extremes','y')").fetchall())
+    assert coefficients['(Intercept)'] / 1e308 == pytest.approx(0.0, abs=1e-12)
+    assert coefficients['x'] / 1e308 == pytest.approx(1.5, abs=1e-12)
+
+
+@pytest.mark.parametrize('kind', ['multinomial', 'cv', 'dispersion'])
+def test_batch_fits_preserve_extreme_mixed_sign_feature_units(con, kind):
+    con.execute('CREATE TABLE base AS SELECT CASE WHEN i%3=0 THEN -1.5 ELSE 1.5 END x,1.0+i%3 y FROM range(12)t(i)')
+    con.execute('CREATE TABLE scaled AS SELECT x*1e308 x,y FROM base')
+    outputs = []
+    for table in ['base', 'scaled']:
+        if kind == 'multinomial':
+            call = f"multinom_fit('{table}','y',l2:=.1,max_iter:=300)"
+        elif kind == 'cv':
+            call = f"cv_l2('{table}','y','linear',[.1],k:=4,max_iter:=300)"
+        else:
+            call = f"nbinom_dispersion('{table}','y',[.5,1.],max_iter:=300)"
+        rows = con.execute('SELECT * FROM '+call+' ORDER BY ALL').fetchall()
+        outputs.append(np.array([row[-1]*(1e308 if kind=='multinomial' and table=='scaled' and row[-2]=='x' else 1.0) for row in rows]))
+    assert np.isfinite(outputs[1]).all()
+    np.testing.assert_allclose(outputs[1], outputs[0], rtol=1e-8, atol=1e-9)

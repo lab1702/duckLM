@@ -161,6 +161,29 @@ def test_robust_summary_preserves_extreme_common_weight_scale(con, family, robus
     np.testing.assert_allclose(values[1:], np.tile(values[0], (2, 1)), rtol=1e-10)
 
 
+@pytest.mark.parametrize('family', ['linreg', 'gamma', 'tweedie'])
+def test_estimated_dispersion_inference_preserves_extreme_weight_scale(con, family):
+    model(con)
+    data = training().assign(w=np.linspace(0.25, 1.0, 48))
+    data['y'] += 0.2
+    x = np.column_stack([np.ones(len(data)), data.x])
+    eta = x @ np.array([0.3, 0.2])
+    mu = eta if family == 'linreg' else np.exp(eta)
+    power = 2.0 if family == 'gamma' else 1.5
+    variance = np.ones(len(data)) if family == 'linreg' else mu**power
+    information = data.w.to_numpy() * (1.0 if family == 'linreg' else mu**(2-power))
+    phi = np.sum(data.w.to_numpy()*(data.y.to_numpy()-mu)**2/variance)/(len(data)-2)
+    expected = np.sqrt(phi*np.diag(np.linalg.inv(x.T @ (information[:,None]*x))))
+    intervals = []
+    for scale in [1.0, 1e-308, 1e308]:
+        load(con, 'edge_train', data.assign(w=data.w*scale))
+        actual = con.execute(f"SELECT std_error FROM {family}_summary('edge_model','edge_train','y',weights_col:='w')").df()['std_error'].to_numpy()
+        np.testing.assert_allclose(actual, expected, rtol=1e-10)
+        intervals.append(con.execute(f"SELECT conf_low,conf_high FROM {family}_predict_ci('edge_model','edge_train','y',weights_col:='w')").df().to_numpy())
+    assert np.isfinite(intervals).all()
+    np.testing.assert_allclose(intervals[1:], np.stack([intervals[0],intervals[0]]), rtol=1e-10)
+
+
 @pytest.mark.parametrize("power, family", [(1.0, "poisson"), (2.0, "gamma")])
 def test_tweedie_deviance_residual_endpoints(con, power, family):
     model(con)
