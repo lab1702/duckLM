@@ -338,16 +338,25 @@ __reg_means AS MATERIALIZED (
       AND s.col != coalesce(weights_col, '')
     GROUP BY s.col
 ),
+-- Scale centered deviations before squaring so finite extreme units do not
+-- overflow or underflow the variance calculation.
+__reg_scales AS MATERIALIZED (
+    SELECT m.col, m.mu, m.constant,
+           max(abs(s.v-m.mu)) FILTER (WHERE w.w > 0) AS scale
+    FROM __reg_means m JOIN __reg_clong s ON s.col = m.col
+    JOIN __reg_w w ON w.rid = s.rid
+    GROUP BY m.col, m.mu, m.constant
+),
 -- j is the feature's position in name order, avoiding string sort keys in
 -- every row's packed feature vector.
 __reg_stats AS MATERIALIZED (
     SELECT m.col, row_number() OVER (ORDER BY m.col) AS j, m.mu,
            CASE WHEN m.constant THEN 1.0
-                ELSE sqrt(sum(w.w * (s.v - m.mu) ^ 2) FILTER (WHERE w.w > 0)
+                ELSE m.scale*sqrt(sum(w.w * ((s.v-m.mu)/nullif(m.scale,0.0)) ^ 2) FILTER (WHERE w.w > 0)
                           / sum(w.w) FILTER (WHERE w.w > 0)) END AS sigma
-    FROM __reg_means m JOIN __reg_clong s ON s.col = m.col
+    FROM __reg_scales m JOIN __reg_clong s ON s.col = m.col
     JOIN __reg_w w ON w.rid = s.rid
-    GROUP BY m.col, m.mu, m.constant
+    GROUP BY m.col, m.mu, m.constant, m.scale
 ),
 __reg_feats AS MATERIALIZED (
     SELECT list(col   ORDER BY col) AS names,
@@ -367,18 +376,26 @@ __reg_ymean AS (
     FROM __reg_clong s JOIN __reg_w w ON w.rid = s.rid
     WHERE s.col = outcome AND w.w > 0
 ),
-__reg_ystats AS (
-    SELECT CASE WHEN family = 'linear' THEN any_value(m.mu) ELSE 0.0 END AS mu_y,
-           CASE WHEN family = 'logistic' THEN 1.0
-                WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom')
-                  THEN (CASE WHEN any_value(m.mu) < 1e-300 THEN 1.0 ELSE any_value(m.mu) END)
-                ELSE (CASE WHEN sqrt(sum(w.w * (s.v - m.mu) ^ 2) / sum(w.w)) < 1e-300
-                           THEN 1.0
-                           ELSE sqrt(sum(w.w * (s.v - m.mu) ^ 2) / sum(w.w)) END)
-           END AS sd_y
+__reg_ycenter AS (
+    SELECT m.mu, s.v-m.mu AS delta, w.w,
+           max(abs(s.v-m.mu)) OVER () AS scale
     FROM __reg_clong s JOIN __reg_w w ON w.rid = s.rid
     CROSS JOIN __reg_ymean m
     WHERE s.col = outcome AND w.w > 0
+),
+__reg_ystdev AS (
+    SELECT any_value(mu) AS mu,
+           any_value(scale)*sqrt(sum(w*pow(delta/nullif(scale,0.0),2))/sum(w)) AS sd
+    FROM __reg_ycenter
+),
+__reg_ystats AS (
+    SELECT CASE WHEN family = 'linear' THEN mu ELSE 0.0 END AS mu_y,
+           CASE WHEN family = 'logistic' THEN 1.0
+                WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom')
+                  THEN (CASE WHEN mu < 1e-300 THEN 1.0 ELSE mu END)
+                ELSE (CASE WHEN coalesce(sd,0.0) < 1e-300 THEN 1.0 ELSE sd END)
+           END AS sd_y
+    FROM __reg_ystdev
 ),
 -- The whole training set packed into one row: a list of {y, xs} structs where
 -- xs = [1.0 (intercept), standardized features in name order]. __reg_clong is
@@ -1359,9 +1376,12 @@ __reg_mstats AS MATERIALIZED (
   -- n*d column-name strings in the sort buffers.
   SELECT col,
          row_number() OVER (ORDER BY col) AS j,
-         CASE WHEN min(v) = max(v) THEN min(v) ELSE avg(v) END AS mu,
-         CASE WHEN min(v) = max(v) THEN 1.0 ELSE stddev_pop(v) END AS sigma
-  FROM __reg_mflong GROUP BY col
+         CASE WHEN min(v) = max(v) THEN min(v) ELSE any_value(mu_raw) END AS mu,
+         CASE WHEN min(v) = max(v) THEN 1.0
+              ELSE max(scale)*sqrt(avg(pow((v-mu_raw)/nullif(scale,0.0),2))) END AS sigma
+  FROM (SELECT *,max(abs(v-mu_raw)) OVER (PARTITION BY col) AS scale
+        FROM (SELECT *,avg(v) OVER (PARTITION BY col) AS mu_raw FROM __reg_mflong))
+  GROUP BY col
 ),
 __reg_mfeats AS MATERIALIZED (
   SELECT list(col ORDER BY col) AS names, list(mu ORDER BY col) AS mus,
@@ -1652,17 +1672,22 @@ __reg_cv_stats AS MATERIALIZED (
   -- aggregate carries its sort key with every value, so a VARCHAR key means
   -- n*d column-name strings in the sort buffers.
   SELECT col, row_number() OVER (ORDER BY col) AS j,
-         CASE WHEN min(v)=max(v) THEN min(v) ELSE avg(v) END AS mu,
-         CASE WHEN min(v)=max(v) THEN 1.0 ELSE stddev_pop(v) END AS sigma
-  FROM __reg_cv_flong GROUP BY col
+         CASE WHEN min(v)=max(v) THEN min(v) ELSE any_value(mu_raw) END AS mu,
+         CASE WHEN min(v)=max(v) THEN 1.0
+              ELSE max(scale)*sqrt(avg(pow((v-mu_raw)/nullif(scale,0.0),2))) END AS sigma
+  FROM (SELECT *,max(abs(v-mu_raw)) OVER (PARTITION BY col) AS scale
+        FROM (SELECT *,avg(v) OVER (PARTITION BY col) AS mu_raw FROM __reg_cv_flong))
+  GROUP BY col
 ),
 __reg_cv_feats AS MATERIALIZED (SELECT count(*)::INT AS d FROM __reg_cv_stats),
 __reg_cv_ys AS (
-  SELECT CASE WHEN family='linear' THEN avg(y) ELSE 0.0 END AS mu_y,
+  SELECT CASE WHEN family='linear' THEN mu ELSE 0.0 END AS mu_y,
          CASE WHEN family='logistic' THEN 1.0
-              WHEN family IN ('poisson','gamma','tweedie','nbinom') THEN (CASE WHEN avg(y)<1e-300 THEN 1.0 ELSE avg(y) END)
-              WHEN coalesce(stddev_pop(y),0)<1e-300 THEN 1.0 ELSE stddev_pop(y) END AS sd_y
-  FROM __reg_cv_yraw
+              WHEN family IN ('poisson','gamma','tweedie','nbinom') THEN (CASE WHEN mu<1e-300 THEN 1.0 ELSE mu END)
+              WHEN coalesce(sd,0)<1e-300 THEN 1.0 ELSE sd END AS sd_y
+  FROM (SELECT avg(y) AS mu,max(scale)*sqrt(avg(pow((y-mu_raw)/nullif(scale,0.0),2))) AS sd
+        FROM (SELECT *,max(abs(y-mu_raw)) OVER () AS scale
+              FROM (SELECT *,avg(y) OVER () AS mu_raw FROM __reg_cv_yraw)))
 ),
 __reg_cv_n AS (SELECT count(*)::DOUBLE AS n FROM __reg_cv_yraw),
 __reg_cv_foldsz AS (SELECT fold AS f, count(*)::DOUBLE AS sz FROM __reg_cv_yraw GROUP BY fold),
@@ -2022,9 +2047,12 @@ __reg_nbd_stats AS MATERIALIZED (
   -- aggregate carries its sort key with every value, so a VARCHAR key means
   -- n*d column-name strings in the sort buffers.
   SELECT col, row_number() OVER (ORDER BY col) AS j,
-         CASE WHEN min(v)=max(v) THEN min(v) ELSE avg(v) END AS mu,
-         CASE WHEN min(v)=max(v) THEN 1.0 ELSE stddev_pop(v) END AS sigma
-  FROM __reg_nbd_flong GROUP BY col
+         CASE WHEN min(v)=max(v) THEN min(v) ELSE any_value(mu_raw) END AS mu,
+         CASE WHEN min(v)=max(v) THEN 1.0
+              ELSE max(scale)*sqrt(avg(pow((v-mu_raw)/nullif(scale,0.0),2))) END AS sigma
+  FROM (SELECT *,max(abs(v-mu_raw)) OVER (PARTITION BY col) AS scale
+        FROM (SELECT *,avg(v) OVER (PARTITION BY col) AS mu_raw FROM __reg_nbd_flong))
+  GROUP BY col
 ),
 __reg_nbd_feats AS MATERIALIZED (SELECT count(*)::INT AS d FROM __reg_nbd_stats),
 __reg_nbd_ys AS (SELECT CASE WHEN avg(y)<1e-300 THEN 1.0 ELSE avg(y) END AS sd_y FROM __reg_nbd_yraw),
@@ -2312,9 +2340,18 @@ CREATE OR REPLACE MACRO __reg_t_sf(t, df) AS (
   CASE WHEN df IS NULL OR t IS NULL THEN NULL
        WHEN isnan(df) OR isnan(t) OR df <= 0 THEN 'NaN'::DOUBLE
        WHEN df = 'Infinity'::DOUBLE THEN norm_cdf(-t)
-       ELSE (CASE WHEN t >= 0.0 THEN 0.0 ELSE 1.0 END)
-  + (CASE WHEN t >= 0.0 THEN 0.5 ELSE -0.5 END)
-    * __reg_betai(df/2.0, 0.5, df/(df + t*t)) END
+       WHEN t = 0 THEN 0.5
+       WHEN isinf(t) THEN CASE WHEN t > 0 THEN 0.0 ELSE 1.0 END
+       ELSE list_transform([-__reg_softplus(2.0*ln(abs(t))-ln(df))], lambda logx:
+         (CASE WHEN t >= 0.0 THEN 0.0 ELSE 1.0 END)
+         + (CASE WHEN t >= 0.0 THEN 0.5 ELSE -0.5 END)
+         * CASE WHEN logx < -30.0 THEN
+             -- I_x(a,1/2) = x^a/(a*B(a,1/2)) * (1+O(x)); keeping
+             -- log(x) avoids losing representable heavy tails when x underflows.
+             CASE WHEN (df/2.0)*logx < -750.0 THEN 0.0
+                  ELSE exp((df/2.0)*logx+lgamma((df+1.0)/2.0)-lgamma(1.0+df/2.0)-0.5723649429247001) END
+           ELSE __reg_betai(df/2.0,0.5,exp(logx)) END
+       )[1] END
 );
 CREATE OR REPLACE MACRO t_cdf(t, df) AS ( __reg_t_sf(-t::DOUBLE, df::DOUBLE) );
 CREATE OR REPLACE MACRO __reg_t_pdf(t, df) AS (

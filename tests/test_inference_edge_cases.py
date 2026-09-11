@@ -482,3 +482,24 @@ def test_multinomial_summary_preserves_confidence_level_immediately_below_one(co
     beta,se,lo,hi=con.execute("SELECT coefficient,std_error,conf_low,conf_high FROM multinom_summary('wide_multi_model','wide_multi_data','y',conf_level:=?)",[level]).fetchone()
     critical=-norm.ppf((1-level)/2)
     np.testing.assert_allclose([lo,hi],[beta-critical*se,beta+critical*se],rtol=1e-10)
+
+
+@pytest.mark.parametrize('df', [.1,.5,1.,2.])
+@pytest.mark.parametrize('magnitude', [1e160,1e200])
+def test_student_t_retains_extreme_representable_tails(con,df,magnitude):
+    import math
+    log_constant=math.lgamma((df+1)/2)-math.lgamma(df/2)-.5*math.log(math.pi)+(df/2-1)*math.log(df)
+    # The next power-tail term is O(df/t^2), far below double precision here.
+    expected=math.exp(log_constant-df*math.log(magnitude))
+    actual=con.execute('SELECT t_cdf(?,?)',[-magnitude,df]).fetchone()[0]
+    assert actual==pytest.approx(expected,rel=1e-12,abs=5e-324)
+
+
+@pytest.mark.parametrize('df,probability', [(.1,1e-20),(.5,1e-100),(.01,.01)])
+def test_student_t_quantiles_reach_large_finite_values(con,df,probability):
+    import math
+    log_constant=math.lgamma((df+1)/2)-math.lgamma(df/2)-.5*math.log(math.pi)+(df/2-1)*math.log(df)
+    expected=-math.exp((log_constant-math.log(probability))/df)
+    actual=con.execute('SELECT t_ppf(?,?)',[probability,df]).fetchone()[0]
+    assert actual==pytest.approx(expected,rel=1e-11)
+    assert con.execute('SELECT t_cdf(?,?)',[actual,df]).fetchone()[0]==pytest.approx(probability,rel=1e-12)
