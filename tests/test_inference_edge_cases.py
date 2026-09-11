@@ -346,3 +346,21 @@ def test_inference_preserves_model_and_predictions_without_training_rows(con,fam
     assert len(prediction)==1
     assert prediction[0][0]==pytest.approx(expected)
     assert prediction[0][1:]==(None,None)
+
+
+@pytest.mark.parametrize('eta,outcome',[(40.,0.),(-40.,1.),(-800.,1.)])
+def test_logistic_influence_deviance_uses_finite_logit(con,eta,outcome):
+    con.execute("CREATE TABLE residual_model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient",[eta])
+    con.execute('CREATE TABLE residual_data AS SELECT ?::DOUBLE y',[outcome])
+    actual=con.execute("SELECT deviance_resid FROM logit_influence('residual_model','residual_data','y')").fetchone()[0]
+    expected=np.sign(outcome-.5)*np.sqrt(2*(outcome*np.logaddexp(0,-eta)+(1-outcome)*np.logaddexp(0,eta)))
+    assert actual==pytest.approx(expected)
+
+
+@pytest.mark.parametrize('alpha',[1e-12,1e-16,1e-20])
+def test_nb_influence_deviance_has_poisson_limit(con,alpha):
+    con.execute("CREATE TABLE nb_residual_model AS SELECT '(Intercept)' feature,ln(2.0) coefficient")
+    con.execute('CREATE TABLE nb_residual_data AS SELECT 1.0 y')
+    actual=con.execute(f"SELECT deviance_resid FROM nbinom_influence('nb_residual_model','nb_residual_data','y',alpha:={alpha})").fetchone()[0]
+    expected=-np.sqrt(2*(-np.log(2)-(1+1/alpha)*np.log1p(-alpha/(1+2*alpha))))
+    assert actual==pytest.approx(expected,abs=1e-10)

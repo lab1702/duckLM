@@ -216,31 +216,6 @@ __reg_long AS MATERIALIZED (
     SELECT __reg_rid__ AS rid, name AS col, value AS v
     FROM (UNPIVOT __reg_wide ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
 ),
-__reg_ycheck AS (
-    SELECT CASE
-             WHEN count(*) = 0
-               THEN error(caller || ': outcome column "' || outcome || '" not found, entirely NULL, or table is empty')
-             WHEN family = 'logistic' AND NOT bool_and(v IN (0.0, 1.0))
-               THEN error(caller || ': outcome column "' || outcome || '" must be binary (0/1 or boolean)')
-             WHEN family = 'poisson' AND min(v) < 0
-               THEN error(caller || ': outcome column "' || outcome || '" must be non-negative for Poisson regression')
-             WHEN family = 'gamma' AND min(v) <= 0
-               THEN error(caller || ': outcome column "' || outcome || '" must be strictly positive for Gamma regression')
-             WHEN family = 'tweedie' AND power < 1
-               THEN error(caller || ': power must be >= 1 (1<power<2 for zero-inflated positive data; use linreg_fit for power=0)')
-             WHEN family = 'tweedie' AND power >= 2 AND min(v) <= 0
-               THEN error(caller || ': outcome column "' || outcome || '" must be strictly positive for Tweedie power >= 2')
-             WHEN family = 'tweedie' AND min(v) < 0
-               THEN error(caller || ': outcome column "' || outcome || '" must be non-negative for Tweedie regression')
-             WHEN family = 'nbinom' AND min(v) < 0
-               THEN error(caller || ': outcome column "' || outcome || '" must be non-negative for negative binomial regression')
-             WHEN family = 'nbinom' AND alpha <= 0
-               THEN error(caller || ': alpha (dispersion) must be > 0')
-             ELSE true
-           END AS ok
-    FROM __reg_long
-    WHERE col = outcome
-),
 -- Every column name of the input table, even when the table has zero rows:
 -- the sampled row is LEFT JOINed onto a constant row so the UNPIVOT always
 -- has one row to enumerate (aggregates over an empty input would otherwise
@@ -303,6 +278,31 @@ __reg_complete AS (
 __reg_clong AS MATERIALIZED (
     SELECT l.rid, l.col, l.v
     FROM __reg_long l SEMI JOIN __reg_complete c ON c.rid = l.rid
+),
+__reg_ycheck AS (
+    SELECT CASE
+             WHEN (SELECT count(*) FROM __reg_long WHERE col = outcome) = 0
+               THEN error(caller || ': outcome column "' || outcome || '" not found, entirely NULL, or table is empty')
+             WHEN family = 'logistic' AND NOT bool_and(v IN (0.0, 1.0))
+               THEN error(caller || ': outcome column "' || outcome || '" must be binary (0/1 or boolean)')
+             WHEN family = 'poisson' AND min(v) < 0
+               THEN error(caller || ': outcome column "' || outcome || '" must be non-negative for Poisson regression')
+             WHEN family = 'gamma' AND min(v) <= 0
+               THEN error(caller || ': outcome column "' || outcome || '" must be strictly positive for Gamma regression')
+             WHEN family = 'tweedie' AND power < 1
+               THEN error(caller || ': power must be >= 1 (1<power<2 for zero-inflated positive data; use linreg_fit for power=0)')
+             WHEN family = 'tweedie' AND power >= 2 AND min(v) <= 0
+               THEN error(caller || ': outcome column "' || outcome || '" must be strictly positive for Tweedie power >= 2')
+             WHEN family = 'tweedie' AND min(v) < 0
+               THEN error(caller || ': outcome column "' || outcome || '" must be non-negative for Tweedie regression')
+             WHEN family = 'nbinom' AND min(v) < 0
+               THEN error(caller || ': outcome column "' || outcome || '" must be non-negative for negative binomial regression')
+             WHEN family = 'nbinom' AND alpha <= 0
+               THEN error(caller || ': alpha (dispersion) must be > 0')
+             ELSE true
+           END AS ok
+    FROM __reg_clong
+    WHERE col = outcome
 ),
 -- Sample weight per complete row (1.0 when no weights column is given).
 __reg_w AS (
@@ -2789,16 +2789,16 @@ __reg_pr AS (
          (CASE family WHEN 'logistic' THEN mu*(1.0-mu) WHEN 'linear' THEN 1.0 WHEN 'poisson' THEN mu
                  WHEN 'gamma' THEN mu*mu WHEN 'tweedie' THEN pow(mu,power) WHEN 'nbinom' THEN mu*(1.0+alpha*mu) END) AS Vmu,
          (CASE family
-            WHEN 'logistic' THEN 2.0*((CASE WHEN y>0 THEN y*ln(y/mu) ELSE 0.0 END) + (CASE WHEN y<1 THEN (1.0-y)*ln((1.0-y)/(1.0-mu)) ELSE 0.0 END))
+            WHEN 'logistic' THEN 2.0*(y*greatest(-eta,0.0)+(1-y)*greatest(eta,0.0)+__reg_log1p(exp(-abs(eta))))
             WHEN 'linear'   THEN (y-mu)*(y-mu)
-            WHEN 'poisson'  THEN 2.0*((CASE WHEN y>0 THEN y*ln(y/mu) ELSE 0.0 END) - (y-mu))
-            WHEN 'gamma'    THEN 2.0*(-ln(y/mu) + (y-mu)/mu)
+            WHEN 'poisson'  THEN 2.0*((CASE WHEN y>0 THEN y*(ln(y)-eta) ELSE 0.0 END) - y + exp(eta))
+            WHEN 'gamma'    THEN 2.0*(-ln(y)+eta+y*exp(-eta)-1.0)
             WHEN 'tweedie'  THEN CASE
-              WHEN power = 1.0 THEN 2.0*((CASE WHEN y>0 THEN y*ln(y/mu) ELSE 0.0 END) - (y-mu))
-              WHEN power = 2.0 THEN 2.0*(-ln(y/mu) + (y-mu)/mu)
-              ELSE 2.0*((CASE WHEN y>0 THEN pow(y,2.0-power)/((1.0-power)*(2.0-power)) ELSE 0.0 END) - y*pow(mu,1.0-power)/(1.0-power) + pow(mu,2.0-power)/(2.0-power)) END
-            WHEN 'nbinom'   THEN 2.0*((CASE WHEN y>0 THEN y*ln(y/mu) ELSE 0.0 END) - (y+1.0/alpha)*ln((y+1.0/alpha)/(mu+1.0/alpha))) END) AS udev
-  FROM (SELECT __reg_rid__, xs, wt, y,
+              WHEN power = 1.0 THEN 2.0*((CASE WHEN y>0 THEN y*(ln(y)-eta) ELSE 0.0 END) - y + exp(eta))
+              WHEN power = 2.0 THEN 2.0*(-ln(y)+eta+y*exp(-eta)-1.0)
+              ELSE 2.0*((CASE WHEN y>0 THEN pow(y,2.0-power)/((1.0-power)*(2.0-power)) ELSE 0.0 END) - (CASE WHEN y=0 THEN 0.0 ELSE y*exp((1.0-power)*eta) END)/(1.0-power) + exp((2.0-power)*eta)/(2.0-power)) END
+            WHEN 'nbinom'   THEN 2.0*__reg_nb_halfdev(y,eta,alpha) END) AS udev
+  FROM (SELECT __reg_rid__, xs, wt, y, eta,
                CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                            WHEN 'linear' THEN eta ELSE exp(greatest(-700.0,least(eta,700.0))) END AS mu
         FROM (SELECT __reg_rid__, xs, wt, y, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0))

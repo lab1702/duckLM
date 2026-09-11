@@ -134,3 +134,17 @@ def test_batch_fit_rejects_reserved_internal_columns(con, call):
     """)
     with pytest.raises(duckdb.Error, match="reserved"):
         batch_values(con, call, "reserved_feature")
+
+
+@pytest.mark.parametrize('family',['logit','poisson','gamma','tweedie','nbinom'])
+@pytest.mark.parametrize('missing',['x','expo','wt'])
+def test_outcome_validation_ignores_incomplete_training_rows(con,family,missing):
+    y='i%2' if family=='logit' else 'exp(.2+.1*i)'
+    con.execute(f'CREATE OR REPLACE TABLE retained_rows AS SELECT i::DOUBLE x,({y})::DOUBLE y,0.0 AS expo,1.0 wt FROM range(10)t(i)')
+    con.execute('CREATE OR REPLACE TABLE with_invalid_dropped_row AS SELECT * FROM retained_rows')
+    row={'x':'0.0','y':'-1.0','expo':'0.0','wt':'1.0'};row[missing]='NULL'
+    con.execute('INSERT INTO with_invalid_dropped_row VALUES ('+','.join(row.values())+')')
+    fitted=[]
+    for table in ['retained_rows','with_invalid_dropped_row']:
+        fitted.append(dict(con.execute(f"SELECT * FROM {family}_fit('{table}','y',offset_col:='expo',weights_col:='wt')").fetchall()))
+    assert fitted[1]==pytest.approx(fitted[0],abs=1e-10)
