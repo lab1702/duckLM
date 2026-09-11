@@ -1,6 +1,7 @@
 """Regression coverage for scoring boundaries and generated categorical SQL."""
 
 from pathlib import Path
+from decimal import Decimal, localcontext
 
 import duckdb
 import numpy as np
@@ -43,6 +44,71 @@ def test_tweedie_evaluation_at_poisson_and_gamma_endpoints(con, power):
         len(y) * mean_tweedie_deviance(y, np.full(len(y), y.mean()), power=power)
     )
     assert metrics["pseudo_r2"] == pytest.approx(d2_tweedie_score(y, mu, power=power))
+
+
+def _decimal_tweedie_deviance(y, mu, power):
+    """Evaluate the defining expression with enough precision for cancellation."""
+    if y == mu:
+        return 0.0
+    with localcontext() as context:
+        context.prec = 80
+        y, mu, power = (Decimal.from_float(float(v)) for v in (y, mu, power))
+        if power == 1:
+            half = (y * (y / mu).ln() if y else Decimal(0)) - y + mu
+        elif power == 2:
+            half = -(y / mu).ln() + y / mu - 1
+        else:
+            half = (
+                y ** (2 - power) / ((1 - power) * (2 - power))
+                - y * mu ** (1 - power) / (1 - power)
+                + mu ** (2 - power) / (2 - power)
+            )
+        return float(2 * half)
+
+
+@pytest.mark.parametrize("power, with_zero", [
+    (float(power), with_zero)
+    for power in [
+        1.0, np.nextafter(1.0, 2.0), 1.0 + 1e-10, 1.01, 1.5,
+        2.0 - 1e-10, np.nextafter(2.0, 1.0), 2.0,
+        np.nextafter(2.0, 3.0), 2.0 + 1e-10, 2.01, 3.0,
+    ]
+    for with_zero in [False, True]
+    if not with_zero or power < 2  # Zero outcomes require power < 2.
+])
+def test_tweedie_deviance_is_continuous_near_endpoints(con, power, with_zero):
+    con.execute("CREATE TABLE model AS SELECT * FROM "
+                "(VALUES ('(Intercept)', 0.0), ('x', 1.0)) t(feature, coefficient)")
+    y = np.array([0.0 if with_zero else 1.0, 3.0, 5.0])
+    x = np.array([0.0, 0.5, 1.0])
+    con.execute("CREATE TABLE observations(x DOUBLE, y DOUBLE)")
+    con.executemany("INSERT INTO observations VALUES (?, ?)", list(zip(x.tolist(), y.tolist())))
+    mu = np.exp(x)
+    unit_deviance = np.array([
+        _decimal_tweedie_deviance(yi, mui, power) for yi, mui in zip(y, mu)
+    ])
+    null_deviance = sum(_decimal_tweedie_deviance(yi, y.mean(), power) for yi in y)
+    metrics = _metrics(con, f"tweedie_evaluate('model', 'observations', 'y', power := {power!r}::DOUBLE)")
+    assert metrics["deviance"] == pytest.approx(unit_deviance.sum(), rel=1e-11, abs=1e-12)
+    assert metrics["null_deviance"] == pytest.approx(null_deviance, rel=1e-11, abs=1e-12)
+    assert metrics["pseudo_r2"] == pytest.approx(1 - unit_deviance.sum() / null_deviance,
+                                                 rel=1e-11, abs=1e-12)
+    actual = con.execute(f"SELECT deviance_resid FROM tweedie_influence("
+                         f"'model', 'observations', 'y', power := {power!r}::DOUBLE)").fetchnumpy()["deviance_resid"]
+    expected = np.sign(y - mu) * np.sqrt(unit_deviance)
+    np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-12)
+
+
+@pytest.mark.parametrize("power", [1.0000000001, 1.5, 1.9999999999, 2.0000000001, 3.0])
+@pytest.mark.parametrize("outcomes", [[1e-300, 1e300], [1 - 1e-7, 1 + 1e-7]])
+def test_tweedie_deviance_handles_extreme_and_nearly_exact_means(con, power, outcomes):
+    con.execute("CREATE TABLE model AS SELECT '(Intercept)' feature, 0.0 coefficient")
+    con.execute("CREATE TABLE observations(y DOUBLE)")
+    con.executemany("INSERT INTO observations VALUES (?)", [(y,) for y in outcomes])
+    metrics = _metrics(con, f"tweedie_evaluate('model', 'observations', 'y', power := {power}::DOUBLE)")
+    expected = sum(_decimal_tweedie_deviance(y, 1.0, power) for y in outcomes)
+    assert np.isfinite(metrics["deviance"])
+    assert metrics["deviance"] == pytest.approx(expected, rel=1e-10, abs=0)
 
 
 @pytest.mark.parametrize("outcome", [0, 1])

@@ -924,6 +924,32 @@ CREATE OR REPLACE MACRO __reg_nb_halfdev(y, eta, alpha) AS (
   )[1]
 );
 
+-- exp(s) * (exp(a*x)-1)/a, continuous at a=0. Expand the small
+-- exponential difference before dividing; combine exponents on the other
+-- branch so a large ratio does not overflow before scaling it back down.
+CREATE OR REPLACE MACRO __reg_exp_diff_quotient(s, a, x) AS (
+  list_transform([a*x], lambda v:
+    CASE WHEN abs(v) < 1e-4
+         THEN exp(s)*x*(1.0+v*(0.5+v*(1.0/6.0+v*(1.0/24.0+v/120.0))))
+         ELSE (exp(s+v)-exp(s))/a END)[1]
+);
+
+-- Tweedie half-deviance written as a difference of exponential quotients.
+-- Unlike the three power terms, neither quotient diverges at p=1 or p=2.
+-- A local series also avoids cancellation when the observation equals its mean.
+CREATE OR REPLACE MACRO __reg_tw_halfdev(y, eta, power) AS (
+  CASE WHEN y = 0 THEN exp((2.0-power)*eta)/(2.0-power)
+       ELSE list_transform([struct_pack(q := 2.0-power, r := 1.0-power,
+                                         t := ln(y)-eta, s := (2.0-power)*ln(y))], lambda z:
+         CASE WHEN abs(z.t)*greatest(abs(z.q),abs(z.r)) < 1e-3
+              THEN exp(z.s)*z.t*z.t*(0.5-z.t*(
+                   (z.q+z.r)/6.0-z.t*((z.q*z.q+z.q*z.r+z.r*z.r)/24.0
+                   -z.t*(z.q+z.r)*(z.q*z.q+z.r*z.r)/120.0)))
+              ELSE __reg_exp_diff_quotient(z.s,z.q,-z.t)
+                   -__reg_exp_diff_quotient(z.s,z.r,-z.t) END)[1]
+  END
+);
+
 CREATE OR REPLACE MACRO __reg_eval(model, tbl, outcome, family, caller, offset_col, power, alpha) AS TABLE
 WITH RECURSIVE
 __reg_numbered AS MATERIALIZED (
@@ -1017,12 +1043,7 @@ __reg_agg AS (
            sum(-ln(y) + z + y * exp(-z) - 1.0) AS dev_gam_half,
            sum(((y - yhat) / yhat) * ((y - yhat) / yhat)) AS pearson_gam,
            -- Tweedie unit half-deviance and Pearson chi-square (power = p).
-           sum(CASE WHEN power = 1 THEN
-                      (CASE WHEN y > 0 THEN y * (ln(y) - z) ELSE 0.0 END) - (y - yhat)
-                    WHEN power = 2 THEN -ln(y) + z + y * exp(-z) - 1.0
-                    ELSE pow(greatest(y, 0.0), 2.0 - power) / ((1.0 - power) * (2.0 - power))
-               - (CASE WHEN y = 0 THEN 0.0 ELSE y * exp((1.0 - power) * z) END) / (1.0 - power)
-               + exp((2.0 - power) * z) / (2.0 - power) END) AS dev_tw_half,
+           sum(__reg_tw_halfdev(y,z,power)) AS dev_tw_half,
            sum((y - yhat) * (y - yhat) / pow(yhat, power)) AS pearson_tw,
            -- Negative binomial (NB2, r = 1/alpha): log-likelihood, half-deviance,
            -- and Pearson chi-square (variance = mu + alpha*mu^2).
@@ -1085,12 +1106,7 @@ __reg_null AS (
            sum((CASE WHEN y > 0 THEN y * ln(y / r.mu0) ELSE 0.0 END) - (y - r.mu0)) AS null_dev_pois_half,
            sum(-ln(y / r.mu0) + (y - r.mu0) / r.mu0) AS null_dev_gam_half,
            sum(CASE WHEN y = 0 AND r.mu0 = 0 THEN 0.0
-                    WHEN power = 1 THEN
-                      (CASE WHEN y > 0 THEN y * ln(y / r.mu0) ELSE 0.0 END) - (y - r.mu0)
-                    WHEN power = 2 THEN -ln(y / r.mu0) + (y - r.mu0) / r.mu0
-                    ELSE pow(greatest(y, 0.0), 2.0 - power) / ((1.0 - power) * (2.0 - power))
-               - y * pow(r.mu0, 1.0 - power) / (1.0 - power)
-               + pow(r.mu0, 2.0 - power) / (2.0 - power) END) AS null_dev_tw_half,
+                    ELSE __reg_tw_halfdev(y,ln(r.mu0),power) END) AS null_dev_tw_half,
            sum(CASE WHEN y = 0 AND r.mu0 = 0 THEN 0.0
                     ELSE __reg_nb_halfdev(y,ln(r.mu0),alpha) END) AS null_dev_nb_half
     FROM __reg_null_rows r, __reg_agg a
@@ -2827,10 +2843,7 @@ __reg_pr AS (
             WHEN 'linear'   THEN (y-mu)*(y-mu)
             WHEN 'poisson'  THEN 2.0*((CASE WHEN y>0 THEN y*(ln(y)-eta) ELSE 0.0 END) - y + exp(eta))
             WHEN 'gamma'    THEN 2.0*(-ln(y)+eta+y*exp(-eta)-1.0)
-            WHEN 'tweedie'  THEN CASE
-              WHEN power = 1.0 THEN 2.0*((CASE WHEN y>0 THEN y*(ln(y)-eta) ELSE 0.0 END) - y + exp(eta))
-              WHEN power = 2.0 THEN 2.0*(-ln(y)+eta+y*exp(-eta)-1.0)
-              ELSE 2.0*((CASE WHEN y>0 THEN pow(y,2.0-power)/((1.0-power)*(2.0-power)) ELSE 0.0 END) - (CASE WHEN y=0 THEN 0.0 ELSE y*exp((1.0-power)*eta) END)/(1.0-power) + exp((2.0-power)*eta)/(2.0-power)) END
+            WHEN 'tweedie'  THEN 2.0*__reg_tw_halfdev(y,eta,power)
             WHEN 'nbinom'   THEN 2.0*__reg_nb_halfdev(y,eta,alpha) END) AS udev
   FROM (SELECT __reg_rid__, xs, wt, y, eta,
                CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
