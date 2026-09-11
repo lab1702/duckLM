@@ -668,3 +668,15 @@ def test_scoring_preserves_small_products_when_finite_product_sum_overflows(con,
     column = 'prob' if family == 'logit' else 'prediction'
     prediction = con.execute(f"SELECT {column} FROM {family}_predict('model','observations')").fetchone()[0]
     assert prediction == pytest.approx(expected,rel=1e-12,abs=0.)
+
+
+@pytest.mark.parametrize('score', [-710., -720., -740.])
+def test_logistic_predictions_preserve_representable_negative_tail_probabilities(con, score):
+    con.execute("CREATE TABLE model AS SELECT * FROM (VALUES ('(Intercept)',0.),('x',1.))t(feature,coefficient)")
+    con.execute('CREATE TABLE observations AS SELECT ?::DOUBLE x',[score])
+    expected = np.exp(score)/(1+np.exp(score))
+    for threshold,predicted_class in [(expected/2,True),(expected*2,False)]:
+        probability,classification = con.execute("SELECT prob,pred FROM logit_predict('model','observations',threshold:=?)",[threshold]).fetchone()
+        assert probability > 0.
+        assert probability == pytest.approx(expected,rel=1e-12,abs=0.)
+        assert classification == predicted_class

@@ -289,6 +289,20 @@ CREATE OR REPLACE MACRO __reg_dot(va, vb) AS (
       END)[1])[1]
 );
 
+-- Recover a nonlinear training predictor from root-weighted coordinates when
+-- a finite observation overflows during unweighted standardization. Apply the
+-- coefficients before removing the root weight, so zero coefficients stay zero.
+CREATE OR REPLACE MACRO __reg_fit_dot(xs, wxs, sw, beta) AS (
+  list_transform([list_dot_product(xs,beta)], lambda direct:
+    CASE WHEN isfinite(direct) THEN direct ELSE list_dot_product(wxs,beta)/sw END)[1]
+);
+
+-- exp(-eta) can overflow while the negative-tail probability is representable.
+CREATE OR REPLACE MACRO __reg_sigmoid(eta) AS (
+  CASE WHEN eta >= 0 THEN 1.0/(1.0+exp(-eta))
+       ELSE exp(eta)/(1.0+exp(eta)) END
+);
+
 -- Combine the mean powers before multiplying by outcomes or residuals.
 CREATE OR REPLACE MACRO __reg_tw_score(y, mu, power) AS (
   __reg_mul_div(y-mu,pow(mu,2.0-power),mu)
@@ -710,11 +724,11 @@ __reg_irls(it, betas, move) AS (
                             SELECT g.it, g.betas, p.sumw, c.log_alpha_int AS log_alpha_int,
                                    list_transform(p.rows, lambda rw: struct_pack(
                                        xs := rw.wxs, w := rw.sw, y := rw.y,
-                                       linpred := list_dot_product(rw.xs, g.betas),
+                                       linpred := __reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas),
                                        mu := CASE family
-                                               WHEN 'logistic' THEN 1.0 / (1.0 + exp(-greatest(least(list_dot_product(rw.xs, g.betas) + rw.o, 700.0), -700.0)))
-                                               WHEN 'linear'   THEN list_dot_product(rw.xs, g.betas) + rw.o
-                                               ELSE exp(greatest(least(list_dot_product(rw.xs, g.betas) + rw.o, 700.0), -700.0)) END
+                                               WHEN 'logistic' THEN 1.0 / (1.0 + exp(-greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o, 700.0), -700.0)))
+                                               WHEN 'linear'   THEN __reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o
+                                               ELSE exp(greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o, 700.0), -700.0)) END
                                        )) AS mus
                             FROM __reg_irls g, __reg_packed p, __reg_cfg c
                             -- isfinite() stops promptly on a singular step (NaN move),
@@ -817,28 +831,28 @@ __reg_gd AS (
                            xs := rw.wxs,
                            w  := rw.sw,
                            r  := CASE WHEN family = 'logistic'
-                                      THEN rw.y - 1.0 / (1.0 + exp(-(list_dot_product(rw.xs, look) + rw.o)))
+                                      THEN rw.y - __reg_sigmoid(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o)
                                       WHEN family = 'poisson'
-                                      THEN rw.y - exp(least(list_dot_product(rw.xs, look) + rw.o, 700.0))
+                                      THEN rw.y - exp(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o, 700.0))
                                       WHEN family = 'gamma'
-                                      THEN rw.y / exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)) - 1.0
+                                      THEN rw.y / exp(greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o, 700.0), -700.0)) - 1.0
                                       WHEN family = 'tweedie'
-                                      THEN __reg_tw_score(rw.y,exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)),power)
+                                      THEN __reg_tw_score(rw.y,exp(greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o, 700.0), -700.0)),power)
                                       WHEN family = 'nbinom'
                                       -- NB2: r = (y - mu) / (1 + alpha*mu), mu = exp(eta);
                                       -- reduces to Poisson (y - mu) as alpha -> 0
-                                      THEN __reg_nb_fit_score(rw.y,least(list_dot_product(rw.xs, look) + rw.o,700.0),log_alpha_int,l1=0 AND l2=0)
-                                      ELSE rw.y - (list_dot_product(rw.xs, look) + rw.o)
+                                      THEN __reg_nb_fit_score(rw.y,least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o,700.0),log_alpha_int,l1=0 AND l2=0)
+                                      ELSE rw.y - (__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o)
                                  END,
                            hw := CASE WHEN family = 'poisson'
-                                      THEN exp(least(list_dot_product(rw.xs, look) + rw.o, 700.0))
+                                      THEN exp(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o, 700.0))
                                       WHEN family = 'gamma'
-                                      THEN rw.y / exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0))
+                                      THEN rw.y / exp(greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o, 700.0), -700.0))
                                       WHEN family = 'tweedie'
-                                      THEN __reg_tw_observed(rw.y,exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)),power)
+                                      THEN __reg_tw_observed(rw.y,exp(greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o, 700.0), -700.0)),power)
                                       WHEN family = 'nbinom'
                                       -- NB Hessian weight mu(1+alpha*y)/(1+alpha*mu)^2
-                                      THEN __reg_nb_fit_observed(rw.y,least(list_dot_product(rw.xs, look) + rw.o,700.0),log_alpha_int,l1=0 AND l2=0)
+                                      THEN __reg_nb_fit_observed(rw.y,least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o,700.0),log_alpha_int,l1=0 AND l2=0)
                                       ELSE 0.0
                                  END)) AS res
                 FROM (
@@ -984,8 +998,8 @@ SELECT * FROM __reg_fit(tbl, outcome, 'linear', 'linreg_fit', max_iter, learning
 
 CREATE OR REPLACE MACRO logit_predict(model, tbl, threshold := 0.5, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
-       1.0 / (1.0 + exp(-__reg_score__)) AS prob,
-       1.0 / (1.0 + exp(-__reg_score__)) >= threshold AS pred
+       __reg_sigmoid(__reg_score__) AS prob,
+       __reg_sigmoid(__reg_score__) >= threshold AS pred
 FROM __reg_score(model, tbl, 'logit_predict', offset_col)
 ORDER BY __reg_rid__;
 
@@ -1226,7 +1240,7 @@ __reg_y AS (SELECT rid, v AS y FROM __reg_long WHERE col = outcome),
 -- mean response yhat under the family's inverse link.
 __reg_rows AS (
     SELECT y.y, z.z, coalesce(o.o, 0.0) AS o,
-           CASE family WHEN 'logistic' THEN 1.0 / (1.0 + exp(-z.z))
+           CASE family WHEN 'logistic' THEN __reg_sigmoid(z.z)
                        WHEN 'poisson'  THEN exp(z.z)
                        WHEN 'gamma'    THEN exp(z.z)
                        WHEN 'tweedie'  THEN exp(z.z)
@@ -2092,7 +2106,7 @@ __reg_cv_gd AS (
                    -- gradient sum below can skip the per-coefficient fold test.
                    r := list_transform(look, lambda bm, m:
                      CASE WHEN mfold[m] = rw.fold THEN 0.0 ELSE
-                     (CASE WHEN family='logistic' THEN rw.yt - 1.0/(1.0+exp(-list_dot_product(rw.xs,bm)))
+                     (CASE WHEN family='logistic' THEN rw.yt - __reg_sigmoid(list_dot_product(rw.xs,bm))
                            WHEN family='poisson'  THEN rw.yt - exp(least(list_dot_product(rw.xs,bm),700.0))
                            WHEN family='gamma'    THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)) - 1.0
                            WHEN family='tweedie'  THEN __reg_tw_score(rw.yt,exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),mpow[m])
@@ -3256,13 +3270,13 @@ __reg_serrors AS (
   FROM __reg_scored
 )
 SELECT sn.* EXCLUDE (__reg_srid__),
-       CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-s.eta)) WHEN 'linear' THEN s.eta ELSE exp(s.eta) END AS prediction,
+       CASE family WHEN 'logistic' THEN __reg_sigmoid(s.eta) WHEN 'linear' THEN s.eta ELSE exp(s.eta) END AS prediction,
        CASE WHEN s.unit_se IS NULL OR NOT isfinite(s.unit_se) THEN NULL
-            ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta - s.crit*s.unit_se)))
+            ELSE (CASE family WHEN 'logistic' THEN __reg_sigmoid(s.eta - s.crit*s.unit_se)
                               WHEN 'linear' THEN __reg_dot([s.eta,-s.crit],[1.0,s.unit_se])
                               ELSE exp(s.eta - s.crit*s.unit_se) END) END AS conf_low,
        CASE WHEN s.unit_se IS NULL OR NOT isfinite(s.unit_se) THEN NULL
-            ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta + s.crit*s.unit_se)))
+            ELSE (CASE family WHEN 'logistic' THEN __reg_sigmoid(s.eta + s.crit*s.unit_se)
                               WHEN 'linear' THEN __reg_dot([s.eta,s.crit],[1.0,s.unit_se])
                               ELSE exp(s.eta + s.crit*s.unit_se) END) END AS conf_high
 FROM __reg_serrors s JOIN __reg_snum sn ON sn.__reg_srid__ = s.__reg_srid__

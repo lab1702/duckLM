@@ -270,6 +270,23 @@ def test_linear_fit_uses_weighted_coordinates_when_raw_standardization_overflows
     np.testing.assert_allclose(predictions,expected,rtol=1e-8,atol=1e-8)
 
 
+@pytest.mark.parametrize('solver', ['auto', 'gd'])
+@pytest.mark.parametrize('direction', [-1., 1.])
+@pytest.mark.parametrize('offset', [0., 1.5])
+def test_weighted_logistic_fit_handles_overflowing_unweighted_coordinates(con, solver, direction, offset):
+    from scipy.optimize import brentq
+    from scipy.special import expit
+
+    con.execute('CREATE TABLE weighted_coordinates(x DOUBLE,y DOUBLE,w DOUBLE,expo DOUBLE)')
+    con.executemany('INSERT INTO weighted_coordinates VALUES (?,?,?,?)',
+                    [(0.,0.,1e308,offset),(direction,1.,1e308,offset),(direction*1e308,1.,1e-310,offset)])
+    coefficients = dict(con.execute(f"SELECT * FROM logit_fit('weighted_coordinates','y',weights_col:='w',offset_col:='expo',solver:='{solver}',l2:=.2,max_iter:=100)").fetchall())
+    # The tiny row contributes .005 to weighted feature variance, but its
+    # likelihood gradient vanishes at the positive-margin ridge optimum.
+    slope = brentq(lambda s: .5*(expit(s/2)-1)+.2*.255*s,0.,10.)
+    assert coefficients == pytest.approx({'(Intercept)':-slope/2-offset,'x':direction*slope},abs=1e-8)
+
+
 @pytest.mark.parametrize('solver', ['auto', 'irls', 'gd'])
 def test_linear_intercept_cancels_before_restoring_outcome_units(con, solver):
     con.execute('CREATE TABLE finite_intercept AS SELECT * FROM (VALUES (-2.5,-1e308),(-2.,-5e307),(-1.5,0.))t(x,y)')

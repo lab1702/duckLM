@@ -35,6 +35,25 @@ def training():
     return pd.DataFrame({"x": x, "y": rng.poisson(np.exp(0.3 + 0.2 * x)).astype(float)})
 
 
+@pytest.mark.parametrize('score', [-710., -720., -740.])
+def test_logistic_prediction_intervals_preserve_negative_tail_probabilities(con, score):
+    from scipy.stats import norm
+
+    con.execute("CREATE TABLE tail_model AS SELECT * FROM (VALUES ('(Intercept)',0.),('x',1.))t(feature,coefficient)")
+    con.execute('CREATE TABLE tail_train AS SELECT i::DOUBLE x,(i>0)::DOUBLE y,1e12 w FROM range(-1,2)t(i)')
+    con.execute('CREATE TABLE tail_score AS SELECT ?::DOUBLE x',[score])
+    actual = np.array(con.execute("SELECT prediction,conf_low,conf_high FROM logit_predict_ci('tail_model','tail_train','y',newdata:='tail_score',weights_col:='w')").fetchone())
+    x = np.column_stack([np.ones(3),np.arange(-1.,2.)])
+    p = 1/(1+np.exp(-x[:,1]))
+    covariance = np.linalg.inv(x.T@((1e12*p*(1-p))[:,None]*x))
+    row = np.array([1.,score])
+    margin = norm.ppf(.975)*np.sqrt(row@covariance@row)
+    logits = np.array([score,score-margin,score+margin])
+    expected = np.exp(logits)/(1+np.exp(logits))
+    assert (actual > 0).all()
+    np.testing.assert_allclose(actual,expected,rtol=1e-12,atol=0.)
+
+
 @pytest.mark.parametrize('family', ['linreg', 'logit', 'poisson', 'gamma', 'tweedie', 'nbinom'])
 @pytest.mark.parametrize('extreme_column', ['x', 'expo', 'y'])
 def test_zero_weight_extremes_cannot_contaminate_inference(con, family, extreme_column):
