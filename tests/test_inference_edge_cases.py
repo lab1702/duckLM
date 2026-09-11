@@ -816,3 +816,37 @@ def test_negative_binomial_large_mean_diagnostics_match_finite_ratio_reference(c
     expected_ci = 2*np.exp(np.column_stack([-np.sqrt(variance), np.sqrt(variance)])*norm.ppf(.975))
     actual_ci = con.execute(f'SELECT conf_low,conf_high FROM nbinom_predict_ci({args})').df().to_numpy()/scale
     np.testing.assert_allclose(actual_ci, expected_ci, rtol=1e-10)
+
+
+@pytest.mark.parametrize('family', ['poisson', 'nbinom'])
+@pytest.mark.parametrize('scale', [1e-302, 1e-310])
+def test_tiny_positive_information_preserves_uncertainty_and_leverage(con, family, scale):
+    x = np.arange(-10, 11)/10
+    mu = np.exp(.3*x)
+    ratio = 1+.1*(np.arange(21)%3)
+    design = np.column_stack([np.ones(21), x])
+    load(con, 'tiny_information', pd.DataFrame({'x': x, 'y': scale*mu*ratio}))
+    con.execute("CREATE TABLE tiny_model AS SELECT '(Intercept)' feature,ln(?) coefficient UNION ALL SELECT 'x',.3", [scale])
+    inverse = np.linalg.inv(design.T@(mu[:, None]*design))
+    # NB tends to Poisson here: alpha*mu is far below machine precision.
+    se = con.execute(f"SELECT std_error FROM {family}_summary('tiny_model','tiny_information','y')").df()['std_error'].to_numpy()
+    np.testing.assert_allclose(se*np.sqrt(scale), np.sqrt(np.diag(inverse)), rtol=1e-10)
+    scores = mu*(ratio-1)
+    robust_cov = inverse@(design.T@((scores**2)[:, None]*design))@inverse
+    robust = con.execute(f"SELECT std_error FROM {family}_summary('tiny_model','tiny_information','y',robust:='hc0')").df()['std_error'].to_numpy()
+    np.testing.assert_allclose(robust, np.sqrt(np.diag(robust_cov)), rtol=1e-9)
+    hat = con.execute(f"SELECT hat FROM {family}_influence('tiny_model','tiny_information','y')").df()['hat'].to_numpy()
+    np.testing.assert_allclose(hat, mu*np.einsum('ij,jk,ik->i', design, inverse, design), rtol=1e-10)
+    ci = con.execute(f"SELECT conf_low,conf_high FROM {family}_predict_ci('tiny_model','tiny_information','y')").fetchall()
+    # The link-scale standard error is finite; exponentiating its enormous
+    # normal interval legitimately reaches zero/infinity, rather than NULL.
+    assert all(low == 0.0 and high == np.inf for low, high in ci)
+
+
+@pytest.mark.parametrize('scale', [1e-302, 1e-310])
+def test_multinomial_tiny_class_information_has_finite_standard_errors(con, scale):
+    con.execute("CREATE TABLE tiny_classes AS SELECT i::DOUBLE x,CASE WHEN i%2=0 THEN 'a' ELSE 'b' END y FROM range(6)t(i)")
+    con.execute("CREATE TABLE tiny_model AS SELECT 'a' AS class,'(Intercept)' feature,0.0 coefficient UNION ALL SELECT 'a','x',0.0 UNION ALL SELECT 'b','(Intercept)',ln(?) UNION ALL SELECT 'b','x',0.0", [scale])
+    design = np.column_stack([np.ones(6), np.arange(6)])
+    se = con.execute("SELECT std_error FROM multinom_summary('tiny_model','tiny_classes','y')").df()['std_error'].to_numpy()
+    np.testing.assert_allclose(se*np.sqrt(scale), np.sqrt(np.diag(np.linalg.inv(design.T@design))), rtol=1e-10)

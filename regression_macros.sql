@@ -669,13 +669,13 @@ __reg_gd AS (
                    CASE WHEN j = 1 THEN zj
                         ELSE sign(zj) * greatest(abs(zj) - threshl1, 0.0) END) AS newbetas
         FROM (
-            SELECT it, betas, look, (step / damp) * l1 AS threshl1,
+            SELECT it, betas, look, step * (l1 / damp) AS threshl1,
                    -- smooth-part gradient step z = look + (step/damp)*(grad - l2*look);
                    -- (1/sumw) sum_i w_i xs_ij r_i is the mean-loss gradient, and the
                    -- smooth L2 gradient l2*look_j stays here (not in the prox).
                    list_transform(look, lambda b, j:
-                       b + (step / damp) * (list_sum(list_transform(res, lambda ob: ob.w * ob.xs[j] * ob.r)) / sumw
-                                            - CASE WHEN j = 1 THEN 0.0 ELSE l2 * b END)) AS zstep
+                       b + step * ((list_sum(list_transform(res, lambda ob: ob.w * ob.xs[j] * ob.r)) / sumw
+                                    - CASE WHEN j = 1 THEN 0.0 ELSE l2 * b END) / damp)) AS zstep
             FROM (
                 SELECT it, betas, n, sumw, step, look, res,
                    -- The log-link families (Poisson/Gamma/Tweedie) have
@@ -686,8 +686,8 @@ __reg_gd AS (
                    -- the residual bounds steps far from the optimum, where
                    -- curvature alone can be arbitrarily small.
                    CASE WHEN family = 'nbinom'
-                        THEN greatest(1e-300, l2 + list_aggregate(
-                               list_transform(res, lambda ob: ob.hw + abs(ob.r)), 'max'))
+                        THEN coalesce(nullif(l2 + list_aggregate(
+                               list_transform(res, lambda ob: ob.hw + abs(ob.r)), 'max'),0.0),1.0)
                         WHEN family IN ('poisson', 'gamma', 'tweedie')
                         THEN greatest(1.0, list_aggregate(
                                list_transform(res, lambda ob: ob.hw), 'max'))
@@ -724,8 +724,7 @@ __reg_gd AS (
                                       WHEN family = 'nbinom'
                                       -- NB2: r = (y - mu) / (1 + alpha*mu), mu = exp(eta);
                                       -- reduces to Poisson (y - mu) as alpha -> 0
-                                      THEN (rw.y - exp(least(list_dot_product(rw.xs, look) + rw.o, 700.0)))
-                                           / (1.0 + alpha_int * exp(least(list_dot_product(rw.xs, look) + rw.o, 700.0)))
+                                      THEN __reg_nb_score(rw.y,least(list_dot_product(rw.xs, look) + rw.o,700.0),alpha_int)
                                       ELSE rw.y - (list_dot_product(rw.xs, look) + rw.o)
                                  END,
                            hw := CASE WHEN family = 'poisson'
@@ -737,8 +736,7 @@ __reg_gd AS (
                                            + (power - 1.0) * rw.y * pow(exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)), 1.0 - power)
                                       WHEN family = 'nbinom'
                                       -- NB Hessian weight mu(1+alpha*y)/(1+alpha*mu)^2
-                                      THEN exp(least(list_dot_product(rw.xs, look) + rw.o, 700.0)) * (1.0 + alpha_int * rw.y)
-                                           / pow(1.0 + alpha_int * exp(least(list_dot_product(rw.xs, look) + rw.o, 700.0)), 2.0)
+                                      THEN __reg_nb_observed(rw.y,least(list_dot_product(rw.xs, look) + rw.o,700.0),alpha_int)
                                       ELSE 0.0
                                  END)) AS res
                 FROM (
@@ -1023,8 +1021,9 @@ CREATE OR REPLACE MACRO __reg_nb_info(eta, alpha) AS (
   exp(eta-__reg_softplus(ln(alpha)+eta))
 );
 CREATE OR REPLACE MACRO __reg_nb_observed(y, eta, alpha) AS (
-  exp(eta + CASE WHEN y = 0 THEN 0.0 ELSE __reg_softplus(ln(alpha)+ln(y)) END
-      - 2.0*__reg_softplus(ln(alpha)+eta))
+  CASE WHEN alpha = 0 THEN exp(eta)
+       ELSE exp(eta + CASE WHEN y = 0 THEN 0.0 ELSE __reg_softplus(ln(alpha)+ln(y)) END
+                - 2.0*__reg_softplus(ln(alpha)+eta)) END
 );
 CREATE OR REPLACE MACRO __reg_nb_pearson(y, eta, alpha) AS (
   CASE WHEN eta >= 0 THEN (y/exp(eta)-1.0)/sqrt(exp(-eta)+alpha)
@@ -1946,7 +1945,7 @@ __reg_cv_gd AS (
            -- L1 prox on the L2-inclusive gradient step, per model per coef
            list_transform(zstep, lambda zm, m: list_transform(zm, lambda zmj, j:
                CASE WHEN j = 1 THEN zmj
-                    ELSE sign(zmj) * greatest(abs(zmj) - (step/damp[m])*ml1[m], 0.0) END)) AS newB
+                    ELSE sign(zmj) * greatest(abs(zmj) - step*(ml1[m]/damp[m]), 0.0) END)) AS newB
     FROM (
       SELECT it, B, look, step, damp, ml1,
              -- The held-out rows are zeroed in `r` (below), not here: this inner
@@ -1954,9 +1953,9 @@ __reg_cv_gd AS (
              -- here would index mfold[m] and compare it D1 times per (row, model).
              -- A zero residual contributes nothing to the gradient either way.
              list_transform(look, lambda bm, m: list_transform(bm, lambda lmj, j:
-                 lmj + (step/damp[m]) * (
+                 lmj + step * ((
                    list_sum(list_transform(res, lambda ob: ob.xs[j] * ob.r[m])) / mntrain[m]
-                   - CASE WHEN j = 1 THEN 0.0 ELSE ml2[m] * lmj END))) AS zstep
+                   - CASE WHEN j = 1 THEN 0.0 ELSE ml2[m] * lmj END) / damp[m]))) AS zstep
       FROM (
         SELECT it, B, look, step, mfold, ml2, ml1, mntrain, res,
                -- NB candidates can differ by many orders of magnitude in
@@ -1964,8 +1963,8 @@ __reg_cv_gd AS (
                -- bound steps with residuals when far from the optimum.
                CASE WHEN family = 'nbinom'
                     THEN list_transform(mfold, lambda mf, m:
-                           greatest(1e-300, ml2[m] + list_aggregate(
-                             list_transform(res, lambda ob: ob.hw[m]+abs(ob.r[m])), 'max')))
+                           coalesce(nullif(ml2[m] + list_aggregate(
+                             list_transform(res, lambda ob: ob.hw[m]+abs(ob.r[m])), 'max'),0.0),1.0))
                     ELSE list_resize([]::DOUBLE[], len(mfold),
                          CASE WHEN family IN ('poisson','gamma','tweedie')
                            THEN greatest(1.0, list_aggregate(list_transform(res,
@@ -1984,8 +1983,7 @@ __reg_cv_gd AS (
                            WHEN family='gamma'    THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)) - 1.0
                            WHEN family='tweedie'  THEN (rw.yt - exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)))
                                                        * pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)), 1.0 - mpow[m])
-                           WHEN family='nbinom'   THEN (rw.yt - exp(least(list_dot_product(rw.xs,bm),700.0)))
-                                                       / (1.0 + malp_int[m] * exp(least(list_dot_product(rw.xs,bm),700.0)))
+                           WHEN family='nbinom'   THEN __reg_nb_score(rw.yt,least(list_dot_product(rw.xs,bm),700.0),malp_int[m])
                            ELSE rw.yt - list_dot_product(rw.xs,bm) END) END),
                    -- hw damps the step for the unbounded-curvature log-link families
                    -- only; for the others `damp` is the constant 1.0 and hw is never
@@ -1998,8 +1996,7 @@ __reg_cv_gd AS (
                            WHEN family='gamma'   THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0))
                            WHEN family='tweedie' THEN (2.0-mpow[m])*pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),2.0-mpow[m])
                                                      + (mpow[m]-1.0)*rw.yt*pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),1.0-mpow[m])
-                           WHEN family='nbinom'  THEN exp(least(list_dot_product(rw.xs,bm),700.0))*(1.0+malp_int[m]*rw.yt)
-                                                     / pow(1.0+malp_int[m]*exp(least(list_dot_product(rw.xs,bm),700.0)),2.0)
+                           WHEN family='nbinom'  THEN __reg_nb_observed(rw.yt,least(list_dot_product(rw.xs,bm),700.0),malp_int[m])
                            ELSE 0.0 END) END) END)) AS res
           FROM (
             SELECT g.it, g.B, p.rows, c.step, ma.mfold, ma.ml2, ma.ml1, ma.mntrain, ma.mpow, ma.malp_int,
@@ -2189,20 +2186,18 @@ __reg_nbd_gd AS (
   FROM (
     SELECT it, B, look,
            list_transform(look, lambda bm, m: list_transform(bm, lambda lmj, j:
-               lmj + (step/damp[m]) * (list_sum(list_transform(res, lambda ob: ob.xs[j] * ob.r[m])) / n))) AS newB
+               lmj + step * ((list_sum(list_transform(res, lambda ob: ob.xs[j] * ob.r[m])) / n) / damp[m]))) AS newB
     FROM (
       SELECT it, B, look, step, n, res,
-             list_transform(malp_int, lambda al, m: greatest(1e-300,
-               list_aggregate(list_transform(res, lambda ob: ob.hw[m]+abs(ob.r[m])), 'max'))) AS damp
+             list_transform(malp_int, lambda al, m: coalesce(nullif(
+               list_aggregate(list_transform(res, lambda ob: ob.hw[m]+abs(ob.r[m])), 'max'),0.0),1.0)) AS damp
       FROM (
         SELECT it, B, look, step, n, malp_int,
                list_transform(rows, lambda rw: struct_pack(
                  r := list_transform(look, lambda bm, m:
-                        (rw.yt - exp(least(list_dot_product(rw.xs,bm),700.0)))
-                        / (1.0 + malp_int[m]*exp(least(list_dot_product(rw.xs,bm),700.0)))),
+                        __reg_nb_score(rw.yt,least(list_dot_product(rw.xs,bm),700.0),malp_int[m])),
                  hw := list_transform(look, lambda bm, m:
-                        exp(least(list_dot_product(rw.xs,bm),700.0))*(1.0+malp_int[m]*rw.yt)
-                        / pow(1.0+malp_int[m]*exp(least(list_dot_product(rw.xs,bm),700.0)),2.0)),
+                        __reg_nb_observed(rw.yt,least(list_dot_product(rw.xs,bm),700.0),malp_int[m])),
                  xs := rw.xs)) AS res
         FROM (
           SELECT g.it, g.B, p.rows, p.n, c.step, ma.malp_int,
@@ -2682,13 +2677,18 @@ __reg_rww AS (
     FROM (SELECT __reg_rid__, xs, y, wt, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0)
   ) r CROSS JOIN __reg_xunits u
 ),
+-- Remove the common Fisher-information scale before accumulation/inversion;
+-- restore it after square roots, so finite standard errors need no finite variance.
+__reg_infounit AS (
+  SELECT coalesce(nullif(max(w),0.0),1.0) AS wunit FROM __reg_rww
+),
 __reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_rww),
 __reg_idx AS (SELECT unnest(range(1, (SELECT d FROM __reg_dims)+1)) AS i),
 __reg_pairs AS (SELECT a.i AS a, b.i AS b FROM __reg_idx a, __reg_idx b),
 __reg_xwx AS (
   SELECT list(rowlist ORDER BY a) AS A FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
-      SELECT p.a AS a, p.b AS b, sum(__reg_rww.w * __reg_rww.xs[p.a] * __reg_rww.xs[p.b]) AS val
+      SELECT p.a AS a, p.b AS b, sum((__reg_rww.w/(SELECT wunit FROM __reg_infounit)) * __reg_rww.xs[p.a] * __reg_rww.xs[p.b]) AS val
       FROM __reg_rww, __reg_pairs p GROUP BY p.a, p.b
     ) GROUP BY a
   )
@@ -2697,7 +2697,7 @@ __reg_xwx AS (
 -- singular-pivot test scale-invariant and squares less conditioning error.
 -- dsc[j] = sqrt(diag_j); Cov = phi * D^-1 R^-1 D^-1, so SE_j = sqrt(phi*Rinv_jj)/dsc_j.
 __reg_scal AS (
-  SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc
+  SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 0.0 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc
   FROM __reg_xwx
 ),
 __reg_rscaled AS (
@@ -2754,7 +2754,7 @@ __reg_disp AS (
 -- the score-outer-product, including squared analytic weights (var_weights).
 -- A uniform rescaling of analytic weights therefore leaves robust SEs unchanged.
 -- Dispersion-free -> z inference. e_i = the GD residual.
-__reg_robrow AS (
+__reg_robraw AS (
   SELECT __reg_rww.__reg_rid__, __reg_rww.xs, __reg_rww.wt, cl.cl AS cl,
          __reg_rww.wt * (CASE family
                      WHEN 'logistic' THEN __reg_logit_var(__reg_rww.eta) WHEN 'linear' THEN 1.0
@@ -2771,6 +2771,15 @@ __reg_robrow AS (
                      ELSE __reg_rww.y-mu END) AS sc                       -- score scalar = a*r
   FROM __reg_rww LEFT JOIN __reg_clv cl ON cl.__reg_rid__ = __reg_rww.__reg_rid__
 ),
+-- A common information scale cancels between sandwich bread and scores.
+-- Remove it before inversion, which could otherwise overflow for tiny means.
+__reg_robscale AS (
+  SELECT coalesce(nullif(max(abs(hwt)),0.0),1.0) AS hunit FROM __reg_robraw
+),
+__reg_robrow AS (
+  SELECT r.* REPLACE (hwt/s.hunit AS hwt, sc/s.hunit AS sc)
+  FROM __reg_robraw r CROSS JOIN __reg_robscale s
+),
 __reg_rdims AS (SELECT count(DISTINCT cl)::INT AS G FROM __reg_robrow),
 __reg_breada AS (
   SELECT list(rowlist ORDER BY a) AS A FROM (
@@ -2781,7 +2790,7 @@ __reg_breada AS (
 __reg_breadinv AS (
   SELECT list_transform(RAinv, lambda row, i: list_transform(row, lambda v, j: v/(dscA[i]*dscA[j]))) AS Ainv
   FROM (SELECT dscA, __reg_matinv(list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dscA[i]*dscA[j])))) AS RAinv
-        FROM (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dscA FROM __reg_breada))
+        FROM (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 0.0 THEN sqrt(row[i]) ELSE 1.0 END) AS dscA FROM __reg_breada))
 ),
 __reg_lev AS (
   SELECT r.xs, r.sc, r.cl, r.wt,
@@ -2826,6 +2835,7 @@ __reg_robchk AS (
 ),
 __reg_final AS (
   SELECT b.names AS names, b.bvec AS bvec, c.Rinv AS Rinv, s.dsc AS dsc, rv.rv AS rv, u.units AS units, ws.wscale AS wscale,
+         (SELECT wunit FROM __reg_infounit) AS wunit,
          dp.phi AS phi, dp.est AS est, dp.df AS df,
          (robust != 'none' OR cluster_col IS NOT NULL) AS robactive,
          (dp.est AND dp.df > 0.0 AND robust = 'none' AND cluster_col IS NULL) AS uset,
@@ -2845,7 +2855,7 @@ __reg_percoef AS (
                 CASE WHEN Rinv IS NOT NULL AND df > 0.0 AND isfinite(rv[gs.i]) AND rv[gs.i] > 0.0 THEN sqrt(rv[gs.i]) / units[gs.i] ELSE NULL END
               ELSE
                 CASE WHEN Rinv IS NOT NULL AND isfinite(phi * Rinv[gs.i][gs.i]) AND phi * Rinv[gs.i][gs.i] > 0.0
-                     THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] / units[gs.i] / (CASE WHEN est THEN 1.0 ELSE sqrt(wscale) END) ELSE NULL END
+                     THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] / units[gs.i] / (CASE WHEN est THEN 1.0 ELSE sqrt(wscale) END) / sqrt(wunit) ELSE NULL END
          END AS scaled_std_error
   FROM __reg_final, unnest(range(1, len(bvec)+1)) AS gs(i)
 )
@@ -3008,16 +3018,21 @@ __reg_rww AS (
                             WHEN 'linear' THEN eta ELSE exp(eta) END AS mu
         FROM (SELECT xs, y, wt, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0)) r CROSS JOIN __reg_xunits u
 ),
+-- Remove the common Fisher-information scale before accumulation/inversion;
+-- restore it after square roots, so finite standard errors need no finite variance.
+__reg_infounit AS (
+  SELECT coalesce(nullif(max(w),0.0),1.0) AS wunit FROM __reg_rww
+),
 __reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_rww),
 __reg_idx AS (SELECT unnest(range(1, (SELECT d FROM __reg_dims)+1)) AS i),
 __reg_pairs AS (SELECT a.i AS a, b.i AS b FROM __reg_idx a, __reg_idx b),
 __reg_xwx AS (
   SELECT list(rowlist ORDER BY a) AS A FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
-      SELECT p.a AS a, p.b AS b, sum(__reg_rww.w * __reg_rww.xs[p.a] * __reg_rww.xs[p.b]) AS val
+      SELECT p.a AS a, p.b AS b, sum((__reg_rww.w/(SELECT wunit FROM __reg_infounit)) * __reg_rww.xs[p.a] * __reg_rww.xs[p.b]) AS val
       FROM __reg_rww, __reg_pairs p GROUP BY p.a, p.b) GROUP BY a)
 ),
-__reg_scal AS (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc FROM __reg_xwx),
+__reg_scal AS (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 0.0 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc FROM __reg_xwx),
 __reg_rscaled AS (SELECT dsc, list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dsc[i]*dsc[j]))) AS R FROM __reg_scal),
 __reg_gj(k, d, sing, M) AS (
   SELECT 0, len(R), false,
@@ -3047,7 +3062,8 @@ __reg_disp AS (
 ),
 __reg_cparams AS (
   SELECT c.Rinv AS Rinv, s.dsc AS dsc, u.units AS units, dp.phi AS phi, dp.uset AS uset, dp.df AS df,
-         CASE WHEN family IN ('linear','gamma','tweedie') THEN 1.0 ELSE sqrt(ws.wscale) END AS se_weight_scale,
+         (CASE WHEN family IN ('linear','gamma','tweedie') THEN 1.0 ELSE sqrt(ws.wscale) END)
+         * sqrt((SELECT wunit FROM __reg_infounit)) AS se_weight_scale,
          CASE WHEN dp.uset THEN -t_ppf((1.0-conf_level)/2.0, dp.df)
               ELSE -norm_ppf((1.0-conf_level)/2.0) END AS crit
   FROM __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_disp dp CROSS JOIN __reg_xunits u CROSS JOIN __reg_weightscale ws
@@ -3246,22 +3262,25 @@ __reg_pr AS (
 __reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_pr),
 __reg_idx AS (SELECT unnest(range(1, (SELECT d FROM __reg_dims)+1)) AS i),
 __reg_pairs AS (SELECT a.i AS a, b.i AS b FROM __reg_idx a, __reg_idx b),
+__reg_breadscale AS (
+  SELECT coalesce(nullif(max(abs(hwt)),0.0),1.0) AS hunit FROM __reg_pr
+),
 __reg_breada AS (
   SELECT list(rowlist ORDER BY a) AS A FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
-      SELECT p.a AS a, p.b AS b, sum(__reg_pr.hwt * __reg_pr.xs[p.a] * __reg_pr.xs[p.b]) AS val
+      SELECT p.a AS a, p.b AS b, sum((__reg_pr.hwt/(SELECT hunit FROM __reg_breadscale)) * __reg_pr.xs[p.a] * __reg_pr.xs[p.b]) AS val
       FROM __reg_pr, __reg_pairs p GROUP BY p.a, p.b) GROUP BY a)
 ),
 __reg_breadinv AS (
   SELECT list_transform(RAinv, lambda row, i: list_transform(row, lambda v, j: v/(dscA[i]*dscA[j]))) AS Ainv
   FROM (SELECT dscA, __reg_matinv(list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dscA[i]*dscA[j])))) AS RAinv
-        FROM (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dscA FROM __reg_breada))
+        FROM (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 0.0 THEN sqrt(row[i]) ELSE 1.0 END) AS dscA FROM __reg_breada))
 ),
 __reg_lev AS (
   SELECT p.__reg_rid__,
          list_sum(list_transform(p.xs, lambda xa, a: xa * list_dot_product(bi.Ainv[a], p.xs))) AS xax,
-         p.hwt * xax AS h
-  FROM __reg_pr p CROSS JOIN __reg_breadinv bi
+         (p.hwt/bs.hunit) * xax AS h, bs.hunit AS hunit
+  FROM __reg_pr p CROSS JOIN __reg_breadinv bi CROSS JOIN __reg_breadscale bs
 ),
 __reg_disp AS (
   SELECT CASE WHEN family IN ('linear','gamma','tweedie')
@@ -3284,7 +3303,7 @@ __reg_diag AS (
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN pearson_resid / sqrt(dp.phi*(1.0-l.h)) END AS std_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN
               CASE WHEN family = 'logistic'
-                   THEN p.wt*p.wt*p.resid*p.resid*l.xax / (dp.d*(1.0-l.h)*(1.0-l.h))
+                   THEN (p.wt*p.resid)*(p.wt*(p.resid/l.hunit))*l.xax / (dp.d*(1.0-l.h)*(1.0-l.h))
                    ELSE (pearson_resid*pearson_resid/dp.phi) * l.h / (dp.d*(1.0-l.h)*(1.0-l.h)) END END AS cooks_distance
   FROM __reg_pr p JOIN __reg_lev l ON l.__reg_rid__ = p.__reg_rid__ CROSS JOIN __reg_disp dp
 )
@@ -3424,7 +3443,7 @@ __reg_info AS (
   )
 ),
 -- diagonal scaling -> unit-diagonal correlation form
-__reg_scal AS (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc FROM __reg_info),
+__reg_scal AS (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 0.0 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc FROM __reg_info),
 __reg_rscaled AS (SELECT dsc, list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dsc[i]*dsc[j]))) AS R FROM __reg_scal),
 __reg_gj(k, d, sing, M) AS (
   SELECT 0, len(R), false,

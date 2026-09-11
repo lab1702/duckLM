@@ -16,6 +16,28 @@ def con():
     connection.close()
 
 
+@pytest.mark.parametrize('scale', [1e160, 1e300, 1e305])
+@pytest.mark.parametrize('solver', ['auto', 'gd'])
+def test_negative_binomial_curvature_preserves_large_count_fallback(con, scale, solver):
+    con.execute('CREATE OR REPLACE TABLE large_counts AS SELECT i::DOUBLE/10 x,?*exp(.3*i/10) y,1.0 constant FROM range(-10,11)t(i)', [scale])
+    coefficients = dict(con.execute(f"SELECT * FROM nbinom_fit('large_counts','y',solver:='{solver}',max_iter:=1000)").fetchall())
+    assert coefficients['(Intercept)'] == pytest.approx(np.log(scale), abs=1e-8)
+    assert coefficients['x'] == pytest.approx(.3, abs=1e-8)
+    assert coefficients['constant'] == 0.0
+
+
+@pytest.mark.parametrize('scale', [1e160, 1e305])
+def test_negative_binomial_batch_curvature_preserves_exact_large_count_means(con, scale):
+    con.execute('CREATE OR REPLACE TABLE large_counts AS SELECT i::DOUBLE/10 x,?*exp(.3*i/10) y,1.0 constant FROM range(-10,11)t(i)', [scale])
+    con.execute("CREATE OR REPLACE TABLE exact_nb AS SELECT '(Intercept)' feature,ln(?) coefficient UNION ALL SELECT 'x',.3 UNION ALL SELECT 'constant',0.0", [scale])
+    scores = con.execute("SELECT cv_deviance FROM cv_alpha('large_counts','y',[.5,1.],k:=3,max_iter:=1000)").fetchnumpy()['cv_deviance']
+    np.testing.assert_allclose(scores, 0.0, atol=1e-12)
+    profile = con.execute("SELECT * FROM nbinom_dispersion('large_counts','y',[.5,1.],max_iter:=1000)").fetchall()
+    for alpha, loglik in profile:
+        expected = con.execute(f"SELECT loglik FROM nbinom_evaluate('exact_nb','large_counts','y',alpha:={alpha})").fetchone()[0]
+        assert loglik == pytest.approx(expected, abs=1e-8)
+
+
 @pytest.mark.parametrize("scales", [[1, 1, 1], [1e-6, 1e3, 1e6]])
 def test_matrix_inverse_rejects_general_dependency_at_any_scale(con, scales):
     matrix = np.array([[1., 2., 3.], [2., 5., 7.], [3., 7., 10.]])
