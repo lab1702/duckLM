@@ -303,33 +303,33 @@ __reg_w AS (
     FROM __reg_complete c
     LEFT JOIN __reg_clong wv ON wv.rid = c.rid AND wv.col = coalesce(weights_col, '')
 ),
--- Standardization stats per feature (over complete rows). Constant columns
--- (detected exactly by min = max) get mu = min(v) and sigma = 1: centering on
--- an actual stored value makes every z-score exactly 0 (avg() of a
--- non-representable constant like 4.2 is not bit-exact, which would otherwise
--- leave a ~1e-16 z-score and drift the coefficient off 0), so the coefficient
--- stays exactly 0.
--- Weighted mean and weighted population sd. With equal weights these reduce to
--- the ordinary avg / stddev_pop, so no-weights fits are unchanged.
--- j is the feature's position in name order. Downstream, the per-row feature
--- vector is assembled with list(... ORDER BY j) rather than ORDER BY col: an
--- ordered list aggregate carries its sort key alongside every value, and a
--- VARCHAR key means n*d column-name strings in the sort buffers. Ordering by
--- the integer instead is the same order (j is assigned by ORDER BY col) for a
--- fraction of the time and memory.
-__reg_stats AS MATERIALIZED (
+-- Standardization uses positive-weight complete rows. Center the observations
+-- before squaring: E[x^2] - E[x]^2 loses the variance when a feature has a
+-- large mean and a small spread. Zero-weight rows cannot change whether a
+-- feature is constant, nor its centering value.
+__reg_means AS MATERIALIZED (
     SELECT s.col,
-           row_number() OVER (ORDER BY s.col) AS j,
-           CASE WHEN min(s.v) = max(s.v) THEN min(s.v)
-                ELSE sum(w.w * s.v) / sum(w.w) END AS mu,
-           CASE WHEN min(s.v) = max(s.v) THEN 1.0
-                ELSE sqrt(greatest(sum(w.w * s.v * s.v) / sum(w.w)
-                                   - (sum(w.w * s.v) / sum(w.w)) ^ 2, 0.0)) END AS sigma
+           CASE WHEN min(s.v) FILTER (WHERE w.w > 0) = max(s.v) FILTER (WHERE w.w > 0)
+                  THEN min(s.v) FILTER (WHERE w.w > 0)
+                ELSE sum(w.w * s.v) FILTER (WHERE w.w > 0)
+                     / sum(w.w) FILTER (WHERE w.w > 0) END AS mu,
+           min(s.v) FILTER (WHERE w.w > 0) = max(s.v) FILTER (WHERE w.w > 0) AS constant
     FROM __reg_clong s JOIN __reg_w w ON w.rid = s.rid
     WHERE s.col != outcome
       AND s.col != coalesce(offset_col, '')
       AND s.col != coalesce(weights_col, '')
     GROUP BY s.col
+),
+-- j is the feature's position in name order, avoiding string sort keys in
+-- every row's packed feature vector.
+__reg_stats AS MATERIALIZED (
+    SELECT m.col, row_number() OVER (ORDER BY m.col) AS j, m.mu,
+           CASE WHEN m.constant THEN 1.0
+                ELSE sqrt(sum(w.w * (s.v - m.mu) ^ 2) FILTER (WHERE w.w > 0)
+                          / sum(w.w) FILTER (WHERE w.w > 0)) END AS sigma
+    FROM __reg_means m JOIN __reg_clong s ON s.col = m.col
+    JOIN __reg_w w ON w.rid = s.rid
+    GROUP BY m.col, m.mu, m.constant
 ),
 __reg_feats AS MATERIALIZED (
     SELECT list(col   ORDER BY col) AS names,
@@ -344,20 +344,23 @@ __reg_feats AS MATERIALIZED (
 -- log-link outcome by its mean shifts only the intercept (by ln(mean), undone
 -- in the back-transform below) and makes the optimizer start at fitted means
 -- ~= 1 from the zero initialization.
+__reg_ymean AS (
+    SELECT sum(w.w * s.v) / sum(w.w) AS mu
+    FROM __reg_clong s JOIN __reg_w w ON w.rid = s.rid
+    WHERE s.col = outcome AND w.w > 0
+),
 __reg_ystats AS (
-    SELECT CASE WHEN family = 'linear' THEN sum(w.w * s.v) / sum(w.w) ELSE 0.0 END AS mu_y,
+    SELECT CASE WHEN family = 'linear' THEN any_value(m.mu) ELSE 0.0 END AS mu_y,
            CASE WHEN family = 'logistic' THEN 1.0
                 WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom')
-                  THEN (CASE WHEN sum(w.w * s.v) / sum(w.w) < 1e-300 THEN 1.0
-                             ELSE sum(w.w * s.v) / sum(w.w) END)
-                ELSE (CASE WHEN sqrt(greatest(sum(w.w * s.v * s.v) / sum(w.w)
-                                              - (sum(w.w * s.v) / sum(w.w)) ^ 2, 0.0)) < 1e-300
+                  THEN (CASE WHEN any_value(m.mu) < 1e-300 THEN 1.0 ELSE any_value(m.mu) END)
+                ELSE (CASE WHEN sqrt(sum(w.w * (s.v - m.mu) ^ 2) / sum(w.w)) < 1e-300
                            THEN 1.0
-                           ELSE sqrt(greatest(sum(w.w * s.v * s.v) / sum(w.w)
-                                              - (sum(w.w * s.v) / sum(w.w)) ^ 2, 0.0)) END)
+                           ELSE sqrt(sum(w.w * (s.v - m.mu) ^ 2) / sum(w.w)) END)
            END AS sd_y
     FROM __reg_clong s JOIN __reg_w w ON w.rid = s.rid
-    WHERE s.col = outcome
+    CROSS JOIN __reg_ymean m
+    WHERE s.col = outcome AND w.w > 0
 ),
 -- The whole training set packed into one row: a list of {y, xs} structs where
 -- xs = [1.0 (intercept), standardized features in name order]. __reg_clong is
@@ -756,7 +759,7 @@ __reg_namecheck AS (
                THEN error(caller || ': column names beginning with "__reg_" are reserved for internal use; please rename')
              WHEN caller = 'logit_predict' AND coalesce(bool_or(lower(colname) IN ('prob', 'pred')), false)
                THEN error('logit_predict: the input table already has a "prob" or "pred" column, which collides with the output columns; rename or drop it first (e.g. SELECT * EXCLUDE (prob, pred))')
-             WHEN caller IN ('linreg_predict', 'poisson_predict', 'gamma_predict') AND coalesce(bool_or(lower(colname) = 'prediction'), false)
+             WHEN caller IN ('linreg_predict', 'poisson_predict', 'gamma_predict', 'tweedie_predict', 'nbinom_predict') AND coalesce(bool_or(lower(colname) = 'prediction'), false)
                THEN error(caller || ': the input table already has a "prediction" column, which collides with the output column; rename or drop it first (e.g. SELECT * EXCLUDE (prediction))')
              ELSE true
            END AS ok
@@ -909,6 +912,14 @@ __reg_z AS (
     LEFT JOIN __reg_offset o ON o.rid = l.rid
     WHERE c.feature != '(Intercept)'
     GROUP BY l.rid, m.b0, m.kfeat
+    UNION ALL
+    -- An intercept-only model has no feature rows to aggregate. It still
+    -- predicts every input row whose requested offset is present.
+    SELECT n.__reg_rid__, m.b0 + coalesce(o.o, 0.0)
+    FROM __reg_numbered n
+    CROSS JOIN __reg_meta m
+    LEFT JOIN __reg_offset o ON o.rid = n.__reg_rid__
+    WHERE m.kfeat = 0 AND (offset_col IS NULL OR o.o IS NOT NULL)
 ),
 __reg_y AS (SELECT rid, v AS y FROM __reg_long WHERE col = outcome),
 -- One row per evaluated observation: actual y, linear predictor z, and the
@@ -952,9 +963,12 @@ __reg_agg AS (
            sum(-ln(y / yhat) + (y - yhat) / yhat) AS dev_gam_half,
            sum(((y - yhat) / yhat) * ((y - yhat) / yhat)) AS pearson_gam,
            -- Tweedie unit half-deviance and Pearson chi-square (power = p).
-           sum(pow(greatest(y, 0.0), 2.0 - power) / ((1.0 - power) * (2.0 - power))
+           sum(CASE WHEN power = 1 THEN
+                      (CASE WHEN y > 0 THEN y * ln(y / yhat) ELSE 0.0 END) - (y - yhat)
+                    WHEN power = 2 THEN -ln(y / yhat) + (y - yhat) / yhat
+                    ELSE pow(greatest(y, 0.0), 2.0 - power) / ((1.0 - power) * (2.0 - power))
                - y * pow(yhat, 1.0 - power) / (1.0 - power)
-               + pow(yhat, 2.0 - power) / (2.0 - power)) AS dev_tw_half,
+               + pow(yhat, 2.0 - power) / (2.0 - power) END) AS dev_tw_half,
            sum((y - yhat) * (y - yhat) / pow(yhat, power)) AS pearson_tw,
            -- Negative binomial (NB2, r = 1/alpha): log-likelihood, half-deviance,
            -- and Pearson chi-square (variance = mu + alpha*mu^2).
@@ -969,12 +983,17 @@ __reg_agg AS (
 -- Null-model quantities need ybar, so aggregate a second time against it.
 __reg_null AS (
     SELECT sum((y - a.ybar) * (y - a.ybar)) AS sst,
-           sum(y * ln(a.ybar) + (1 - y) * ln(1 - a.ybar)) AS ll0_bin,
+           -- lim(p -> 0+) p*ln(p) = 0, including one-class holdouts.
+           sum(CASE WHEN a.ybar IN (0, 1) THEN 0.0
+                    ELSE y * ln(a.ybar) + (1 - y) * ln(1 - a.ybar) END) AS ll0_bin,
            sum((CASE WHEN y > 0 THEN y * ln(y / a.ybar) ELSE 0.0 END) - (y - a.ybar)) AS null_dev_pois_half,
            sum(-ln(y / a.ybar) + (y - a.ybar) / a.ybar) AS null_dev_gam_half,
-           sum(pow(greatest(y, 0.0), 2.0 - power) / ((1.0 - power) * (2.0 - power))
+           sum(CASE WHEN power = 1 THEN
+                      (CASE WHEN y > 0 THEN y * ln(y / a.ybar) ELSE 0.0 END) - (y - a.ybar)
+                    WHEN power = 2 THEN -ln(y / a.ybar) + (y - a.ybar) / a.ybar
+                    ELSE pow(greatest(y, 0.0), 2.0 - power) / ((1.0 - power) * (2.0 - power))
                - y * pow(a.ybar, 1.0 - power) / (1.0 - power)
-               + pow(a.ybar, 2.0 - power) / (2.0 - power)) AS null_dev_tw_half,
+               + pow(a.ybar, 2.0 - power) / (2.0 - power) END) AS null_dev_tw_half,
            sum((CASE WHEN y > 0 THEN y * ln(y / a.ybar) ELSE 0.0 END)
                - (y + 1.0 / alpha) * ln((y + 1.0 / alpha) / (a.ybar + 1.0 / alpha))) AS null_dev_nb_half
     FROM __reg_rows r, __reg_agg a
@@ -988,7 +1007,8 @@ SELECT
     a.accuracy AS accuracy,
     au.auc AS auc,
     CASE WHEN family = 'logistic' THEN -a.ll_bin / a.n END AS log_loss,
-    CASE family WHEN 'linear'   THEN -a.n / 2.0 * (ln(2 * pi()) + ln(a.sse / a.n) + 1.0)
+    CASE family WHEN 'linear'   THEN CASE WHEN a.sse = 0 THEN 'Infinity'::DOUBLE
+                                         ELSE -a.n / 2.0 * (ln(2 * pi()) + ln(a.sse / a.n) + 1.0) END
                 WHEN 'logistic' THEN a.ll_bin
                 WHEN 'poisson'  THEN a.ll_pois
                 WHEN 'nbinom'   THEN a.ll_nb END AS loglik,
@@ -1002,7 +1022,7 @@ SELECT
                 WHEN 'gamma'    THEN 2.0 * nu.null_dev_gam_half
                 WHEN 'tweedie'  THEN 2.0 * nu.null_dev_tw_half
                 WHEN 'nbinom'   THEN 2.0 * nu.null_dev_nb_half END AS null_deviance,
-    CASE family WHEN 'logistic' THEN 1.0 - a.ll_bin / nu.ll0_bin
+    CASE family WHEN 'logistic' THEN 1.0 - a.ll_bin / nullif(nu.ll0_bin, 0.0)
                 WHEN 'poisson'  THEN 1.0 - a.dev_pois_half / nu.null_dev_pois_half
                 WHEN 'gamma'    THEN 1.0 - a.dev_gam_half / nu.null_dev_gam_half
                 WHEN 'tweedie'  THEN 1.0 - a.dev_tw_half / nu.null_dev_tw_half
@@ -1010,11 +1030,11 @@ SELECT
     CASE WHEN family = 'gamma'   THEN a.pearson_gam / (a.n - m.kparams)
          WHEN family = 'tweedie' THEN a.pearson_tw / (a.n - m.kparams)
          WHEN family = 'nbinom'  THEN a.pearson_nb / (a.n - m.kparams) END AS dispersion,
-    CASE family WHEN 'linear'   THEN -2.0 * (-a.n / 2.0 * (ln(2 * pi()) + ln(a.sse / a.n) + 1.0)) + 2.0 * m.kparams
+    CASE family WHEN 'linear'   THEN -2.0 * loglik + 2.0 * m.kparams
                 WHEN 'logistic' THEN -2.0 * a.ll_bin  + 2.0 * m.kparams
                 WHEN 'poisson'  THEN -2.0 * a.ll_pois + 2.0 * m.kparams
                 WHEN 'nbinom'   THEN -2.0 * a.ll_nb   + 2.0 * m.kparams END AS aic,
-    CASE family WHEN 'linear'   THEN -2.0 * (-a.n / 2.0 * (ln(2 * pi()) + ln(a.sse / a.n) + 1.0)) + ln(a.n) * m.kparams
+    CASE family WHEN 'linear'   THEN -2.0 * loglik + ln(a.n) * m.kparams
                 WHEN 'logistic' THEN -2.0 * a.ll_bin  + ln(a.n) * m.kparams
                 WHEN 'poisson'  THEN -2.0 * a.ll_pois + ln(a.n) * m.kparams
                 WHEN 'nbinom'   THEN -2.0 * a.ll_nb   + ln(a.n) * m.kparams END AS bic
@@ -1066,18 +1086,17 @@ FROM __reg_eval(model, tbl, outcome, 'nbinom', 'nbinom_evaluate', offset_col, NU
 --   con.sql(f"CREATE TABLE encoded AS {sql}")
 --   con.sql("SELECT * FROM linreg_fit('encoded','revenue')")
 --
--- `tbl` must be a table or view (resolvable in duckdb_columns), optionally
+-- `tbl` must be a table or view (resolvable by DuckDB), optionally
 -- schema/catalog-qualified. VARCHAR columns are treated as categorical; a NULL
 -- category yields NULL dummies, so that row is dropped by the fit (as R drops
--- NA rows). High-cardinality columns produce many dummies -- encode with care.
+-- NA rows). For a factor with fewer than two observed levels, NULL-category
+-- rows are filtered explicitly because no dummy columns remain to mark them.
+-- High-cardinality columns produce many dummies -- encode with care.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE MACRO dummy_encode_sql(tbl, outcome) AS (
   WITH __reg_enc_cat AS (
-    SELECT column_name AS col FROM duckdb_columns()
-    WHERE (table_name = tbl
-           OR schema_name || '.' || table_name = tbl
-           OR database_name || '.' || schema_name || '.' || table_name = tbl)
-      AND data_type = 'VARCHAR' AND column_name != outcome
+    SELECT name AS col FROM pragma_table_info(tbl)
+    WHERE type = 'VARCHAR' AND name != outcome
   ),
   __reg_enc_lvl AS (
     SELECT DISTINCT name AS col, val
@@ -1086,15 +1105,28 @@ CREATE OR REPLACE MACRO dummy_encode_sql(tbl, outcome) AS (
   ),
   __reg_enc_ref AS (SELECT col, min(val) AS ref FROM __reg_enc_lvl GROUP BY col),
   __reg_enc_dum AS (
-    SELECT string_agg('(' || l.col || ' = ''' || replace(l.val, '''', '''''') || ''')::INT AS "'
+    SELECT string_agg('("' || replace(l.col, '"', '""') || '" = ''' || replace(l.val, '''', '''''') || ''')::INT AS "'
                       || replace(l.col || '_' || l.val, '"', '""') || '"',
                       ', ' ORDER BY l.col, l.val) AS dummies
     FROM __reg_enc_lvl l JOIN __reg_enc_ref r ON r.col = l.col WHERE l.val <> r.ref
   ),
-  __reg_enc_ex AS (SELECT string_agg(col, ', ' ORDER BY col) AS excl FROM __reg_enc_cat)
-  SELECT CASE WHEN (SELECT count(*) FROM __reg_enc_cat) = 0 THEN 'SELECT * FROM ' || tbl
+  __reg_enc_ex AS (
+    SELECT string_agg('"' || replace(col, '"', '""') || '"', ', ' ORDER BY col) AS excl
+    FROM __reg_enc_cat
+  ),
+  __reg_enc_missing AS (
+    SELECT string_agg('"' || replace(c.col, '"', '""') || '" IS NOT NULL', ' AND ' ORDER BY c.col) AS predicate
+    FROM __reg_enc_cat c
+    WHERE (SELECT count(*) FROM __reg_enc_lvl l WHERE l.col = c.col) < 2
+  ),
+  -- Let query_table resolve qualified/quoted identifiers, and escape its
+  -- string argument so spaces, quotes, dots, and SQL punctuation stay data.
+  __reg_enc_source AS (SELECT 'query_table(''' || replace(tbl, '''', '''''') || ''')' AS source)
+  SELECT CASE WHEN (SELECT count(*) FROM __reg_enc_cat) = 0 THEN 'SELECT * FROM ' || (SELECT source FROM __reg_enc_source)
               ELSE 'SELECT * EXCLUDE (' || (SELECT excl FROM __reg_enc_ex) || ')'
-                   || coalesce(', ' || (SELECT dummies FROM __reg_enc_dum), '') || ' FROM ' || tbl END
+                   || coalesce(', ' || (SELECT dummies FROM __reg_enc_dum), '')
+                   || ' FROM ' || (SELECT source FROM __reg_enc_source)
+                   || coalesce(' WHERE ' || (SELECT predicate FROM __reg_enc_missing), '') END
 );
 
 
@@ -1117,17 +1149,37 @@ CREATE OR REPLACE MACRO dummy_encode_sql(tbl, outcome) AS (
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE MACRO multinom_fit(tbl, outcome, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, l1 := 0.0) AS TABLE
 WITH RECURSIVE
-__reg_mnum AS MATERIALIZED (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
+__reg_mcols AS (
+  SELECT colname
+  FROM (SELECT * FROM (SELECT 1 AS __reg_one)
+        LEFT JOIN (SELECT CAST(COLUMNS(*) AS VARCHAR) FROM query_table(tbl) LIMIT 1) ON true)
+       UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
+),
+__reg_mnum AS MATERIALIZED (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+__reg_mfraw AS MATERIALIZED (
+  SELECT __reg_rid__ AS rid, name AS col, value AS v
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != outcome AND c != '__reg_rid__') AS DOUBLE) FROM __reg_mnum)
+        ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
+),
+__reg_myall AS MATERIALIZED (
+  SELECT __reg_rid__ AS rid, val AS lab
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != '__reg_rid__') AS VARCHAR) FROM __reg_mnum)
+        ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE val) WHERE name = outcome
+),
+-- Drop incomplete observations before computing standardization, counts,
+-- class labels or packed vectors. The schema count includes entirely NULL
+-- features, which are rejected explicitly by the input checks.
+__reg_mcomplete AS MATERIALIZED (
+  SELECT x.rid FROM __reg_mfraw x JOIN __reg_myall y ON y.rid = x.rid
+  GROUP BY x.rid
+  HAVING count(*) = (SELECT count(*) FROM __reg_mcols WHERE colname != outcome)
+),
 __reg_mflong AS MATERIALIZED (
-  SELECT rid, name AS col, value AS v
-  FROM (UNPIVOT (SELECT rid, CAST(COLUMNS(c -> c != outcome AND c != 'rid') AS DOUBLE) FROM __reg_mnum)
-        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE value)
+  SELECT x.* FROM __reg_mfraw x SEMI JOIN __reg_mcomplete c ON c.rid = x.rid
 ),
 __reg_mylab AS MATERIALIZED (
-  SELECT rid, val AS lab
-  FROM (UNPIVOT (SELECT rid, CAST(COLUMNS(c -> c != 'rid') AS VARCHAR) FROM __reg_mnum)
-        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE val)
-  WHERE name = outcome
+  SELECT yr.rid, yr.lab
+  FROM __reg_myall yr SEMI JOIN __reg_mcomplete c ON c.rid = yr.rid
 ),
 __reg_mnonref AS (
   SELECT list(lab ORDER BY lab) AS nrf
@@ -1151,6 +1203,21 @@ __reg_mfeats AS MATERIALIZED (
 ),
 __reg_mchk AS (
   SELECT CASE
+    WHEN starts_with(lower(tbl), '__reg_')
+      THEN error('multinom_fit: table names beginning with "__reg_" are reserved for internal use; please rename')
+    WHEN (SELECT coalesce(bool_or(starts_with(lower(colname), '__reg_')), false) FROM __reg_mcols)
+      THEN error('multinom_fit: column names beginning with "__reg_" are reserved for internal use; please rename')
+    WHEN (SELECT count(*) FROM __reg_mcols WHERE colname = '(Intercept)' AND colname != outcome) > 0
+      THEN error('multinom_fit: a feature named "(Intercept)" would collide with the model intercept; please rename it')
+    WHEN (SELECT count(*) FROM __reg_mcols WHERE colname != outcome) = 0
+      THEN error('multinom_fit: no feature columns besides the outcome')
+    WHEN (SELECT count(DISTINCT col) FROM __reg_mfraw)
+           != (SELECT count(*) FROM __reg_mcols WHERE colname != outcome)
+      THEN error('multinom_fit: feature column(s) entirely NULL: '
+                 || (SELECT string_agg('"' || colname || '"', ', ') FROM __reg_mcols
+                     WHERE colname != outcome AND colname NOT IN (SELECT col FROM __reg_mfraw)))
+    WHEN (SELECT count(*) FROM __reg_mcomplete) = 0
+      THEN error('multinom_fit: no complete (non-NULL) rows to train on')
     WHEN (SELECT count(*) FROM (SELECT DISTINCT lab FROM __reg_mylab)) < 2
       THEN error('multinom_fit: outcome column "' || outcome || '" must have at least 2 distinct classes')
     WHEN (SELECT d FROM __reg_mfeats) = 0
@@ -1185,7 +1252,7 @@ __reg_mgd AS (
          list_transform(range(K1), lambda k: list_transform(range(D1), lambda j: 0.0::DOUBLE)) AS B,
          list_transform(range(K1), lambda k: list_transform(range(D1), lambda j: 0.0::DOUBLE)) AS prev,
          1e308::DOUBLE AS move
-  FROM __reg_mpacked
+  FROM __reg_mpacked, __reg_mchk WHERE ok
   UNION ALL
   SELECT it + 1, newB, B,
          list_aggregate(list_transform(newB, lambda bk, k:
@@ -1315,7 +1382,10 @@ FROM __reg_mrm;
 -- Standardization is global (cv.glmnet's default); folds are (row# - 1) % k
 -- (deterministic -- shuffle first if rows are ordered by the outcome). Returns
 -- one row per grid value with the mean held-out deviance (squared error for
--- linear); pick the smallest cv_deviance. Cost scales with
+-- linear); pick the smallest cv_deviance. Power/alpha sweeps tune mean
+-- prediction with a common scoring power=1.5 / alpha=1.0 for every candidate,
+-- since candidate-dependent deviances are not comparable. Use
+-- nbinom_dispersion for likelihood-based dispersion estimation. Cost scales with
 -- k * |grid| * features * rows * iterations -- keep the grid modest.
 --
 --   cv_l2(tbl, outcome, family, l2_grid, k := 5)  -> (l2, cv_deviance)
@@ -1329,8 +1399,55 @@ FROM __reg_mrm;
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE MACRO __reg_cv(tbl, outcome, family, grid, sweep, k, max_iter, learning_rate, tol) AS TABLE
 WITH RECURSIVE
+__reg_cv_cols AS (
+  SELECT colname
+  FROM (SELECT * FROM (SELECT 1 AS __reg_one)
+        LEFT JOIN (SELECT CAST(COLUMNS(*) AS VARCHAR) FROM query_table(tbl) LIMIT 1) ON true)
+       UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
+),
+__reg_cv_num AS MATERIALIZED (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+__reg_cv_fraw AS MATERIALIZED (
+  SELECT __reg_rid__ AS rid, name AS col, value AS v
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != outcome AND c != '__reg_rid__') AS DOUBLE) FROM __reg_cv_num)
+        ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
+),
+__reg_cv_yall AS MATERIALIZED (
+  SELECT __reg_rid__ AS rid, val AS y
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != '__reg_rid__') AS DOUBLE) FROM __reg_cv_num)
+        ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE val) WHERE name = outcome
+),
+-- Drop incomplete observations before computing standardization, counts,
+-- class labels or packed vectors. The schema count includes entirely NULL
+-- features, which are rejected explicitly by the input checks.
+__reg_cv_complete AS MATERIALIZED (
+  SELECT x.rid FROM __reg_cv_fraw x JOIN __reg_cv_yall y ON y.rid = x.rid
+  GROUP BY x.rid
+  HAVING count(*) = (SELECT count(*) FROM __reg_cv_cols WHERE colname != outcome)
+),
+__reg_cv_flong AS MATERIALIZED (
+  SELECT x.* FROM __reg_cv_fraw x SEMI JOIN __reg_cv_complete c ON c.rid = x.rid
+),
+__reg_cv_yraw AS MATERIALIZED (
+  SELECT yr.rid, yr.y, (row_number() OVER (ORDER BY yr.rid) - 1) % k AS fold
+  FROM __reg_cv_yall yr SEMI JOIN __reg_cv_complete c ON c.rid = yr.rid
+),
 __reg_cv_chk AS (
   SELECT CASE
+    WHEN starts_with(lower(tbl), '__reg_')
+      THEN error('cv: table names beginning with "__reg_" are reserved for internal use; please rename')
+    WHEN (SELECT coalesce(bool_or(starts_with(lower(colname), '__reg_')), false) FROM __reg_cv_cols)
+      THEN error('cv: column names beginning with "__reg_" are reserved for internal use; please rename')
+    WHEN (SELECT count(*) FROM __reg_cv_cols WHERE colname = '(Intercept)' AND colname != outcome) > 0
+      THEN error('cv: a feature named "(Intercept)" would collide with the model intercept; please rename it')
+    WHEN (SELECT count(*) FROM __reg_cv_cols WHERE colname != outcome) = 0
+      THEN error('cv: no feature columns besides the outcome')
+    WHEN (SELECT count(DISTINCT col) FROM __reg_cv_fraw)
+           != (SELECT count(*) FROM __reg_cv_cols WHERE colname != outcome)
+      THEN error('cv: feature column(s) entirely NULL: '
+                 || (SELECT string_agg('"' || colname || '"', ', ') FROM __reg_cv_cols
+                     WHERE colname != outcome AND colname NOT IN (SELECT col FROM __reg_cv_fraw)))
+    WHEN (SELECT count(*) FROM __reg_cv_complete) = 0
+      THEN error('cv: no complete (non-NULL) rows to train on')
     WHEN family NOT IN ('linear','logistic','poisson','gamma','tweedie','nbinom')
       THEN error('cv: unsupported family ' || family)
     WHEN k < 2 THEN error('cv: k must be >= 2')
@@ -1339,17 +1456,6 @@ __reg_cv_chk AS (
     WHEN sweep = 'power' AND list_aggregate(grid,'min') < 1 THEN error('cv: tweedie power must be >= 1')
     WHEN sweep = 'alpha' AND list_aggregate(grid,'min') <= 0 THEN error('cv: nbinom alpha must be > 0')
     ELSE true END AS ok
-),
-__reg_cv_num AS MATERIALIZED (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
-__reg_cv_flong AS MATERIALIZED (
-  SELECT rid, name AS col, value AS v
-  FROM (UNPIVOT (SELECT rid, CAST(COLUMNS(c -> c != outcome AND c != 'rid') AS DOUBLE) FROM __reg_cv_num)
-        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE value)
-),
-__reg_cv_yraw AS MATERIALIZED (
-  SELECT rid, val AS y, (rid - 1) % k AS fold
-  FROM (UNPIVOT (SELECT rid, CAST(COLUMNS(c -> c != 'rid') AS DOUBLE) FROM __reg_cv_num)
-        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE val) WHERE name = outcome
 ),
 __reg_cv_stats AS MATERIALIZED (
   -- j: feature position in name order. The per-row feature vector below is
@@ -1606,8 +1712,11 @@ __reg_cv_score AS (
   SELECT gg.g AS g, r.y AS y,
          list_dot_product(r.xs, s.B[(gg.g - 1) * k + r.fold + 1]) AS eta,
          ys.mu_y AS mu_y, ys.sd_y AS sd_y,
-         CASE WHEN sweep='power' THEN grid[gg.g] ELSE 1.5 END AS pw,
-         CASE WHEN sweep='alpha' THEN grid[gg.g] ELSE 1.0 END AS al
+         -- Candidate-dependent deviances have different scales and cannot be
+         -- ranked across powers/dispersions. Compare the held-out means using
+         -- one common loss throughout each sweep (including refinement).
+         1.5::DOUBLE AS pw,
+         1.0::DOUBLE AS al
   FROM __reg_cv_sol s, __reg_cv_rows r, __reg_cv_ys ys, range(1, len(grid)+1) gg(g)
 )
 SELECT grid[g] AS param,
@@ -1646,26 +1755,62 @@ SELECT param AS l2, cv_deviance FROM __reg_cv(tbl, outcome, family, l2_grid, 'l2
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE MACRO nbinom_dispersion(tbl, outcome, alpha_grid, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
 WITH RECURSIVE
-__reg_nbd_chk AS (
-  SELECT CASE
-    WHEN len(alpha_grid) < 1 THEN error('nbinom_dispersion: alpha_grid must be non-empty')
-    WHEN list_aggregate(alpha_grid,'min') <= 0 THEN error('nbinom_dispersion: alpha values must be > 0')
-    ELSE true END AS ok
+__reg_nbd_cols AS (
+  SELECT colname
+  FROM (SELECT * FROM (SELECT 1 AS __reg_one)
+        LEFT JOIN (SELECT CAST(COLUMNS(*) AS VARCHAR) FROM query_table(tbl) LIMIT 1) ON true)
+       UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
 ),
-__reg_nbd_num AS MATERIALIZED (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
+__reg_nbd_num AS MATERIALIZED (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+__reg_nbd_fraw AS MATERIALIZED (
+  SELECT __reg_rid__ AS rid, name AS col, value AS v
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != outcome AND c != '__reg_rid__') AS DOUBLE) FROM __reg_nbd_num)
+        ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
+),
+__reg_nbd_yall AS MATERIALIZED (
+  SELECT __reg_rid__ AS rid, val AS y
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != '__reg_rid__') AS DOUBLE) FROM __reg_nbd_num)
+        ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE val) WHERE name = outcome
+),
+-- Drop incomplete observations before computing standardization, counts,
+-- class labels or packed vectors. The schema count includes entirely NULL
+-- features, which are rejected explicitly by the input checks.
+__reg_nbd_complete AS MATERIALIZED (
+  SELECT x.rid FROM __reg_nbd_fraw x JOIN __reg_nbd_yall y ON y.rid = x.rid
+  GROUP BY x.rid
+  HAVING count(*) = (SELECT count(*) FROM __reg_nbd_cols WHERE colname != outcome)
+),
 __reg_nbd_flong AS MATERIALIZED (
-  SELECT rid, name AS col, value AS v
-  FROM (UNPIVOT (SELECT rid, CAST(COLUMNS(c -> c != outcome AND c != 'rid') AS DOUBLE) FROM __reg_nbd_num)
-        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE value)
+  SELECT x.* FROM __reg_nbd_fraw x SEMI JOIN __reg_nbd_complete c ON c.rid = x.rid
 ),
 __reg_nbd_yraw AS MATERIALIZED (
-  SELECT rid, val AS y
-  FROM (UNPIVOT (SELECT rid, CAST(COLUMNS(c -> c != 'rid') AS DOUBLE) FROM __reg_nbd_num)
-        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE val) WHERE name = outcome
+  SELECT yr.rid, yr.y
+  FROM __reg_nbd_yall yr SEMI JOIN __reg_nbd_complete c ON c.rid = yr.rid
 ),
 __reg_nbd_ycheck AS (
   SELECT CASE WHEN min(y) < 0 THEN error('nbinom_dispersion: outcome must be non-negative') ELSE true END AS ok
   FROM __reg_nbd_yraw
+),
+__reg_nbd_chk AS (
+  SELECT CASE
+    WHEN starts_with(lower(tbl), '__reg_')
+      THEN error('nbinom_dispersion: table names beginning with "__reg_" are reserved for internal use; please rename')
+    WHEN (SELECT coalesce(bool_or(starts_with(lower(colname), '__reg_')), false) FROM __reg_nbd_cols)
+      THEN error('nbinom_dispersion: column names beginning with "__reg_" are reserved for internal use; please rename')
+    WHEN (SELECT count(*) FROM __reg_nbd_cols WHERE colname = '(Intercept)' AND colname != outcome) > 0
+      THEN error('nbinom_dispersion: a feature named "(Intercept)" would collide with the model intercept; please rename it')
+    WHEN (SELECT count(*) FROM __reg_nbd_cols WHERE colname != outcome) = 0
+      THEN error('nbinom_dispersion: no feature columns besides the outcome')
+    WHEN (SELECT count(DISTINCT col) FROM __reg_nbd_fraw)
+           != (SELECT count(*) FROM __reg_nbd_cols WHERE colname != outcome)
+      THEN error('nbinom_dispersion: feature column(s) entirely NULL: '
+                 || (SELECT string_agg('"' || colname || '"', ', ') FROM __reg_nbd_cols
+                     WHERE colname != outcome AND colname NOT IN (SELECT col FROM __reg_nbd_fraw)))
+    WHEN (SELECT count(*) FROM __reg_nbd_complete) = 0
+      THEN error('nbinom_dispersion: no complete (non-NULL) rows to train on')
+    WHEN len(alpha_grid) < 1 THEN error('nbinom_dispersion: alpha_grid must be non-empty')
+    WHEN list_aggregate(alpha_grid,'min') <= 0 THEN error('nbinom_dispersion: alpha values must be > 0')
+    ELSE true END AS ok
 ),
 __reg_nbd_stats AS MATERIALIZED (
   -- j: feature position in name order. The per-row feature vector below is
@@ -1969,48 +2114,73 @@ CREATE OR REPLACE MACRO __reg_summary(model, tbl, outcome, family, caller,
                                       conf_level, offset_col, weights_col, power, alpha,
                                       robust, cluster_col) AS TABLE
 WITH RECURSIVE
-mdl AS (SELECT feature, coefficient FROM query_table(model)),
+__reg_cols AS (
+  SELECT colname
+  FROM (SELECT * FROM (SELECT 1 AS __reg_one)
+        LEFT JOIN (SELECT CAST(COLUMNS(*) AS VARCHAR) FROM query_table(tbl) LIMIT 1) ON true)
+       UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
+),
+__reg_inputcheck AS (
+  SELECT CASE WHEN starts_with(lower(tbl), '__reg_') OR starts_with(lower(model), '__reg_')
+              THEN error(caller || ': table names beginning with "__reg_" are reserved for internal use; please rename')
+              WHEN EXISTS (SELECT 1 FROM __reg_cols WHERE starts_with(lower(colname), '__reg_'))
+              THEN error(caller || ': column names beginning with "__reg_" are reserved for internal use; please rename')
+              WHEN weights_col IS NOT NULL AND weights_col NOT IN (SELECT colname FROM __reg_cols)
+              THEN error(caller || ': weights column "' || weights_col || '" not found')
+              WHEN cluster_col IS NOT NULL AND cluster_col NOT IN (SELECT colname FROM __reg_cols)
+              THEN error(caller || ': cluster column "' || cluster_col || '" not found')
+              ELSE true END AS ok
+),
+__reg_mdl AS (SELECT feature, coefficient FROM query_table(model)),
 -- Feature position in name order, so the per-row feature vector below can be
 -- ordered by an integer rather than by the VARCHAR column name (see __reg_stats).
-mdlj AS (SELECT feature, row_number() OVER (ORDER BY feature) AS j
-         FROM mdl WHERE feature != '(Intercept)'),
-beta AS (
-  SELECT ([ coalesce((SELECT coefficient FROM mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
+__reg_mdlj AS (SELECT feature, row_number() OVER (ORDER BY feature) AS j
+         FROM __reg_mdl WHERE feature != '(Intercept)'),
+__reg_beta AS (
+  SELECT ([ coalesce((SELECT coefficient FROM __reg_mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
           || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS bvec,
          ([ '(Intercept)' ]
           || list(feature ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS names,
          (count(*) FILTER (WHERE feature != '(Intercept)'))::INT AS k
-  FROM mdl
+  FROM __reg_mdl CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok
 ),
-num AS (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
-alllong AS (
-  SELECT rid, name AS col, value AS v
-  FROM (UNPIVOT (SELECT rid, TRY_CAST(COLUMNS(* EXCLUDE (rid)) AS DOUBLE) FROM num)
-        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE value)
+__reg_num AS (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+__reg_alllong AS (
+  SELECT __reg_rid__, name AS col, value AS v
+  FROM (UNPIVOT (SELECT __reg_rid__, TRY_CAST(COLUMNS(* EXCLUDE (__reg_rid__)) AS DOUBLE) FROM __reg_num)
+        ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
 ),
-yv AS (SELECT rid, v AS y  FROM alllong WHERE col = outcome),
-ov AS (SELECT rid, v AS o  FROM alllong WHERE col = offset_col),
-wv AS (SELECT rid, v AS wt FROM alllong WHERE col = weights_col),
-clv AS (SELECT rid, v AS cl FROM alllong WHERE col = cluster_col),
-feat AS (
-  SELECT l.rid, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
-  FROM alllong l JOIN mdlj m ON m.feature = l.col
-  GROUP BY l.rid
+__reg_yv AS (SELECT __reg_rid__, v AS y  FROM __reg_alllong WHERE col = outcome),
+__reg_ov AS (SELECT __reg_rid__, v AS o  FROM __reg_alllong WHERE col = offset_col),
+__reg_wv AS (SELECT __reg_rid__, v AS wt FROM __reg_alllong WHERE col = weights_col),
+-- Cluster identities must not pass through DOUBLE: text labels and distinct
+-- numeric-looking strings (e.g. '01' and '1') identify different groups.
+__reg_clv AS (
+  SELECT __reg_rid__, value AS cl
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(* EXCLUDE (__reg_rid__)) AS VARCHAR) FROM __reg_num)
+        ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
+  WHERE name = cluster_col
 ),
-rows0 AS (
-  SELECT f.rid, f.xs, y.y,
+__reg_feat AS (
+  SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
+  FROM __reg_alllong l JOIN __reg_mdlj m ON m.feature = l.col
+  GROUP BY l.__reg_rid__
+),
+__reg_rows0 AS (
+  SELECT f.__reg_rid__, f.xs, y.y,
          CASE WHEN offset_col IS NULL THEN 0.0 ELSE o.o END AS off,
-         CASE WHEN weights_col IS NULL THEN 1.0 ELSE coalesce(w.wt, 1.0) END AS wt
-  FROM feat f
-  JOIN yv y ON y.rid = f.rid
-  LEFT JOIN ov o ON o.rid = f.rid
-  LEFT JOIN wv w ON w.rid = f.rid
-  CROSS JOIN beta
-  WHERE f.nf = beta.k AND y.y IS NOT NULL
+         CASE WHEN weights_col IS NULL THEN 1.0 ELSE w.wt END AS wt
+  FROM __reg_feat f
+  JOIN __reg_yv y ON y.__reg_rid__ = f.__reg_rid__
+  LEFT JOIN __reg_ov o ON o.__reg_rid__ = f.__reg_rid__
+  LEFT JOIN __reg_wv w ON w.__reg_rid__ = f.__reg_rid__
+  CROSS JOIN __reg_beta
+  WHERE f.nf = __reg_beta.k AND y.y IS NOT NULL
     AND (offset_col IS NULL OR o.o IS NOT NULL)
+    AND (weights_col IS NULL OR w.wt IS NOT NULL)
 ),
-rww AS (
-  SELECT r.rid, r.xs, r.y, r.wt, mu,
+__reg_rww AS (
+  SELECT r.__reg_rid__, r.xs, r.y, r.wt, mu,
          r.wt * (CASE family
                    WHEN 'logistic' THEN mu*(1.0-mu)  WHEN 'linear' THEN 1.0
                    WHEN 'poisson'  THEN mu           WHEN 'gamma'  THEN 1.0
@@ -2025,41 +2195,41 @@ rww AS (
                    WHEN 'nbinom'   THEN (r.y-mu)*(r.y-mu)/(mu*(1.0+alpha*mu)) END) AS pearson
   FROM (
     -- eta clamped to [-700, 700] (as the fit does) so mu = exp(eta) never overflows
-    SELECT rid, xs, y, wt,
+    SELECT __reg_rid__, xs, y, wt,
            CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0, least(eta, 700.0))))
                        WHEN 'linear'   THEN eta
                        ELSE exp(greatest(-700.0, least(eta, 700.0))) END AS mu
-    FROM (SELECT rid, xs, y, wt, off + list_dot_product(xs, (SELECT bvec FROM beta)) AS eta FROM rows0)
+    FROM (SELECT __reg_rid__, xs, y, wt, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0)
   ) r
 ),
-dims AS (SELECT count(*)::INT AS n, (SELECT k FROM beta)+1 AS d FROM rww),
-idx AS (SELECT unnest(range(1, (SELECT d FROM dims)+1)) AS i),
-pairs AS (SELECT a.i AS a, b.i AS b FROM idx a, idx b),
-xwx AS (
+__reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_rww),
+__reg_idx AS (SELECT unnest(range(1, (SELECT d FROM __reg_dims)+1)) AS i),
+__reg_pairs AS (SELECT a.i AS a, b.i AS b FROM __reg_idx a, __reg_idx b),
+__reg_xwx AS (
   SELECT list(rowlist ORDER BY a) AS A FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
-      SELECT p.a AS a, p.b AS b, sum(rww.w * rww.xs[p.a] * rww.xs[p.b]) AS val
-      FROM rww, pairs p GROUP BY p.a, p.b
+      SELECT p.a AS a, p.b AS b, sum(__reg_rww.w * __reg_rww.xs[p.a] * __reg_rww.xs[p.b]) AS val
+      FROM __reg_rww, __reg_pairs p GROUP BY p.a, p.b
     ) GROUP BY a
   )
 ),
 -- Scale X'WX to unit diagonal (correlation form) before inversion: makes the
 -- singular-pivot test scale-invariant and squares less conditioning error.
 -- dsc[j] = sqrt(diag_j); Cov = phi * D^-1 R^-1 D^-1, so SE_j = sqrt(phi*Rinv_jj)/dsc_j.
-scal AS (
+__reg_scal AS (
   SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc
-  FROM xwx
+  FROM __reg_xwx
 ),
-rscaled AS (
+__reg_rscaled AS (
   SELECT dsc, list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dsc[i]*dsc[j]))) AS R
-  FROM scal
+  FROM __reg_scal
 ),
-gj(k, d, sing, M) AS (
+__reg_gj(k, d, sing, M) AS (
   SELECT 0, len(R), false,
          list_transform(R, lambda row, i:
              list_concat(list_transform(row, lambda v, j: v::DOUBLE),
                          list_transform(row, lambda v, j: CASE WHEN j = i THEN 1.0 ELSE 0.0 END)))
-  FROM rscaled
+  FROM __reg_rscaled
   UNION ALL
   SELECT col, d, sing OR abs(piv) < 1e-12,
          CASE WHEN abs(piv) < 1e-12 THEN Mswap
@@ -2079,96 +2249,100 @@ gj(k, d, sing, M) AS (
           SELECT k, k+1 AS col, d, sing, M,
                  list_transform(M, lambda row, i:
                      CASE WHEN i >= k+1 THEN abs(row[k+1]) ELSE -1e308 END) AS pcol
-          FROM gj WHERE k < d
+          FROM __reg_gj WHERE k < d
         )
       )
     )
   )
 ),
-covinv AS (
+__reg_covinv AS (
   SELECT CASE WHEN sing THEN NULL
               ELSE list_transform(M, lambda row, i: list_slice(row, d+1, 2*d)) END AS Rinv
-  FROM gj WHERE k = d
+  FROM __reg_gj WHERE k = d
 ),
-disp AS (
+__reg_disp AS (
   SELECT CASE WHEN family IN ('linear','gamma','tweedie')
-              THEN (SELECT sum(pearson) FROM rww) / nullif((SELECT n-d FROM dims), 0)
+              THEN (SELECT sum(pearson) FROM __reg_rww) / nullif((SELECT n-d FROM __reg_dims), 0)
               ELSE 1.0 END AS phi,
          family IN ('linear','gamma','tweedie') AS est,
-         (SELECT (n-d)::DOUBLE FROM dims) AS df
+         (SELECT (n-d)::DOUBLE FROM __reg_dims) AS df
 ),
 -- ---- Robust (sandwich) covariance: Cov = A^-1 B A^-1 -----------------------
 -- Computed alongside the model-based covariance; selected when robust != 'none'
 -- or cluster_col is given. A = X'diag(a*hw)X uses the OBSERVED-info weight hw
 -- (matches statsmodels for the non-canonical log-link families); the meat B is
--- the score-outer-product. Dispersion-free -> z inference. e_i = the GD residual.
-robrow AS (
-  SELECT rww.rid, rww.xs, rww.wt, cl.cl AS cl,
-         rww.wt * (CASE family
+-- the score-outer-product, including squared analytic weights (var_weights).
+-- A uniform rescaling of analytic weights therefore leaves robust SEs unchanged.
+-- Dispersion-free -> z inference. e_i = the GD residual.
+__reg_robrow AS (
+  SELECT __reg_rww.__reg_rid__, __reg_rww.xs, __reg_rww.wt, cl.cl AS cl,
+         __reg_rww.wt * (CASE family
                      WHEN 'logistic' THEN mu*(1.0-mu)  WHEN 'linear' THEN 1.0
                      WHEN 'poisson'  THEN mu
-                     WHEN 'gamma'    THEN rww.y/mu
-                     WHEN 'tweedie'  THEN (2.0-power)*pow(mu,2.0-power) + (power-1.0)*rww.y*pow(mu,1.0-power)
-                     WHEN 'nbinom'   THEN mu*(1.0+alpha*rww.y)/pow(1.0+alpha*mu,2.0) END) AS hwt,
-         rww.wt * (CASE family
-                     WHEN 'gamma'   THEN (rww.y-mu)/mu
-                     WHEN 'tweedie' THEN (rww.y-mu)*pow(mu,1.0-power)
-                     WHEN 'nbinom'  THEN (rww.y-mu)/(1.0+alpha*mu)
-                     ELSE rww.y-mu END) AS sc                       -- score scalar = a*r
-  FROM rww LEFT JOIN clv cl ON cl.rid = rww.rid
+                     WHEN 'gamma'    THEN __reg_rww.y/mu
+                     WHEN 'tweedie'  THEN (2.0-power)*pow(mu,2.0-power) + (power-1.0)*__reg_rww.y*pow(mu,1.0-power)
+                     WHEN 'nbinom'   THEN mu*(1.0+alpha*__reg_rww.y)/pow(1.0+alpha*mu,2.0) END) AS hwt,
+         __reg_rww.wt * (CASE family
+                     WHEN 'gamma'   THEN (__reg_rww.y-mu)/mu
+                     WHEN 'tweedie' THEN (__reg_rww.y-mu)*pow(mu,1.0-power)
+                     WHEN 'nbinom'  THEN (__reg_rww.y-mu)/(1.0+alpha*mu)
+                     ELSE __reg_rww.y-mu END) AS sc                       -- score scalar = a*r
+  FROM __reg_rww LEFT JOIN __reg_clv cl ON cl.__reg_rid__ = __reg_rww.__reg_rid__
 ),
-rdims AS (SELECT count(DISTINCT cl)::INT AS G FROM robrow),
-breadA AS (
+__reg_rdims AS (SELECT count(DISTINCT cl)::INT AS G FROM __reg_robrow),
+__reg_breada AS (
   SELECT list(rowlist ORDER BY a) AS A FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
-      SELECT p.a AS a, p.b AS b, sum(robrow.hwt * robrow.xs[p.a] * robrow.xs[p.b]) AS val
-      FROM robrow, pairs p GROUP BY p.a, p.b) GROUP BY a)
+      SELECT p.a AS a, p.b AS b, sum(__reg_robrow.hwt * __reg_robrow.xs[p.a] * __reg_robrow.xs[p.b]) AS val
+      FROM __reg_robrow, __reg_pairs p GROUP BY p.a, p.b) GROUP BY a)
 ),
-breadinv AS (
+__reg_breadinv AS (
   SELECT list_transform(RAinv, lambda row, i: list_transform(row, lambda v, j: v/(dscA[i]*dscA[j]))) AS Ainv
   FROM (SELECT dscA, __reg_matinv(list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dscA[i]*dscA[j])))) AS RAinv
-        FROM (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dscA FROM breadA))
+        FROM (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dscA FROM __reg_breada))
 ),
-lev AS (
+__reg_lev AS (
   SELECT r.xs, r.sc, r.cl, r.wt,
          r.hwt * list_sum(list_transform(r.xs, lambda xa, a: xa * list_dot_product(bi.Ainv[a], r.xs))) AS h
-  FROM robrow r CROSS JOIN breadinv bi
+  FROM __reg_robrow r CROSS JOIN __reg_breadinv bi
 ),
-meat_hc AS (
+__reg_meat_hc AS (
   SELECT list(rowlist ORDER BY a) AS B FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
       SELECT p.a AS a, p.b AS b,
-             sum((CASE WHEN robust = 'hc2' THEN m.sc*m.sc/m.wt/(1.0-m.h)
-                       WHEN robust = 'hc3' THEN m.sc*m.sc/m.wt/((1.0-m.h)*(1.0-m.h))
-                       ELSE m.sc*m.sc/m.wt END) * m.xs[p.a] * m.xs[p.b]) AS val
-      FROM lev m, pairs p GROUP BY p.a, p.b) GROUP BY a)
+             sum((CASE WHEN robust = 'hc2' THEN m.sc*m.sc/(1.0-m.h)
+                       WHEN robust = 'hc3' THEN m.sc*m.sc/((1.0-m.h)*(1.0-m.h))
+                       ELSE m.sc*m.sc END) * m.xs[p.a] * m.xs[p.b]) AS val
+      FROM __reg_lev m, __reg_pairs p GROUP BY p.a, p.b) GROUP BY a)
 ),
-clsg AS (
+__reg_clsg AS (
   SELECT cl, list(sga ORDER BY a) AS sg FROM (
-    SELECT l.cl, ix.i AS a, sum(l.sc * l.xs[ix.i]) AS sga FROM lev l, idx ix GROUP BY l.cl, ix.i) GROUP BY cl
+    SELECT l.cl, ix.i AS a, sum(l.sc * l.xs[ix.i]) AS sga FROM __reg_lev l, __reg_idx ix GROUP BY l.cl, ix.i) GROUP BY cl
 ),
-meat_cl AS (
+__reg_meat_cl AS (
   SELECT list(rowlist ORDER BY a) AS B FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
       SELECT p.a AS a, p.b AS b, sum(c.sg[p.a] * c.sg[p.b]) AS val
-      FROM clsg c, pairs p GROUP BY p.a, p.b) GROUP BY a)
+      FROM __reg_clsg c, __reg_pairs p GROUP BY p.a, p.b) GROUP BY a)
 ),
-robvar AS (
+__reg_robvar AS (
   SELECT list_transform(range(1, dm.d+1), lambda j:
       (CASE WHEN cluster_col IS NOT NULL
             THEN (rd.G::DOUBLE/(rd.G-1)) * ((dm.n-1.0)/(dm.n-dm.d))
             WHEN robust = 'hc1' THEN dm.n::DOUBLE/(dm.n-dm.d) ELSE 1.0 END)
       * list_sum(list_transform(bi.Ainv[j], lambda va, a: va * list_dot_product(bm.B[a], bi.Ainv[j])))) AS rv
-  FROM breadinv bi
-       CROSS JOIN (SELECT CASE WHEN cluster_col IS NOT NULL THEN (SELECT B FROM meat_cl) ELSE (SELECT B FROM meat_hc) END AS B) bm
-       CROSS JOIN dims dm CROSS JOIN rdims rd
+  FROM __reg_breadinv bi
+       CROSS JOIN (SELECT CASE WHEN cluster_col IS NOT NULL THEN (SELECT B FROM __reg_meat_cl) ELSE (SELECT B FROM __reg_meat_hc) END AS B) bm
+       CROSS JOIN __reg_dims dm CROSS JOIN __reg_rdims rd
 ),
-robchk AS (
+__reg_robchk AS (
   SELECT CASE WHEN robust NOT IN ('none','hc0','hc1','hc2','hc3')
               THEN error(caller || ': robust must be one of ''none'',''hc0'',''hc1'',''hc2'',''hc3''; got ''' || robust || '''')
+              WHEN cluster_col IS NOT NULL AND EXISTS (SELECT 1 FROM __reg_robrow WHERE cl IS NULL)
+              THEN error(caller || ': cluster column "' || cluster_col || '" contains NULL on rows used for inference')
               ELSE true END AS ok
 ),
-final AS (
+__reg_final AS (
   SELECT b.names AS names, b.bvec AS bvec, c.Rinv AS Rinv, s.dsc AS dsc, rv.rv AS rv,
          dp.phi AS phi, dp.est AS est, dp.df AS df,
          (robust != 'none' OR cluster_col IS NOT NULL) AS robactive,
@@ -2176,11 +2350,11 @@ final AS (
          CASE WHEN dp.est AND dp.df > 0.0 AND robust = 'none' AND cluster_col IS NULL
                 THEN t_ppf(1.0-(1.0-conf_level)/2.0, dp.df)
               ELSE norm_ppf(1.0-(1.0-conf_level)/2.0) END AS crit
-  FROM beta b CROSS JOIN covinv c CROSS JOIN scal s CROSS JOIN disp dp CROSS JOIN robvar rv
-       CROSS JOIN robchk rc WHERE rc.ok
+  FROM __reg_beta b CROSS JOIN __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_disp dp CROSS JOIN __reg_robvar rv
+       CROSS JOIN __reg_robchk rc WHERE rc.ok
 ),
 -- per-coefficient SE with guards: NULL when the covariance is singular / non-finite / non-positive
-percoef AS (
+__reg_percoef AS (
   SELECT gs.i AS i, names[gs.i] AS feature, bvec[gs.i] AS coefficient, uset, df, crit,
          CASE WHEN robactive THEN
                 -- df <= 0 (saturated): robust variance is undefined; at n==d the
@@ -2190,7 +2364,7 @@ percoef AS (
                 CASE WHEN Rinv IS NOT NULL AND isfinite(phi * Rinv[gs.i][gs.i]) AND phi * Rinv[gs.i][gs.i] > 0.0
                      THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] ELSE NULL END
          END AS std_error
-  FROM final, unnest(range(1, len(bvec)+1)) AS gs(i)
+  FROM __reg_final, unnest(range(1, len(bvec)+1)) AS gs(i)
 )
 SELECT feature, coefficient, std_error,
        coefficient / std_error AS statistic,
@@ -2199,7 +2373,7 @@ SELECT feature, coefficient, std_error,
             ELSE 2.0 * norm_cdf(-abs(coefficient / std_error)) END AS p_value,
        coefficient - crit * std_error AS conf_low,
        coefficient + crit * std_error AS conf_high
-FROM percoef ORDER BY i;
+FROM __reg_percoef CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok ORDER BY i;
 
 CREATE OR REPLACE MACRO logit_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL, robust := 'none', cluster_col := NULL) AS TABLE
 SELECT * FROM __reg_summary(model, tbl, outcome, 'logistic', 'logit_summary', conf_level, offset_col, weights_col, NULL, NULL, robust, cluster_col);
@@ -2226,41 +2400,66 @@ SELECT * FROM __reg_summary(model, tbl, outcome, 'nbinom', 'nbinom_summary', con
 CREATE OR REPLACE MACRO __reg_predict_ci(model, tbl, outcome, newdata, family, caller,
                                          conf_level, offset_col, weights_col, power, alpha) AS TABLE
 WITH RECURSIVE
-mdl AS (SELECT feature, coefficient FROM query_table(model)),
+__reg_cols AS (
+  SELECT colname
+  FROM (SELECT * FROM (SELECT 1 AS __reg_one)
+        LEFT JOIN (SELECT CAST(COLUMNS(*) AS VARCHAR) FROM query_table(tbl) LIMIT 1) ON true)
+       UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
+),
+__reg_scorecols AS (
+  SELECT colname
+  FROM (SELECT * FROM (SELECT 1 AS __reg_one)
+        LEFT JOIN (SELECT CAST(COLUMNS(*) AS VARCHAR) FROM query_table(coalesce(newdata, tbl)) LIMIT 1) ON true)
+       UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
+),
+__reg_inputcheck AS (
+  SELECT CASE WHEN starts_with(lower(tbl), '__reg_') OR starts_with(lower(model), '__reg_')
+                OR starts_with(lower(coalesce(newdata, tbl)), '__reg_')
+              THEN error(caller || ': table names beginning with "__reg_" are reserved for internal use; please rename')
+              WHEN EXISTS (SELECT 1 FROM __reg_cols WHERE starts_with(lower(colname), '__reg_'))
+              THEN error(caller || ': column names beginning with "__reg_" are reserved for internal use; please rename')
+              WHEN EXISTS (SELECT 1 FROM __reg_scorecols WHERE starts_with(lower(colname), '__reg_'))
+              THEN error(caller || ': column names beginning with "__reg_" are reserved for internal use; please rename')
+              WHEN weights_col IS NOT NULL AND weights_col NOT IN (SELECT colname FROM __reg_cols)
+              THEN error(caller || ': weights column "' || weights_col || '" not found')
+              ELSE true END AS ok
+),
+__reg_mdl AS (SELECT feature, coefficient FROM query_table(model)),
 -- Feature position in name order, so the per-row feature vector below can be
 -- ordered by an integer rather than by the VARCHAR column name (see __reg_stats).
-mdlj AS (SELECT feature, row_number() OVER (ORDER BY feature) AS j
-         FROM mdl WHERE feature != '(Intercept)'),
-beta AS (
-  SELECT ([ coalesce((SELECT coefficient FROM mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
+__reg_mdlj AS (SELECT feature, row_number() OVER (ORDER BY feature) AS j
+         FROM __reg_mdl WHERE feature != '(Intercept)'),
+__reg_beta AS (
+  SELECT ([ coalesce((SELECT coefficient FROM __reg_mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
           || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS bvec,
          (count(*) FILTER (WHERE feature != '(Intercept)'))::INT AS k
-  FROM mdl
+  FROM __reg_mdl CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok
 ),
 -- === model-based covariance from the TRAINING data (as __reg_summary) ===
-num AS (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
-alllong AS (
-  SELECT rid, name AS col, value AS v
-  FROM (UNPIVOT (SELECT rid, TRY_CAST(COLUMNS(* EXCLUDE (rid)) AS DOUBLE) FROM num)
-        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE value)
+__reg_num AS (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+__reg_alllong AS (
+  SELECT __reg_rid__, name AS col, value AS v
+  FROM (UNPIVOT (SELECT __reg_rid__, TRY_CAST(COLUMNS(* EXCLUDE (__reg_rid__)) AS DOUBLE) FROM __reg_num)
+        ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
 ),
-yv AS (SELECT rid, v AS y  FROM alllong WHERE col = outcome),
-ov AS (SELECT rid, v AS o  FROM alllong WHERE col = offset_col),
-wv AS (SELECT rid, v AS wt FROM alllong WHERE col = weights_col),
-feat AS (
-  SELECT l.rid, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
-  FROM alllong l JOIN mdlj m ON m.feature = l.col
-  GROUP BY l.rid
+__reg_yv AS (SELECT __reg_rid__, v AS y  FROM __reg_alllong WHERE col = outcome),
+__reg_ov AS (SELECT __reg_rid__, v AS o  FROM __reg_alllong WHERE col = offset_col),
+__reg_wv AS (SELECT __reg_rid__, v AS wt FROM __reg_alllong WHERE col = weights_col),
+__reg_feat AS (
+  SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
+  FROM __reg_alllong l JOIN __reg_mdlj m ON m.feature = l.col
+  GROUP BY l.__reg_rid__
 ),
-rows0 AS (
-  SELECT f.rid, f.xs, y.y,
+__reg_rows0 AS (
+  SELECT f.__reg_rid__, f.xs, y.y,
          CASE WHEN offset_col IS NULL THEN 0.0 ELSE o.o END AS off,
-         CASE WHEN weights_col IS NULL THEN 1.0 ELSE coalesce(w.wt, 1.0) END AS wt
-  FROM feat f JOIN yv y ON y.rid = f.rid
-  LEFT JOIN ov o ON o.rid = f.rid LEFT JOIN wv w ON w.rid = f.rid CROSS JOIN beta
-  WHERE f.nf = beta.k AND y.y IS NOT NULL AND (offset_col IS NULL OR o.o IS NOT NULL)
+         CASE WHEN weights_col IS NULL THEN 1.0 ELSE w.wt END AS wt
+  FROM __reg_feat f JOIN __reg_yv y ON y.__reg_rid__ = f.__reg_rid__
+  LEFT JOIN __reg_ov o ON o.__reg_rid__ = f.__reg_rid__ LEFT JOIN __reg_wv w ON w.__reg_rid__ = f.__reg_rid__ CROSS JOIN __reg_beta
+  WHERE f.nf = __reg_beta.k AND y.y IS NOT NULL AND (offset_col IS NULL OR o.o IS NOT NULL)
+    AND (weights_col IS NULL OR w.wt IS NOT NULL)
 ),
-rww AS (
+__reg_rww AS (
   SELECT r.xs, r.y, r.wt, mu,
          r.wt * (CASE family WHEN 'logistic' THEN mu*(1.0-mu) WHEN 'linear' THEN 1.0
                    WHEN 'poisson' THEN mu WHEN 'gamma' THEN 1.0
@@ -2271,24 +2470,24 @@ rww AS (
                    WHEN 'nbinom' THEN (r.y-mu)*(r.y-mu)/(mu*(1.0+alpha*mu)) END) AS pearson
   FROM (SELECT xs, y, wt, CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                             WHEN 'linear' THEN eta ELSE exp(greatest(-700.0,least(eta,700.0))) END AS mu
-        FROM (SELECT xs, y, wt, off + list_dot_product(xs, (SELECT bvec FROM beta)) AS eta FROM rows0)) r
+        FROM (SELECT xs, y, wt, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0)) r
 ),
-dims AS (SELECT count(*)::INT AS n, (SELECT k FROM beta)+1 AS d FROM rww),
-idx AS (SELECT unnest(range(1, (SELECT d FROM dims)+1)) AS i),
-pairs AS (SELECT a.i AS a, b.i AS b FROM idx a, idx b),
-xwx AS (
+__reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_rww),
+__reg_idx AS (SELECT unnest(range(1, (SELECT d FROM __reg_dims)+1)) AS i),
+__reg_pairs AS (SELECT a.i AS a, b.i AS b FROM __reg_idx a, __reg_idx b),
+__reg_xwx AS (
   SELECT list(rowlist ORDER BY a) AS A FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
-      SELECT p.a AS a, p.b AS b, sum(rww.w * rww.xs[p.a] * rww.xs[p.b]) AS val
-      FROM rww, pairs p GROUP BY p.a, p.b) GROUP BY a)
+      SELECT p.a AS a, p.b AS b, sum(__reg_rww.w * __reg_rww.xs[p.a] * __reg_rww.xs[p.b]) AS val
+      FROM __reg_rww, __reg_pairs p GROUP BY p.a, p.b) GROUP BY a)
 ),
-scal AS (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc FROM xwx),
-rscaled AS (SELECT dsc, list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dsc[i]*dsc[j]))) AS R FROM scal),
-gj(k, d, sing, M) AS (
+__reg_scal AS (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc FROM __reg_xwx),
+__reg_rscaled AS (SELECT dsc, list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dsc[i]*dsc[j]))) AS R FROM __reg_scal),
+__reg_gj(k, d, sing, M) AS (
   SELECT 0, len(R), false,
          list_transform(R, lambda row, i: list_concat(list_transform(row, lambda v, j: v::DOUBLE),
              list_transform(row, lambda v, j: CASE WHEN j = i THEN 1.0 ELSE 0.0 END)))
-  FROM rscaled
+  FROM __reg_rscaled
   UNION ALL
   SELECT col, d, sing OR abs(piv) < 1e-12,
          CASE WHEN abs(piv) < 1e-12 THEN Mswap
@@ -2301,52 +2500,52 @@ gj(k, d, sing, M) AS (
               FROM (SELECT col, d, sing, M, list_position(pcol, list_aggregate(pcol, 'max')) AS p
                     FROM (SELECT k, k+1 AS col, d, sing, M, list_transform(M, lambda row, i:
                                    CASE WHEN i >= k+1 THEN abs(row[k+1]) ELSE -1e308 END) AS pcol
-                          FROM gj WHERE k < d))))
+                          FROM __reg_gj WHERE k < d))))
 ),
-covinv AS (SELECT CASE WHEN sing THEN NULL ELSE list_transform(M, lambda row, i: list_slice(row, d+1, 2*d)) END AS Rinv FROM gj WHERE k = d),
-disp AS (
+__reg_covinv AS (SELECT CASE WHEN sing THEN NULL ELSE list_transform(M, lambda row, i: list_slice(row, d+1, 2*d)) END AS Rinv FROM __reg_gj WHERE k = d),
+__reg_disp AS (
   SELECT CASE WHEN family IN ('linear','gamma','tweedie')
-              THEN (SELECT sum(pearson) FROM rww) / nullif((SELECT n-d FROM dims), 0) ELSE 1.0 END AS phi,
-         (family IN ('linear','gamma','tweedie') AND (SELECT n-d FROM dims) > 0) AS uset,
-         (SELECT (n-d)::DOUBLE FROM dims) AS df
+              THEN (SELECT sum(pearson) FROM __reg_rww) / nullif((SELECT n-d FROM __reg_dims), 0) ELSE 1.0 END AS phi,
+         (family IN ('linear','gamma','tweedie') AND (SELECT n-d FROM __reg_dims) > 0) AS uset,
+         (SELECT (n-d)::DOUBLE FROM __reg_dims) AS df
 ),
-cparams AS (
+__reg_cparams AS (
   SELECT c.Rinv AS Rinv, s.dsc AS dsc, dp.phi AS phi, dp.uset AS uset, dp.df AS df,
          CASE WHEN dp.uset THEN t_ppf(1.0-(1.0-conf_level)/2.0, dp.df)
               ELSE norm_ppf(1.0-(1.0-conf_level)/2.0) END AS crit
-  FROM covinv c CROSS JOIN scal s CROSS JOIN disp dp
+  FROM __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_disp dp
 ),
 -- === score newdata (default = tbl) ===
-snum AS (SELECT row_number() OVER () AS srid, * FROM query_table(coalesce(newdata, tbl))),
-salllong AS (
-  SELECT srid, name AS col, value AS v
-  FROM (UNPIVOT (SELECT srid, TRY_CAST(COLUMNS(* EXCLUDE (srid)) AS DOUBLE) FROM snum)
-        ON COLUMNS(* EXCLUDE (srid)) INTO NAME name VALUE value)
+__reg_snum AS (SELECT row_number() OVER () AS __reg_srid__, * FROM query_table(coalesce(newdata, tbl))),
+__reg_salllong AS (
+  SELECT __reg_srid__, name AS col, value AS v
+  FROM (UNPIVOT (SELECT __reg_srid__, TRY_CAST(COLUMNS(* EXCLUDE (__reg_srid__)) AS DOUBLE) FROM __reg_snum)
+        ON COLUMNS(* EXCLUDE (__reg_srid__)) INTO NAME name VALUE value)
 ),
-soff AS (SELECT srid, v AS o FROM salllong WHERE col = offset_col),
-sfeat AS (
-  SELECT l.srid, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
-  FROM salllong l JOIN mdlj m ON m.feature = l.col
-  GROUP BY l.srid
+__reg_soff AS (SELECT __reg_srid__, v AS o FROM __reg_salllong WHERE col = offset_col),
+__reg_sfeat AS (
+  SELECT l.__reg_srid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
+  FROM __reg_salllong l JOIN __reg_mdlj m ON m.feature = l.col
+  GROUP BY l.__reg_srid__
 ),
-scored AS (
-  SELECT sn.srid,
-         CASE WHEN sf.nf = (SELECT k FROM beta)
+__reg_scored AS (
+  SELECT sn.__reg_srid__,
+         CASE WHEN sf.nf = (SELECT k FROM __reg_beta)
                    AND (offset_col IS NULL OR so.o IS NOT NULL)
               THEN (CASE WHEN offset_col IS NULL THEN 0.0 ELSE so.o END)
-                   + list_dot_product(sf.xs, (SELECT bvec FROM beta)) END AS eta,
-         CASE WHEN sf.nf = (SELECT k FROM beta) AND cp.Rinv IS NOT NULL
+                   + list_dot_product(sf.xs, (SELECT bvec FROM __reg_beta)) END AS eta,
+         CASE WHEN sf.nf = (SELECT k FROM __reg_beta) AND cp.Rinv IS NOT NULL
               THEN cp.phi * list_sum(list_transform(
                        list_transform(sf.xs, lambda v, a: v / cp.dsc[a]),
                        lambda va, a: va * list_dot_product(cp.Rinv[a], list_transform(sf.xs, lambda v2, a2: v2 / cp.dsc[a2]))))
               END AS var_eta,
          cp.crit AS crit
-  FROM snum sn
-  LEFT JOIN sfeat sf ON sf.srid = sn.srid
-  LEFT JOIN soff so ON so.srid = sn.srid
-  CROSS JOIN cparams cp
+  FROM __reg_snum sn
+  LEFT JOIN __reg_sfeat sf ON sf.__reg_srid__ = sn.__reg_srid__
+  LEFT JOIN __reg_soff so ON so.__reg_srid__ = sn.__reg_srid__
+  CROSS JOIN __reg_cparams cp
 )
-SELECT sn.* EXCLUDE (srid),
+SELECT sn.* EXCLUDE (__reg_srid__),
        CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-s.eta)) WHEN 'linear' THEN s.eta ELSE exp(s.eta) END AS prediction,
        CASE WHEN s.var_eta IS NULL OR NOT isfinite(s.var_eta) OR s.var_eta < 0.0 THEN NULL
             ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta - s.crit*sqrt(s.var_eta))))
@@ -2356,8 +2555,9 @@ SELECT sn.* EXCLUDE (srid),
             ELSE (CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-(s.eta + s.crit*sqrt(s.var_eta))))
                               WHEN 'linear' THEN s.eta + s.crit*sqrt(s.var_eta)
                               ELSE exp(s.eta + s.crit*sqrt(s.var_eta)) END) END AS conf_high
-FROM scored s JOIN snum sn ON sn.srid = s.srid
-ORDER BY s.srid;
+FROM __reg_scored s JOIN __reg_snum sn ON sn.__reg_srid__ = s.__reg_srid__
+CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok
+ORDER BY s.__reg_srid__;
 
 CREATE OR REPLACE MACRO logit_predict_ci(model, tbl, outcome, newdata := NULL, conf_level := 0.95, offset_col := NULL, weights_col := NULL) AS TABLE
 SELECT * FROM __reg_predict_ci(model, tbl, outcome, newdata, 'logistic', 'logit_predict_ci', conf_level, offset_col, weights_col, NULL, NULL);
@@ -2381,41 +2581,57 @@ SELECT * FROM __reg_predict_ci(model, tbl, outcome, newdata, 'nbinom', 'nbinom_p
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE MACRO __reg_influence(model, tbl, outcome, family, caller, offset_col, weights_col, power, alpha) AS TABLE
 WITH RECURSIVE
-mdl AS (SELECT feature, coefficient FROM query_table(model)),
+__reg_cols AS (
+  SELECT colname
+  FROM (SELECT * FROM (SELECT 1 AS __reg_one)
+        LEFT JOIN (SELECT CAST(COLUMNS(*) AS VARCHAR) FROM query_table(tbl) LIMIT 1) ON true)
+       UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
+),
+__reg_inputcheck AS (
+  SELECT CASE WHEN starts_with(lower(tbl), '__reg_') OR starts_with(lower(model), '__reg_')
+              THEN error(caller || ': table names beginning with "__reg_" are reserved for internal use; please rename')
+              WHEN EXISTS (SELECT 1 FROM __reg_cols WHERE starts_with(lower(colname), '__reg_'))
+              THEN error(caller || ': column names beginning with "__reg_" are reserved for internal use; please rename')
+              WHEN weights_col IS NOT NULL AND weights_col NOT IN (SELECT colname FROM __reg_cols)
+              THEN error(caller || ': weights column "' || weights_col || '" not found')
+              ELSE true END AS ok
+),
+__reg_mdl AS (SELECT feature, coefficient FROM query_table(model)),
 -- Feature position in name order, so the per-row feature vector below can be
 -- ordered by an integer rather than by the VARCHAR column name (see __reg_stats).
-mdlj AS (SELECT feature, row_number() OVER (ORDER BY feature) AS j
-         FROM mdl WHERE feature != '(Intercept)'),
-beta AS (
-  SELECT ([ coalesce((SELECT coefficient FROM mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
+__reg_mdlj AS (SELECT feature, row_number() OVER (ORDER BY feature) AS j
+         FROM __reg_mdl WHERE feature != '(Intercept)'),
+__reg_beta AS (
+  SELECT ([ coalesce((SELECT coefficient FROM __reg_mdl WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
           || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)')) AS bvec,
          (count(*) FILTER (WHERE feature != '(Intercept)'))::INT AS k
-  FROM mdl
+  FROM __reg_mdl CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok
 ),
-num AS (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
-alllong AS (
-  SELECT rid, name AS col, value AS v
-  FROM (UNPIVOT (SELECT rid, TRY_CAST(COLUMNS(* EXCLUDE (rid)) AS DOUBLE) FROM num)
-        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE value)
+__reg_num AS (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+__reg_alllong AS (
+  SELECT __reg_rid__, name AS col, value AS v
+  FROM (UNPIVOT (SELECT __reg_rid__, TRY_CAST(COLUMNS(* EXCLUDE (__reg_rid__)) AS DOUBLE) FROM __reg_num)
+        ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
 ),
-yv AS (SELECT rid, v AS y  FROM alllong WHERE col = outcome),
-ov AS (SELECT rid, v AS o  FROM alllong WHERE col = offset_col),
-wv AS (SELECT rid, v AS wt FROM alllong WHERE col = weights_col),
-feat AS (
-  SELECT l.rid, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
-  FROM alllong l JOIN mdlj m ON m.feature = l.col GROUP BY l.rid
+__reg_yv AS (SELECT __reg_rid__, v AS y  FROM __reg_alllong WHERE col = outcome),
+__reg_ov AS (SELECT __reg_rid__, v AS o  FROM __reg_alllong WHERE col = offset_col),
+__reg_wv AS (SELECT __reg_rid__, v AS wt FROM __reg_alllong WHERE col = weights_col),
+__reg_feat AS (
+  SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
+  FROM __reg_alllong l JOIN __reg_mdlj m ON m.feature = l.col GROUP BY l.__reg_rid__
 ),
-rows0 AS (
-  SELECT f.rid, f.xs, y.y,
+__reg_rows0 AS (
+  SELECT f.__reg_rid__, f.xs, y.y,
          CASE WHEN offset_col IS NULL THEN 0.0 ELSE o.o END AS off,
-         CASE WHEN weights_col IS NULL THEN 1.0 ELSE coalesce(w.wt, 1.0) END AS wt
-  FROM feat f JOIN yv y ON y.rid = f.rid
-  LEFT JOIN ov o ON o.rid = f.rid LEFT JOIN wv w ON w.rid = f.rid CROSS JOIN beta
-  WHERE f.nf = beta.k AND y.y IS NOT NULL AND (offset_col IS NULL OR o.o IS NOT NULL)
+         CASE WHEN weights_col IS NULL THEN 1.0 ELSE w.wt END AS wt
+  FROM __reg_feat f JOIN __reg_yv y ON y.__reg_rid__ = f.__reg_rid__
+  LEFT JOIN __reg_ov o ON o.__reg_rid__ = f.__reg_rid__ LEFT JOIN __reg_wv w ON w.__reg_rid__ = f.__reg_rid__ CROSS JOIN __reg_beta
+  WHERE f.nf = __reg_beta.k AND y.y IS NOT NULL AND (offset_col IS NULL OR o.o IS NOT NULL)
+    AND (weights_col IS NULL OR w.wt IS NOT NULL)
 ),
 -- per row: mu, observed weight hw, variance V, residual, unit deviance
-pr AS (
-  SELECT rid, xs, wt, y, mu,
+__reg_pr AS (
+  SELECT __reg_rid__, xs, wt, y, mu,
          wt * (CASE family WHEN 'logistic' THEN mu*(1.0-mu) WHEN 'linear' THEN 1.0
                  WHEN 'poisson' THEN mu WHEN 'gamma' THEN y/mu
                  WHEN 'tweedie' THEN (2.0-power)*pow(mu,2.0-power)+(power-1.0)*y*pow(mu,1.0-power)
@@ -2428,47 +2644,51 @@ pr AS (
             WHEN 'linear'   THEN (y-mu)*(y-mu)
             WHEN 'poisson'  THEN 2.0*((CASE WHEN y>0 THEN y*ln(y/mu) ELSE 0.0 END) - (y-mu))
             WHEN 'gamma'    THEN 2.0*(-ln(y/mu) + (y-mu)/mu)
-            WHEN 'tweedie'  THEN 2.0*((CASE WHEN y>0 THEN pow(y,2.0-power)/((1.0-power)*(2.0-power)) ELSE 0.0 END) - y*pow(mu,1.0-power)/(1.0-power) + pow(mu,2.0-power)/(2.0-power))
+            WHEN 'tweedie'  THEN CASE
+              WHEN power = 1.0 THEN 2.0*((CASE WHEN y>0 THEN y*ln(y/mu) ELSE 0.0 END) - (y-mu))
+              WHEN power = 2.0 THEN 2.0*(-ln(y/mu) + (y-mu)/mu)
+              ELSE 2.0*((CASE WHEN y>0 THEN pow(y,2.0-power)/((1.0-power)*(2.0-power)) ELSE 0.0 END) - y*pow(mu,1.0-power)/(1.0-power) + pow(mu,2.0-power)/(2.0-power)) END
             WHEN 'nbinom'   THEN 2.0*((CASE WHEN y>0 THEN y*ln(y/mu) ELSE 0.0 END) - (y+1.0/alpha)*ln((y+1.0/alpha)/(mu+1.0/alpha))) END) AS udev
-  FROM (SELECT rid, xs, wt, y,
+  FROM (SELECT __reg_rid__, xs, wt, y,
                CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                            WHEN 'linear' THEN eta ELSE exp(greatest(-700.0,least(eta,700.0))) END AS mu
-        FROM (SELECT rid, xs, wt, y, off + list_dot_product(xs, (SELECT bvec FROM beta)) AS eta FROM rows0))
+        FROM (SELECT __reg_rid__, xs, wt, y, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0))
 ),
-dims AS (SELECT count(*)::INT AS n, (SELECT k FROM beta)+1 AS d FROM pr),
-idx AS (SELECT unnest(range(1, (SELECT d FROM dims)+1)) AS i),
-pairs AS (SELECT a.i AS a, b.i AS b FROM idx a, idx b),
-breadA AS (
+__reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_pr),
+__reg_idx AS (SELECT unnest(range(1, (SELECT d FROM __reg_dims)+1)) AS i),
+__reg_pairs AS (SELECT a.i AS a, b.i AS b FROM __reg_idx a, __reg_idx b),
+__reg_breada AS (
   SELECT list(rowlist ORDER BY a) AS A FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
-      SELECT p.a AS a, p.b AS b, sum(pr.hwt * pr.xs[p.a] * pr.xs[p.b]) AS val
-      FROM pr, pairs p GROUP BY p.a, p.b) GROUP BY a)
+      SELECT p.a AS a, p.b AS b, sum(__reg_pr.hwt * __reg_pr.xs[p.a] * __reg_pr.xs[p.b]) AS val
+      FROM __reg_pr, __reg_pairs p GROUP BY p.a, p.b) GROUP BY a)
 ),
-breadinv AS (
+__reg_breadinv AS (
   SELECT list_transform(RAinv, lambda row, i: list_transform(row, lambda v, j: v/(dscA[i]*dscA[j]))) AS Ainv
   FROM (SELECT dscA, __reg_matinv(list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dscA[i]*dscA[j])))) AS RAinv
-        FROM (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dscA FROM breadA))
+        FROM (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dscA FROM __reg_breada))
 ),
-lev AS (
-  SELECT p.rid, p.hwt * list_sum(list_transform(p.xs, lambda xa, a: xa * list_dot_product(bi.Ainv[a], p.xs))) AS h
-  FROM pr p CROSS JOIN breadinv bi
+__reg_lev AS (
+  SELECT p.__reg_rid__, p.hwt * list_sum(list_transform(p.xs, lambda xa, a: xa * list_dot_product(bi.Ainv[a], p.xs))) AS h
+  FROM __reg_pr p CROSS JOIN __reg_breadinv bi
 ),
-disp AS (
+__reg_disp AS (
   SELECT CASE WHEN family IN ('linear','gamma','tweedie')
-              THEN (SELECT sum(wt*resid*resid/Vmu) FROM pr) / nullif((SELECT n-d FROM dims), 0) ELSE 1.0 END AS phi,
-         (SELECT d FROM dims) AS d
+              THEN (SELECT sum(wt*resid*resid/Vmu) FROM __reg_pr) / nullif((SELECT n-d FROM __reg_dims), 0) ELSE 1.0 END AS phi,
+         (SELECT d FROM __reg_dims) AS d
 ),
-diag AS (
-  SELECT p.rid,
+__reg_diag AS (
+  SELECT p.__reg_rid__,
          CASE WHEN isfinite(l.h) THEN l.h ELSE NULL END AS hat,  -- NULL (not NaN) on singular bread
          p.resid * sqrt(p.wt) / sqrt(p.Vmu) AS pearson_resid,
          sign(p.resid) * sqrt(p.wt * greatest(p.udev, 0.0)) AS deviance_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN (p.resid*sqrt(p.wt)/sqrt(p.Vmu)) / sqrt(dp.phi*(1.0-l.h)) END AS std_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN (p.resid*p.resid*p.wt/p.Vmu/dp.phi) * l.h / (dp.d*(1.0-l.h)*(1.0-l.h)) END AS cooks_distance
-  FROM pr p JOIN lev l ON l.rid = p.rid CROSS JOIN disp dp
+  FROM __reg_pr p JOIN __reg_lev l ON l.__reg_rid__ = p.__reg_rid__ CROSS JOIN __reg_disp dp
 )
-SELECT n.* EXCLUDE (rid), d.hat, d.pearson_resid, d.deviance_resid, d.std_resid, d.cooks_distance
-FROM num n JOIN diag d ON d.rid = n.rid ORDER BY n.rid;
+SELECT n.* EXCLUDE (__reg_rid__), d.hat, d.pearson_resid, d.deviance_resid, d.std_resid, d.cooks_distance
+FROM __reg_num n JOIN __reg_diag d ON d.__reg_rid__ = n.__reg_rid__
+CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok ORDER BY n.__reg_rid__;
 
 CREATE OR REPLACE MACRO logit_influence(model, tbl, outcome, offset_col := NULL, weights_col := NULL) AS TABLE
 SELECT * FROM __reg_influence(model, tbl, outcome, 'logistic', 'logit_influence', offset_col, weights_col, NULL, NULL);
@@ -2490,80 +2710,101 @@ SELECT * FROM __reg_influence(model, tbl, outcome, 'nbinom', 'nbinom_influence',
 -- min) class is the fixed baseline and is not reported.
 CREATE OR REPLACE MACRO multinom_summary(model, tbl, outcome, conf_level := 0.95) AS TABLE
 WITH RECURSIVE
-mdl AS (SELECT class, feature, coefficient FROM query_table(model)),
-refc AS (SELECT min(class) AS ref FROM mdl),
-featnames AS (
+__reg_cols AS (
+  SELECT colname
+  FROM (SELECT * FROM (SELECT 1 AS __reg_one)
+        LEFT JOIN (SELECT CAST(COLUMNS(*) AS VARCHAR) FROM query_table(tbl) LIMIT 1) ON true)
+       UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
+),
+__reg_inputcheck AS (
+  SELECT CASE WHEN starts_with(lower(tbl), '__reg_') OR starts_with(lower(model), '__reg_')
+              THEN error('multinom_summary: table names beginning with "__reg_" are reserved for internal use; please rename')
+              WHEN EXISTS (SELECT 1 FROM __reg_cols WHERE starts_with(lower(colname), '__reg_'))
+              THEN error('multinom_summary: column names beginning with "__reg_" are reserved for internal use; please rename')
+              ELSE true END AS ok
+),
+__reg_mdl AS (SELECT class, feature, coefficient FROM query_table(model)
+              CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok),
+__reg_refc AS (SELECT min(class) AS ref FROM __reg_mdl),
+__reg_featnames AS (
   SELECT [ '(Intercept)' ] || list(DISTINCT feature ORDER BY feature) FILTER (WHERE feature != '(Intercept)') AS fn
-  FROM mdl
+  FROM __reg_mdl
 ),
 -- beta vector per class ([intercept, features sorted]); non-reference classes ordered
-bpc AS (
+__reg_bpc AS (
   SELECT class,
          [ coalesce(max(coefficient) FILTER (WHERE feature = '(Intercept)'), 0.0) ]::DOUBLE[]
          || list(coefficient ORDER BY feature) FILTER (WHERE feature != '(Intercept)') AS bvec
-  FROM mdl GROUP BY class
+  FROM __reg_mdl GROUP BY class
 ),
-Bmat AS (
+__reg_bmat AS (
   SELECT list(bvec ORDER BY class) AS B, list(class ORDER BY class) AS cls
-  FROM bpc WHERE class != (SELECT ref FROM refc)
+  FROM __reg_bpc WHERE class != (SELECT ref FROM __reg_refc)
 ),
-num AS (SELECT row_number() OVER () AS rid, * FROM query_table(tbl)),
-alllong AS (
-  SELECT rid, name AS col, value AS v
-  FROM (UNPIVOT (SELECT rid, TRY_CAST(COLUMNS(* EXCLUDE (rid)) AS DOUBLE) FROM num)
-        ON COLUMNS(* EXCLUDE (rid)) INTO NAME name VALUE value)
+__reg_num AS (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+__reg_yv AS (
+  SELECT __reg_rid__
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(* EXCLUDE (__reg_rid__)) AS VARCHAR) FROM __reg_num)
+        ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
+  WHERE name = outcome
 ),
-kfeat AS (SELECT count(DISTINCT feature) FILTER (WHERE feature != '(Intercept)') AS k FROM mdl),
-mdlj AS (
+__reg_alllong AS (
+  SELECT __reg_rid__, name AS col, value AS v
+  FROM (UNPIVOT (SELECT __reg_rid__, TRY_CAST(COLUMNS(* EXCLUDE (__reg_rid__)) AS DOUBLE) FROM __reg_num)
+        ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
+),
+__reg_kfeat AS (SELECT count(DISTINCT feature) FILTER (WHERE feature != '(Intercept)') AS k FROM __reg_mdl),
+__reg_mdlj AS (
   SELECT feature, row_number() OVER (ORDER BY feature) AS j
-  FROM (SELECT DISTINCT feature FROM mdl WHERE feature != '(Intercept)')
+  FROM (SELECT DISTINCT feature FROM __reg_mdl WHERE feature != '(Intercept)')
 ),
-feat AS (
-  SELECT l.rid, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
-  FROM alllong l JOIN mdlj m ON m.feature = l.col
-  GROUP BY l.rid
+__reg_feat AS (
+  SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
+  FROM __reg_alllong l JOIN __reg_mdlj m ON m.feature = l.col
+  GROUP BY l.__reg_rid__
 ),
 -- per-row softmax probabilities for the non-reference classes
-probs AS (
-  SELECT rid, xs, list_transform(ee, lambda e: e/(1.0 + list_sum(ee))) AS p
+__reg_probs AS (
+  SELECT __reg_rid__, xs, list_transform(ee, lambda e: e/(1.0 + list_sum(ee))) AS p
   FROM (
-    SELECT f.rid, f.xs,
-           list_transform((SELECT B FROM Bmat), lambda bc: exp(least(list_dot_product(f.xs, bc), 700.0))) AS ee
-    FROM feat f, kfeat WHERE f.nf = kfeat.k
+    SELECT f.__reg_rid__, f.xs,
+           list_transform((SELECT B FROM __reg_bmat), lambda bc: exp(least(list_dot_product(f.xs, bc), 700.0))) AS ee
+    FROM __reg_feat f JOIN __reg_yv y ON y.__reg_rid__ = f.__reg_rid__
+    CROSS JOIN __reg_kfeat WHERE f.nf = __reg_kfeat.k
   )
 ),
-dims AS (
-  SELECT (SELECT len(B) FROM Bmat) AS km1,
-         (SELECT k FROM kfeat) + 1 AS d,
-         ((SELECT len(B) FROM Bmat)) * ((SELECT k FROM kfeat) + 1) AS M
+__reg_dims AS (
+  SELECT (SELECT len(B) FROM __reg_bmat) AS km1,
+         (SELECT k FROM __reg_kfeat) + 1 AS d,
+         ((SELECT len(B) FROM __reg_bmat)) * ((SELECT k FROM __reg_kfeat) + 1) AS M
 ),
 -- block-structured information matrix via flat index pairs
-idx AS (SELECT unnest(range(1, (SELECT M FROM dims)+1)) AS i),
-pairs AS (
+__reg_idx AS (SELECT unnest(range(1, (SELECT M FROM __reg_dims)+1)) AS i),
+__reg_pairs AS (
   SELECT a.i AS a, b.i AS b,
-         (a.i-1)//(SELECT d FROM dims) AS ca, (a.i-1)%(SELECT d FROM dims) AS ja,
-         (b.i-1)//(SELECT d FROM dims) AS cb, (b.i-1)%(SELECT d FROM dims) AS kb
-  FROM idx a, idx b
+         (a.i-1)//(SELECT d FROM __reg_dims) AS ca, (a.i-1)%(SELECT d FROM __reg_dims) AS ja,
+         (b.i-1)//(SELECT d FROM __reg_dims) AS cb, (b.i-1)%(SELECT d FROM __reg_dims) AS kb
+  FROM __reg_idx a, __reg_idx b
 ),
-info AS (
+__reg_info AS (
   SELECT list(rowlist ORDER BY a) AS A FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
       SELECT p.a AS a, p.b AS b,
-             sum(pr.p[p.ca+1] * ((CASE WHEN p.ca = p.cb THEN 1.0 ELSE 0.0 END) - pr.p[p.cb+1])
-                 * pr.xs[p.ja+1] * pr.xs[p.kb+1]) AS val
-      FROM probs pr, pairs p GROUP BY p.a, p.b
+             sum(__reg_pr.p[p.ca+1] * ((CASE WHEN p.ca = p.cb THEN 1.0 ELSE 0.0 END) - __reg_pr.p[p.cb+1])
+                 * __reg_pr.xs[p.ja+1] * __reg_pr.xs[p.kb+1]) AS val
+      FROM __reg_probs __reg_pr, __reg_pairs p GROUP BY p.a, p.b
     ) GROUP BY a
   )
 ),
 -- diagonal scaling -> unit-diagonal correlation form
-scal AS (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc FROM info),
-rscaled AS (SELECT dsc, list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dsc[i]*dsc[j]))) AS R FROM scal),
-gj(k, d, sing, M) AS (
+__reg_scal AS (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 1e-300 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc FROM __reg_info),
+__reg_rscaled AS (SELECT dsc, list_transform(A, lambda row, i: list_transform(row, lambda v, j: v/(dsc[i]*dsc[j]))) AS R FROM __reg_scal),
+__reg_gj(k, d, sing, M) AS (
   SELECT 0, len(R), false,
          list_transform(R, lambda row, i:
              list_concat(list_transform(row, lambda v, j: v::DOUBLE),
                          list_transform(row, lambda v, j: CASE WHEN j = i THEN 1.0 ELSE 0.0 END)))
-  FROM rscaled
+  FROM __reg_rscaled
   UNION ALL
   SELECT col, d, sing OR abs(piv) < 1e-12,
          CASE WHEN abs(piv) < 1e-12 THEN Mswap
@@ -2582,31 +2823,31 @@ gj(k, d, sing, M) AS (
         FROM (
           SELECT k, k+1 AS col, d, sing, M,
                  list_transform(M, lambda row, i: CASE WHEN i >= k+1 THEN abs(row[k+1]) ELSE -1e308 END) AS pcol
-          FROM gj WHERE k < d
+          FROM __reg_gj WHERE k < d
         )
       )
     )
   )
 ),
-covinv AS (
+__reg_covinv AS (
   SELECT CASE WHEN sing THEN NULL ELSE list_transform(M, lambda row, i: list_slice(row, d+1, 2*d)) END AS Rinv
-  FROM gj WHERE k = d
+  FROM __reg_gj WHERE k = d
 ),
-final AS (
+__reg_final AS (
   SELECT bm.B AS B, bm.cls AS cls, fn.fn AS fn, c.Rinv AS Rinv, s.dsc AS dsc,
          dm.d AS d, norm_ppf(1.0-(1.0-conf_level)/2.0) AS crit
-  FROM Bmat bm CROSS JOIN featnames fn CROSS JOIN covinv c CROSS JOIN scal s CROSS JOIN dims dm
+  FROM __reg_bmat bm CROSS JOIN __reg_featnames fn CROSS JOIN __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_dims dm
 ),
-percoef AS (
+__reg_percoef AS (
   SELECT gs.a AS a, cls[(gs.a-1)//d + 1] AS class, fn[(gs.a-1)%d + 1] AS feature,
          B[(gs.a-1)//d + 1][(gs.a-1)%d + 1] AS coefficient, crit,
          CASE WHEN Rinv IS NOT NULL AND isfinite(Rinv[gs.a][gs.a]) AND Rinv[gs.a][gs.a] > 0.0
               THEN sqrt(Rinv[gs.a][gs.a]) / dsc[gs.a] ELSE NULL END AS std_error
-  FROM final, unnest(range(1, len(B)*d + 1)) AS gs(a)
+  FROM __reg_final, unnest(range(1, len(B)*d + 1)) AS gs(a)
 )
 SELECT class, feature, coefficient, std_error,
        coefficient / std_error AS statistic,
        CASE WHEN std_error IS NULL THEN NULL ELSE 2.0 * norm_cdf(-abs(coefficient / std_error)) END AS p_value,
        coefficient - crit * std_error AS conf_low,
        coefficient + crit * std_error AS conf_high
-FROM percoef ORDER BY class, a;
+FROM __reg_percoef ORDER BY class, a;

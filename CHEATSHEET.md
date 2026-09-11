@@ -121,6 +121,9 @@ cv_alpha(tbl, outcome, alpha_grid, k := 5)       -- nbinom
 ```
 Two-stage refine (coarse → fine around the best): `cv_l2_refine` / `cv_l1_refine`
 / `cv_power_refine` / `cv_alpha_refine(..., n_refine := 10)`.
+Power/alpha sweeps compare mean predictions at a fixed scoring power **1.5** /
+alpha **1.0** across the grid; they do not estimate distribution parameters by
+likelihood. Use the dispersion macros below to estimate NB dispersion.
 
 ## Dispersion (negative binomial)
 

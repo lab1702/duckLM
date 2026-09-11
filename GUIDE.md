@@ -257,6 +257,11 @@ and `bic` use *k* = number of model coefficients (intercept included). Gamma's
 log-likelihood/AIC depend on the dispersion parameter, so it reports deviance,
 deviance-based pseudo-R², and the Pearson `dispersion` instead.
 
+A single-class logistic holdout still returns its accuracy and log loss;
+`auc` and `pseudo_r2` are undefined and returned as `NULL`. An exact linear
+fit has zero error and an unbounded Gaussian likelihood as residual variance
+approaches zero: `loglik` is `+Infinity`, and `aic`/`bic` are `-Infinity`.
+
 ## Inference
 
 `{logit,linreg,poisson,gamma,tweedie,nbinom,multinom}_summary` return a
@@ -307,6 +312,11 @@ SELECT * FROM poisson_summary('model', 'claims', 'n', cluster_col := 'region');
 divide the squared residual by `(1−hᵢ)` / `(1−hᵢ)²` using the GLM leverage
 `hᵢ` (`hc3` is the recommended default for small samples). Cluster-robust uses
 the Stata finite-sample factor `(G/(G−1))·((n−1)/(n−d))`.
+Cluster identifiers may be numeric or text; their exact values define group
+membership. A requested cluster column must exist and be non-NULL on every
+row used for inference. Analytic weights enter the observation score before
+its outer product, so multiplying all weights by a constant leaves HC0–HC3
+standard errors unchanged.
 
 The **reference distribution** follows R's `glm`/`lm` convention: the `statistic`
 is a **z**-score with a normal p-value/CI when the dispersion is fixed
@@ -401,6 +411,16 @@ available for multinomial. Coefficient standard errors are available via
 a grid, returning one row per grid value with the mean held-out deviance
 (squared error for linear). Pick the smallest `cv_deviance`.
 
+Each sweep scores all candidate mean predictions with a **fixed loss**:
+`cv_power` uses Tweedie deviance at scoring power **1.5**, and `cv_alpha`
+uses negative-binomial deviance at scoring alpha **1.0**, regardless of the
+candidate used to fit a model. Changing the scoring distribution along with
+the candidate would compare incompatible deviance scales. These sweeps tune
+**mean prediction**, and do not estimate the distribution's power or dispersion
+by likelihood. Use `nbinom_dispersion` / `nbinom_dispersion_refine` for
+negative-binomial dispersion estimation. The same scoring convention applies
+to the refinement wrappers.
+
 All `k × |grid|` models are fit **together in a single pass over the data**, and
 — as with `*_fit` — by IRLS, so a sweep costs a handful of iterations rather than
 the thousands gradient descent needs. That includes `cv_l1`: the penalised models
@@ -485,17 +505,19 @@ con.sql("SELECT * FROM linreg_fit('encoded', 'revenue')")
 
 ```sql
 -- e.g. dummy_encode_sql('sales', 'revenue') returns:
-SELECT * EXCLUDE (region),
-       (region = 'North')::INT AS "region_North",
-       (region = 'South')::INT AS "region_South",
-       (region = 'West')::INT  AS "region_West"     -- 'East' is the reference
-FROM sales
+SELECT * EXCLUDE ("region"),
+       ("region" = 'North')::INT AS "region_North",
+       ("region" = 'South')::INT AS "region_South",
+       ("region" = 'West')::INT  AS "region_West"     -- 'East' is the reference
+FROM query_table('sales')
 ```
 
 Interactions and transforms are still plain columns you add yourself
 (`ln(x) AS log_x`, `a * b AS a_x_b`, …). A NULL category yields NULL dummies, so
-that row is dropped by the fit (as R drops `NA`). `tbl` must be a table/view
-(resolvable in `duckdb_columns`).
+that row is dropped by the fit (as R drops `NA`). When a factor has fewer than
+two observed levels, the generated SQL filters its NULL rows explicitly because
+no dummy column remains to mark them. `tbl` must be a table/view resolvable by
+DuckDB; qualified and quoted names are supported.
 
 ## Contract & fine print
 

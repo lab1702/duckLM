@@ -1115,13 +1115,13 @@ class TestDummyEncode:
         sql = con.execute("SELECT dummy_encode_sql('rawdata', 'y')").fetchone()[0]
         # 3 levels -> 2 dummies; reference 'a' (min) omitted
         assert '"g_b"' in sql and '"g_c"' in sql and '"g_a"' not in sql
-        assert "EXCLUDE (g)" in sql
+        assert 'EXCLUDE ("g")' in sql
 
     def test_no_categoricals_passthrough(self, con):
         df = pd.DataFrame({"y": [1.0, 2, 3], "x": [0.1, 0.2, 0.3], "flag": [True, False, True]})
         _load(con, "rawdata", df)
         sql = con.execute("SELECT dummy_encode_sql('rawdata', 'y')").fetchone()[0]
-        assert sql.strip() == "SELECT * FROM rawdata"  # boolean/numeric untouched
+        assert sql.strip() == "SELECT * FROM query_table('rawdata')"  # boolean/numeric untouched
 
     def test_null_category_yields_null_dummy(self, con):
         df = pd.DataFrame({"y": [1.0, 2, 3, 4], "g": ["a", "b", None, "b"]})
@@ -1286,8 +1286,8 @@ class TestCrossValidation:
                 tr, te = fold != f, fold == f
                 m = TweedieRegressor(power=p, alpha=0, link="log", max_iter=100000, tol=1e-10).fit(Xs[tr], (y / yb)[tr])
                 mu = m.predict(Xs[te]) * yb; yt = y[te]
-                tot += (2 * (np.power(np.maximum(yt, 0), 2 - p) / ((1 - p) * (2 - p))
-                             - yt * np.power(mu, 1 - p) / (1 - p) + np.power(mu, 2 - p) / (2 - p))).sum()
+                # All candidate mean models must use the same scoring power.
+                tot += len(yt) * mean_tweedie_deviance(yt, mu, power=1.5)
             ref[p] = tot / n
         df = pd.DataFrame(X, columns=["x1", "x2"]).assign(y=y); _load(con, "cvtrain", df)
         got = {float(a): float(v) for a, v in con.execute(
@@ -1296,7 +1296,7 @@ class TestCrossValidation:
             assert got[p] == pytest.approx(ref[p], rel=1e-5), p
 
     def test_cv_alpha_runs_and_selects(self, con):
-        # NB dispersion CV: overdispersed data prefers a larger alpha than a tiny one
+        # NB mean prediction CV: compare fits using one common scoring alpha.
         rng = np.random.default_rng(552); n = 2000
         X = np.column_stack([rng.normal(0, 1, n), rng.normal(0, 1, n)])
         Xs = (X - X.mean(0)) / X.std(0)
@@ -1305,7 +1305,7 @@ class TestCrossValidation:
         rows = con.execute("SELECT alpha, cv_deviance FROM cv_alpha('cvtrain','y', [0.05,0.3,0.6,1.5]::DOUBLE[]) ORDER BY alpha").fetchall()
         got = {float(a): float(v) for a, v in rows}
         assert len(got) == 4 and all(np.isfinite(v) for v in got.values())
-        # the tiny-alpha (near-Poisson) deviance should be worse than a moderate one
+        # A moderate fitting alpha improves held-out mean prediction here.
         assert min(got, key=got.get) >= 0.3
 
     def test_cv_selects_lower_l2_on_clean_signal(self, con):
@@ -1653,10 +1653,10 @@ class TestRobustSE:
             G = len(np.unique(cluster)); c = (G / (G - 1)) * ((n - 1) / (n - d))
         else:
             c = 1.0
-            if robust == "hc0": mw = a * r ** 2
-            elif robust == "hc1": mw = a * r ** 2; c = n / (n - d)
-            elif robust == "hc2": mw = a * r ** 2 / (1 - h)
-            else: mw = a * r ** 2 / (1 - h) ** 2  # hc3
+            if robust == "hc0": mw = (a * r) ** 2
+            elif robust == "hc1": mw = (a * r) ** 2; c = n / (n - d)
+            elif robust == "hc2": mw = (a * r) ** 2 / (1 - h)
+            else: mw = (a * r) ** 2 / (1 - h) ** 2  # hc3
             B = X.T @ (mw[:, None] * X)
         return np.sqrt(np.diag(A @ B @ A) * c)
 
@@ -1718,7 +1718,7 @@ class TestRobustSE:
         se = self._ref(X, y, b, "poisson", cluster=grp)
         assert s["std_error"].values == pytest.approx(se, rel=1e-6, abs=1e-9)
 
-    def test_weighted_robust_uses_first_power(self, con):
+    def test_weighted_robust_uses_squared_analytic_score(self, con):
         rng = np.random.default_rng(71); n = 1500
         x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
         wt = rng.uniform(0.5, 2.0, n)
