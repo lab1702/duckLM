@@ -18,6 +18,27 @@ def con():
         yield c
 
 
+@pytest.mark.parametrize('macro', ['cv_l2', 'cv_l1', 'cv_l2_refine', 'cv_l1_refine'])
+def test_linear_cv_keeps_finite_large_scores_and_candidate_ranking(con, macro):
+    con.execute('CREATE TABLE base AS SELECT (i%7)::DOUBLE x,(1+2*(i%7)+3*(i%3))::DOUBLE y FROM range(30)t(i)')
+    con.execute('CREATE TABLE scaled AS SELECT x,y*1e153 y FROM base')
+    extra = ',n_refine:=4' if macro.endswith('_refine') else ''
+    results = [np.asarray(con.execute(f"SELECT * FROM {macro}('{table}','y','linear',[0.,1.,10.],k:=3{extra})").fetchall(), dtype=float)
+               for table in ['base', 'scaled']]
+    results[1][:, 1] /= 1e306
+    assert np.isfinite(results[1]).all()
+    np.testing.assert_allclose(results[1], results[0], rtol=1e-9, atol=1e-10)
+
+
+def test_linear_cv_scales_before_squaring_individual_residuals(con):
+    con.execute('CREATE TABLE base AS SELECT (i%7)::DOUBLE x,CASE WHEN i=0 THEN 1.0 ELSE 0.0 END y FROM range(300)t(i)')
+    con.execute('CREATE TABLE scaled AS SELECT x,y*1e155 y FROM base')
+    baseline = con.execute("SELECT cv_deviance FROM cv_l2('base','y','linear',[0.],k:=3)").fetchone()[0]
+    actual = con.execute("SELECT cv_deviance FROM cv_l2('scaled','y','linear',[0.],k:=3)").fetchone()[0]
+    assert np.isfinite(actual)
+    assert actual/1e155/1e155 == pytest.approx(baseline, rel=1e-10)
+
+
 def test_cv_power_equal_predictions_have_equal_scores_including_endpoints(con):
     rows = con.execute(
         "SELECT * FROM cv_power('balanced','y',[1.0,1.3,1.5,1.7,2.0])"

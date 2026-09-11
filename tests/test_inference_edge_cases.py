@@ -759,3 +759,60 @@ def test_log_link_inference_preserves_finite_means_beyond_old_clipping_range(con
     for observed in [errors, intervals, diagnostics]:
         assert np.isfinite(observed).all()
         np.testing.assert_allclose(observed[1], observed[0], rtol=1e-9, atol=1e-11)
+
+
+@pytest.mark.parametrize('scale', [1e-305, 1e-170, 1e170, 1e305])
+@pytest.mark.parametrize('robust', ['none', 'hc0', 'hc1', 'hc2', 'hc3', 'cluster'])
+def test_linear_inference_preserves_extreme_response_units(con, scale, robust):
+    model(con)
+    model(con, name='scaled_model')
+    con.execute('UPDATE scaled_model SET coefficient=coefficient*?', [scale])
+    data = training().assign(w=np.linspace(.25, 1, 48), expo=.1, grp=np.arange(48)%4)
+    data.loc[47, 'w'] = 0
+    load(con, 'base_response', data)
+    load(con, 'scaled_response', data.assign(y=data.y*scale, expo=data.expo*scale))
+    extra = "cluster_col:='grp'" if robust == 'cluster' else f"robust:='{robust}'"
+    summaries, intervals, diagnostics = [], [], []
+    for mdl, table, factor in [('edge_model', 'base_response', 1), ('scaled_model', 'scaled_response', scale)]:
+        args = f"'{mdl}','{table}','y',weights_col:='w',offset_col:='expo'"
+        summary = con.execute(f'SELECT * FROM linreg_summary({args},{extra})').df()
+        summary[['coefficient', 'std_error', 'conf_low', 'conf_high']] /= factor
+        summaries.append(summary.drop(columns='feature').to_numpy())
+        intervals.append(con.execute(f'SELECT prediction,conf_low,conf_high FROM linreg_predict_ci({args})').df().to_numpy()/factor)
+        diag = con.execute(f'SELECT hat,pearson_resid,deviance_resid,std_resid,cooks_distance FROM linreg_influence({args})').df()
+        diag[['pearson_resid', 'deviance_resid']] /= factor
+        diagnostics.append(diag.to_numpy())
+    for results in [summaries, intervals, diagnostics]:
+        assert np.isfinite(results).all()
+        np.testing.assert_allclose(results[1], results[0], rtol=1e-9, atol=1e-11)
+
+
+@pytest.mark.parametrize('scale', [1e160, 1e300])
+@pytest.mark.parametrize('alpha', [.1, 1., 5.])
+def test_negative_binomial_large_mean_diagnostics_match_finite_ratio_reference(con, scale, alpha):
+    from scipy.stats import norm
+    con.execute('CREATE TABLE large_nb AS SELECT (i%5)::DOUBLE x,?*(1+i%3) y FROM range(30)t(i)', [scale])
+    con.execute(f"CREATE TABLE nb_model AS SELECT * FROM nbinom_fit('large_nb','y',alpha:={alpha})")
+    design = np.column_stack([np.ones(30), np.arange(30)%5])
+    ratio = (1+np.arange(30)%3)/2
+    # At these means, 1/mu is negligible relative to alpha in double precision.
+    hweights = ratio/alpha
+    scores = (ratio-1)/alpha
+    bread_inv = np.linalg.inv(design.T @ (hweights[:, None]*design))
+    meat = design.T @ ((scores**2)[:, None]*design)
+    expected_se = np.sqrt(np.diag(bread_inv @ meat @ bread_inv))
+    hat = hweights*np.einsum('ij,jk,ik->i', design, bread_inv, design)
+    pearson = (ratio-1)/np.sqrt(alpha)
+    deviance = np.sign(ratio-1)*np.sqrt(2*(ratio-1-np.log(ratio))/alpha)
+    expected_diag = np.column_stack([hat, pearson, deviance, pearson/np.sqrt(1-hat), pearson**2*hat/(2*(1-hat)**2)])
+    args = f"'nb_model','large_nb','y',alpha:={alpha}"
+    actual_se = con.execute(f"SELECT std_error FROM nbinom_summary({args},robust:='hc0')").df()['std_error'].to_numpy()
+    np.testing.assert_allclose(actual_se, expected_se, rtol=1e-10)
+    actual_diag = con.execute(f'SELECT hat,pearson_resid,deviance_resid,std_resid,cooks_distance FROM nbinom_influence({args})').df().to_numpy()
+    np.testing.assert_allclose(actual_diag, expected_diag, rtol=1e-9, atol=1e-11)
+    dispersion = con.execute(f'SELECT dispersion FROM nbinom_evaluate({args})').fetchone()[0]
+    assert dispersion == pytest.approx(np.sum(pearson**2)/28, rel=1e-10)
+    variance = alpha*np.einsum('ij,jk,ik->i', design, np.linalg.inv(design.T@design), design)
+    expected_ci = 2*np.exp(np.column_stack([-np.sqrt(variance), np.sqrt(variance)])*norm.ppf(.975))
+    actual_ci = con.execute(f'SELECT conf_low,conf_high FROM nbinom_predict_ci({args})').df().to_numpy()/scale
+    np.testing.assert_allclose(actual_ci, expected_ci, rtol=1e-10)
