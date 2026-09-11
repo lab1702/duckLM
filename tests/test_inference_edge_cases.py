@@ -503,3 +503,58 @@ def test_student_t_quantiles_reach_large_finite_values(con,df,probability):
     actual=con.execute('SELECT t_ppf(?,?)',[probability,df]).fetchone()[0]
     assert actual==pytest.approx(expected,rel=1e-11)
     assert con.execute('SELECT t_cdf(?,?)',[actual,df]).fetchone()[0]==pytest.approx(probability,rel=1e-12)
+
+
+@pytest.mark.parametrize('df', [.1,1.,30.,1000.,1e8,1e12,1e15])
+@pytest.mark.parametrize('difference', [-1e-6,-1e-9,1e-9,1e-6])
+def test_student_t_quantiles_preserve_probabilities_near_median(con,df,difference):
+    from scipy.stats import t
+    probability=.5+difference
+    actual=con.execute('SELECT t_ppf(?,?)',[probability,df]).fetchone()[0]
+    assert actual==pytest.approx(t.ppf(probability,df),rel=1e-7,abs=5e-16)
+    assert con.execute('SELECT t_cdf(?,?)',[actual,df]).fetchone()[0]==pytest.approx(probability,abs=2e-16)
+
+
+@pytest.mark.parametrize('df', [30.,1000.,1e8,1e12,1e15])
+@pytest.mark.parametrize('value', [-8.,-2.,-1e-8,1e-8,1.,2.,8.])
+def test_student_t_cdf_matches_central_and_large_df_reference(con,df,value):
+    from scipy.stats import t
+    actual=con.execute('SELECT t_cdf(?,?)',[value,df]).fetchone()[0]
+    assert actual==pytest.approx(t.cdf(value,df),rel=1e-12,abs=1e-16)
+
+
+@pytest.mark.parametrize('df', [1e8,1e12,1e15])
+@pytest.mark.parametrize('probability', [1e-100,1e-300])
+def test_large_df_student_t_quantiles_preserve_extreme_tails(con,df,probability):
+    from scipy.stats import t
+    actual=con.execute('SELECT t_ppf(?,?)',[probability,df]).fetchone()[0]
+    assert actual==pytest.approx(t.ppf(probability,df),rel=1e-12)
+    assert con.execute('SELECT t_cdf(?,?)',[actual,df]).fetchone()[0]==pytest.approx(probability,rel=1e-11,abs=5e-324)
+
+
+@pytest.mark.parametrize('extreme_x', [-1e9,1e9])
+def test_multinomial_information_matches_binary_logistic_at_saturation(con,extreme_x):
+    con.execute(f"CREATE TABLE binary_data AS SELECT * FROM (VALUES (-1.,'0'),(1.,'1'),(0.,'1'),({extreme_x},'1'))t(x,y)")
+    con.execute("CREATE TABLE binary_model AS SELECT * FROM (VALUES ('(Intercept)',0.),('x',4e-8))t(feature,coefficient)")
+    con.execute("CREATE TABLE multi_model AS SELECT label AS class,feature,CASE WHEN label='0' THEN 0. ELSE coefficient END AS coefficient FROM binary_model,(VALUES ('0'),('1'))t(label)")
+    binary=con.execute("SELECT std_error FROM logit_summary('binary_model','binary_data','y') ORDER BY (feature='(Intercept)') DESC").fetchnumpy()['std_error']
+    multi=con.execute("SELECT std_error FROM multinom_summary('multi_model','binary_data','y') ORDER BY (feature='(Intercept)') DESC").fetchnumpy()['std_error']
+    assert not np.ma.is_masked(multi)
+    np.testing.assert_allclose(multi,binary,rtol=1e-10)
+
+
+def test_multinomial_information_preserves_large_logit_differences(con):
+    from scipy.special import softmax
+    xs=np.array([-1.,0.,1.,1000.])
+    con.execute("CREATE TABLE multi_data AS SELECT * FROM (VALUES (-1.,'a'),(0.,'b'),(1.,'c'),(1000.,'b'))t(x,y)")
+    con.execute("CREATE TABLE multi_model AS SELECT * FROM (VALUES ('a','(Intercept)',0.),('a','x',0.),('b','(Intercept)',0.),('b','x',1.),('c','(Intercept)',0.),('c','x',.9))t(class,feature,coefficient)")
+    information=np.zeros((4,4))
+    for x in xs:
+        p=softmax([0.,x,.9*x])
+        covariance=-np.outer(p[1:],p[1:])
+        for j in range(2):
+            covariance[j,j]=p[j+1]*sum(p[k] for k in range(3) if k!=j+1)
+        information+=np.kron(covariance,np.outer([1.,x],[1.,x]))
+    actual=con.execute("SELECT std_error FROM multinom_summary('multi_model','multi_data','y') ORDER BY class,(feature='(Intercept)') DESC").fetchnumpy()['std_error']
+    assert not np.ma.is_masked(actual)
+    np.testing.assert_allclose(actual,np.sqrt(np.diag(np.linalg.inv(information))),rtol=1e-10)

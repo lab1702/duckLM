@@ -77,3 +77,15 @@ def test_dispersion_profile_preserves_extreme_feature_units(con,scale):
     for table in ['base','scaled']:
         profiles.append(con.execute(f"SELECT * FROM nbinom_dispersion('{table}','y',alpha_grid:=[.5,1.],max_iter:=300)").fetchall())
     np.testing.assert_allclose(np.array(profiles[1],dtype=float),np.array(profiles[0],dtype=float),rtol=1e-7,atol=1e-8)
+
+
+@pytest.mark.parametrize('scale', [1e-308,1e308])
+@pytest.mark.parametrize('family', ['linreg','logit','poisson','gamma','tweedie','nbinom'])
+def test_fits_preserve_a_common_finite_weight_scale(con,scale,family):
+    outcome='i%2' if family=='logit' else '1.0+i'
+    con.execute(f'CREATE TABLE base AS SELECT i::DOUBLE x,{outcome} y,(i+1)/4.0 wt FROM range(4)t(i)')
+    con.execute(f'CREATE TABLE scaled AS SELECT * REPLACE(wt*{scale} AS wt) FROM base')
+    models=[]
+    for table in ['base','scaled']:
+        models.append(dict(con.execute(f"SELECT * FROM {family}_fit('{table}','y',weights_col:='wt',l2:=.1,max_iter:=300)").fetchall()))
+    assert models[1]==pytest.approx(models[0],rel=1e-7,abs=1e-8)

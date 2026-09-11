@@ -315,11 +315,18 @@ __reg_ycheck AS (
     FROM __reg_clong
     WHERE col = outcome
 ),
--- Sample weight per complete row (1.0 when no weights column is given).
-__reg_w AS (
+-- Normalize the common weight scale before sums and weighted moments. The
+-- objective uses mean weights, so this preserves both fits and penalties.
+-- Keep invalid inputs unchanged for the weight validation below.
+__reg_wraw AS MATERIALIZED (
     SELECT c.rid, coalesce(wv.v, 1.0) AS w
     FROM __reg_complete c
     LEFT JOIN __reg_clong wv ON wv.rid = c.rid AND wv.col = coalesce(weights_col, '')
+),
+__reg_w AS MATERIALIZED (
+    SELECT rid, CASE WHEN w < 0 OR NOT isfinite(w) THEN w ELSE w/wscale END AS w
+    FROM __reg_wraw
+    CROSS JOIN (SELECT coalesce(max(w) FILTER (WHERE w > 0 AND isfinite(w)),1.0) AS wscale FROM __reg_wraw)
 ),
 -- Standardization uses positive-weight complete rows. Center the observations
 -- before squaring: E[x^2] - E[x]^2 loses the variance when a feature has a
@@ -950,25 +957,40 @@ CREATE OR REPLACE MACRO __reg_bd0_log(a, q) AS (
   CASE WHEN abs(q) < 1e-3 THEN a*q*q*(0.5+q*(1.0/6.0+q*(1.0/24.0+q*(1.0/120.0+q/720.0))))
        ELSE exp(ln(a)+q)-a-a*q END
 );
+-- (exp(q)-1-q)/alpha without forming an overflowing reciprocal or losing
+-- q^2 before division when the positive dispersion is subnormal.
+CREATE OR REPLACE MACRO __reg_bd0_inv_alpha(alpha, q) AS (
+  CASE WHEN abs(q) < 0.1 THEN
+    list_transform([0.5+q*(1.0/6.0+q*(1.0/24.0+q*(1.0/120.0+q*(1.0/720.0
+      +q*(1.0/5040.0+q*(1.0/40320.0+q*(1.0/362880.0+q/3628800.0)))))))], lambda poly:
+      CASE WHEN abs(q) < 1e-150 THEN (q/alpha)*(q*poly)
+           ELSE (q*(q*poly))/alpha END)[1]
+       WHEN q < 700.0 THEN (exp(q)-1.0-q)/alpha
+       ELSE exp(q-ln(alpha))-(1.0+q)/alpha END
+);
+CREATE OR REPLACE MACRO __reg_nb_zerodev(eta, alpha) AS (
+  CASE WHEN eta+ln(alpha) < -30.0 THEN exp(eta)
+       ELSE __reg_softplus(eta+ln(alpha))/alpha END
+);
 CREATE OR REPLACE MACRO __reg_nb_halfdev(y, eta, alpha) AS (
   list_transform([1.0/alpha], lambda r:
-    CASE WHEN y = 0 THEN r*__reg_softplus(eta-ln(r))
+    CASE WHEN y = 0 THEN __reg_nb_zerodev(eta,alpha)
          ELSE list_transform([struct_pack(t := ln(y)-eta,
-                   w := 1.0/(1.0+exp(ln(y)-ln(r))),
-                   h := least(y,r)/(1.0+exp(-abs(ln(y)-ln(r)))))], lambda z:
+                   w := 1.0/(1.0+exp(ln(y)+ln(alpha))),
+                   h := least(y,r)/(1.0+exp(-abs(ln(y)+ln(alpha)))))], lambda z:
            CASE WHEN abs(z.t) < 1e-3 THEN z.h*z.t*z.t*(0.5+z.t*((1.0-2.0*z.w)/6.0
                 +z.t*((1.0-6.0*z.w+6.0*z.w*z.w)/24.0
                 +z.t*(1.0-2.0*z.w)*(1.0-12.0*z.w+12.0*z.w*z.w)/120.0)))
-                ELSE __reg_bd0_log(y,__reg_softplus(ln(r)-ln(y))-__reg_softplus(ln(r)-eta))
-                    +__reg_bd0_log(r,__reg_softplus(ln(y)-ln(r))-__reg_softplus(eta-ln(r))) END
+                ELSE __reg_bd0_log(y,__reg_softplus(-ln(alpha)-ln(y))-__reg_softplus(-ln(alpha)-eta))
+                    +__reg_bd0_inv_alpha(alpha,__reg_softplus(ln(y)+ln(alpha))-__reg_softplus(eta+ln(alpha))) END
          )[1] END
   )[1]
 );
 CREATE OR REPLACE MACRO __reg_nb_ll(y, eta, alpha) AS (
   list_transform([1.0/alpha], lambda r:
-    CASE WHEN y = 0 THEN -r*__reg_softplus(eta-ln(r))
+    CASE WHEN y = 0 THEN -__reg_nb_zerodev(eta,alpha)
          ELSE __reg_stirlerr(y+r)-__reg_stirlerr(y)-__reg_stirlerr(r)
-              -0.5*(1.8378770664093453+ln(y)+__reg_softplus(ln(y)-ln(r)))
+              -0.5*(1.8378770664093453+ln(y)+__reg_softplus(ln(y)+ln(alpha)))
               -__reg_nb_halfdev(y,eta,alpha) END
     )[1]
 );
@@ -2334,26 +2356,49 @@ CREATE OR REPLACE MACRO __reg_betai(a, b, x) AS (
           / (CASE WHEN x < (a+1.0)/(a+b+2.0) THEN a ELSE b END)
   END
 );
--- P(T>t), cancellation-free tail. Likewise folded to a single __reg_betai
--- expansion for the bracketed t_ppf inversion.
+-- Central t density normalization without subtracting huge log-gammas.
+CREATE OR REPLACE MACRO __reg_t_logpdf0(df) AS (
+  CASE WHEN df >= 32.0 THEN (df/2.0)*__reg_log1p(1.0/df)-0.5-0.9189385332046727
+         +__reg_stirlerr((df+1.0)/2.0)-__reg_stirlerr(df/2.0)
+       ELSE lgamma((df+1.0)/2.0)-lgamma(1.0+df/2.0)
+         +0.5*ln(df)-1.2655121234846454 END
+);
+-- P(T>t), preserving both the small tail and the central difference from
+-- one half. Fold the central/tail branches into one continued fraction to
+-- limit macro expansion in t_ppf. Large df uses inverse Cornish-Fisher.
 CREATE OR REPLACE MACRO __reg_t_sf(t, df) AS (
   CASE WHEN df IS NULL OR t IS NULL THEN NULL
        WHEN isnan(df) OR isnan(t) OR df <= 0 THEN 'NaN'::DOUBLE
        WHEN df = 'Infinity'::DOUBLE THEN norm_cdf(-t)
        WHEN t = 0 THEN 0.5
        WHEN isinf(t) THEN CASE WHEN t > 0 THEN 0.0 ELSE 1.0 END
-       ELSE list_transform([-__reg_softplus(2.0*ln(abs(t))-ln(df))], lambda logx:
-         (CASE WHEN t >= 0.0 THEN 0.0 ELSE 1.0 END)
-         + (CASE WHEN t >= 0.0 THEN 0.5 ELSE -0.5 END)
-         * CASE WHEN logx < -30.0 THEN
+       WHEN df >= 1e8 THEN CASE WHEN abs(t) > 40.0 THEN norm_cdf(-t)
+         ELSE list_transform([1.0/df], lambda inv:
+           norm_cdf(-(t-(t*t*t+t)*inv/4.0
+             +(13.0*pow(t,5)+8.0*t*t*t+3.0*t)*inv*inv/96.0)))[1] END
+       ELSE list_transform([struct_pack(
+         logx := -__reg_softplus(2.0*ln(abs(t))-ln(df)),
+         logu := -__reg_softplus(ln(df)-2.0*ln(abs(t))))], lambda z:
+         CASE WHEN z.logx < -30.0 THEN
              -- I_x(a,1/2) = x^a/(a*B(a,1/2)) * (1+O(x)); keeping
              -- log(x) avoids losing representable heavy tails when x underflows.
-             CASE WHEN (df/2.0)*logx < -750.0 THEN 0.0
-                  ELSE exp((df/2.0)*logx+lgamma((df+1.0)/2.0)-lgamma(1.0+df/2.0)-0.5723649429247001) END
-           ELSE __reg_betai(df/2.0,0.5,exp(logx)) END
+             (CASE WHEN t > 0.0 THEN 0.0 ELSE 1.0 END) + sign(t)*0.5*
+             CASE WHEN (df/2.0)*z.logx < -750.0 THEN 0.0
+                  ELSE exp((df/2.0)*z.logx+lgamma((df+1.0)/2.0)-lgamma(1.0+df/2.0)-0.5723649429247001) END
+           ELSE list_transform([z.logu < ln(3.0)-ln(df+5.0)], lambda central:
+             (CASE WHEN central THEN 0.5 WHEN t > 0.0 THEN 0.0 ELSE 1.0 END)
+             +sign(t)*(CASE WHEN central THEN -1.0 ELSE 0.5 END)
+             *exp(__reg_t_logpdf0(df)+0.5*ln(df)+(df/2.0)*z.logx+0.5*z.logu)
+             *__reg_betacf(CASE WHEN central THEN 0.5 ELSE df/2.0 END,
+                           CASE WHEN central THEN df/2.0 ELSE 0.5 END,
+                           exp(CASE WHEN central THEN z.logu ELSE z.logx END))
+             /(CASE WHEN central THEN 1.0 ELSE df/2.0 END))[1] END
        )[1] END
 );
-CREATE OR REPLACE MACRO t_cdf(t, df) AS ( __reg_t_sf(-t::DOUBLE, df::DOUBLE) );
+CREATE OR REPLACE MACRO t_cdf(t, df) AS (
+  list_transform([struct_pack(value := t::DOUBLE, degrees := df::DOUBLE)],
+    lambda args: __reg_t_sf(-args.value,args.degrees))[1]
+);
 CREATE OR REPLACE MACRO __reg_t_pdf(t, df) AS (
   exp(lgamma((df+1.0)/2.0) - lgamma(df/2.0) - 0.5*ln(df * 3.141592653589793::DOUBLE))
   * pow(1.0 + t*t/df, -(df+1.0)/2.0)
@@ -2367,7 +2412,11 @@ CREATE OR REPLACE MACRO __reg_t_ppf(p, df) AS (
        WHEN p = 0 THEN '-Infinity'::DOUBLE
        WHEN p = 1 THEN 'Infinity'::DOUBLE
        WHEN p = 0.5 THEN 0.0
-       WHEN df = 1.0 THEN (CASE WHEN p < 0.5 THEN -1.0 ELSE 1.0 END) / tan(pi() * least(p,1.0-p))
+       WHEN df >= 1e8 THEN list_transform([norm_ppf(p)], lambda z:
+         z+(z*z*z+z)*(1.0/df)/4.0
+           +(5.0*pow(z,5)+16.0*z*z*z+3.0*z)*(1.0/df)*(1.0/df)/96.0)[1]
+       WHEN df = 1.0 THEN CASE WHEN abs(p-0.5) < 0.25 THEN tan(pi()*(p-0.5))
+         ELSE (CASE WHEN p < 0.5 THEN -1.0 ELSE 1.0 END) / tan(pi() * least(p,1.0-p)) END
        ELSE list_transform([least(p, 1.0-p)::DOUBLE], lambda q:
               list_transform([df::DOUBLE], lambda dd:
                 list_transform([
@@ -3123,14 +3172,18 @@ __reg_feat AS (
   SELECT __reg_rid__, [1.0::DOUBLE], 0::INT FROM __reg_num
   WHERE NOT EXISTS (SELECT 1 FROM __reg_mdlj)
 ),
--- per-row softmax probabilities for the non-reference classes
+-- Shift logits before exponentiating and retain the reference probability
+-- last, so diagonal information can sum the other classes without 1-p.
 __reg_probs AS (
-  SELECT __reg_rid__, xs, list_transform(ee, lambda e: e/(1.0 + list_sum(ee))) AS p
+  SELECT __reg_rid__, xs, list_transform(ee, lambda e: e/list_sum(ee)) AS p
   FROM (
-    SELECT f.__reg_rid__, f.xs,
-           list_transform((SELECT B FROM __reg_bmat), lambda bc: exp(least(list_dot_product(f.xs, bc), 700.0))) AS ee
-    FROM __reg_feat f JOIN __reg_yv y ON y.__reg_rid__ = f.__reg_rid__
-    CROSS JOIN __reg_kfeat WHERE f.nf = __reg_kfeat.k
+    SELECT __reg_rid__, xs, list_transform(eta, lambda v: exp(v-list_max(eta))) AS ee
+    FROM (
+      SELECT f.__reg_rid__, f.xs,
+             list_transform((SELECT B FROM __reg_bmat), lambda bc: list_dot_product(f.xs, bc)) || [0.0::DOUBLE] AS eta
+      FROM __reg_feat f JOIN __reg_yv y ON y.__reg_rid__ = f.__reg_rid__
+      CROSS JOIN __reg_kfeat WHERE f.nf = __reg_kfeat.k
+    )
   )
 ),
 __reg_dims AS (
@@ -3150,7 +3203,9 @@ __reg_info AS (
   SELECT list(rowlist ORDER BY a) AS A FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
       SELECT p.a AS a, p.b AS b,
-             sum(__reg_pr.p[p.ca+1] * ((CASE WHEN p.ca = p.cb THEN 1.0 ELSE 0.0 END) - __reg_pr.p[p.cb+1])
+             sum(__reg_pr.p[p.ca+1] * (CASE WHEN p.ca = p.cb
+                   THEN list_sum(list_transform(__reg_pr.p, lambda pv, i: CASE WHEN i != p.ca+1 THEN pv ELSE 0.0 END))
+                   ELSE -__reg_pr.p[p.cb+1] END)
                  * __reg_pr.xs[p.ja+1] * __reg_pr.xs[p.kb+1]) AS val
       FROM __reg_probs __reg_pr, __reg_pairs p GROUP BY p.a, p.b
     ) GROUP BY a

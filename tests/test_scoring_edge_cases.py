@@ -513,3 +513,15 @@ def test_multinomial_scoring_rejects_reserved_tables(con,call,reserved_table):
     outcome=",'y'" if call=='evaluate' else ''
     with pytest.raises(duckdb.Error,match='table names beginning with.*__reg_.*reserved'):
         con.execute(f"SELECT * FROM multinom_{call}('{model}','{table}'{outcome})").fetchall()
+
+
+@pytest.mark.parametrize('alpha', [1e-310,5e-324])
+@pytest.mark.parametrize('eta', [-800.,0.,2.])
+def test_subnormal_nb_dispersion_preserves_poisson_scoring_limit(con,alpha,eta):
+    con.execute("CREATE TABLE model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient",[eta])
+    con.execute('CREATE TABLE observations AS SELECT i::DOUBLE y FROM range(5)t(i)')
+    expected=_metrics(con,"poisson_evaluate('model','observations','y')")
+    actual=_metrics(con,f"nbinom_evaluate('model','observations','y',alpha:={alpha})")
+    for name in ['loglik','deviance','null_deviance','aic','bic']:
+        assert np.isfinite(actual[name])
+        assert actual[name]==pytest.approx(expected[name],rel=1e-12,abs=1e-11)
