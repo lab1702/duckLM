@@ -2571,15 +2571,10 @@ __reg_feat AS (
   SELECT __reg_rid__, [1.0::DOUBLE], 0::INT FROM __reg_num
   WHERE NOT EXISTS (SELECT 1 FROM __reg_mdlj)
 ),
-__reg_rows0 AS (
+__reg_rowsraw AS (
   SELECT f.__reg_rid__, f.xs, y.y,
          CASE WHEN offset_col IS NULL THEN 0.0 ELSE o.o END AS off,
-         -- A common weight scale cancels in sandwich covariance and in
-         -- model-based covariance when dispersion is estimated.
-         CASE WHEN weights_col IS NULL THEN 1.0
-              WHEN robust != 'none' OR cluster_col IS NOT NULL OR family IN ('linear','gamma','tweedie')
-                THEN w.wt / nullif(max(w.wt) OVER (),0.0)
-              ELSE w.wt END AS wt
+         CASE WHEN weights_col IS NULL THEN 1.0 ELSE w.wt END AS wt
   FROM __reg_feat f
   JOIN __reg_yv y ON y.__reg_rid__ = f.__reg_rid__
   LEFT JOIN __reg_ov o ON o.__reg_rid__ = f.__reg_rid__
@@ -2589,8 +2584,27 @@ __reg_rows0 AS (
     AND (offset_col IS NULL OR o.o IS NOT NULL)
     AND (weights_col IS NULL OR w.wt IS NOT NULL)
 ),
+__reg_weightcheck AS (
+  SELECT CASE WHEN EXISTS (SELECT 1 FROM __reg_rowsraw WHERE NOT isfinite(wt))
+              THEN error(caller || ': weights must be finite')
+              WHEN EXISTS (SELECT 1 FROM __reg_rowsraw WHERE wt < 0)
+              THEN error(caller || ': weights must be non-negative')
+              ELSE true END AS ok
+),
+__reg_rows0 AS (
+  SELECT r.* REPLACE (CASE WHEN robust != 'none' OR cluster_col IS NOT NULL OR family IN ('linear','gamma','tweedie') THEN wt/nullif(max(wt) OVER (),0.0) ELSE wt END AS wt)
+  FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc WHERE wc.ok
+),
+-- Normalize feature units before any cross-products. The original vectors
+-- still form eta; covariance uses these units and is transformed back below.
+__reg_xunits AS (
+  SELECT list(unit ORDER BY i) AS units
+  FROM (SELECT ix.i, coalesce(nullif(max(abs(r.xs[ix.i])) FILTER (WHERE r.wt > 0),0.0),1.0) AS unit
+        FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
+        LEFT JOIN __reg_rows0 r ON true GROUP BY ix.i)
+),
 __reg_rww AS (
-  SELECT r.__reg_rid__, r.xs, r.y, r.wt, mu, r.eta,
+  SELECT r.__reg_rid__, list_transform(r.xs, lambda v,j: v/u.units[j]) AS xs, r.y, r.wt, mu, r.eta,
          r.wt * (CASE family
                    WHEN 'logistic' THEN __reg_logit_var(r.eta) WHEN 'linear' THEN 1.0
                    WHEN 'poisson'  THEN mu           WHEN 'gamma'  THEN 1.0
@@ -2610,7 +2624,7 @@ __reg_rww AS (
                        WHEN 'linear'   THEN eta
                        ELSE exp(greatest(-700.0, least(eta, 700.0))) END AS mu
     FROM (SELECT __reg_rid__, xs, y, wt, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0)
-  ) r
+  ) r CROSS JOIN __reg_xunits u
 ),
 __reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_rww),
 __reg_idx AS (SELECT unnest(range(1, (SELECT d FROM __reg_dims)+1)) AS i),
@@ -2754,7 +2768,7 @@ __reg_robchk AS (
               ELSE true END AS ok
 ),
 __reg_final AS (
-  SELECT b.names AS names, b.bvec AS bvec, c.Rinv AS Rinv, s.dsc AS dsc, rv.rv AS rv,
+  SELECT b.names AS names, b.bvec AS bvec, c.Rinv AS Rinv, s.dsc AS dsc, rv.rv AS rv, u.units AS units,
          dp.phi AS phi, dp.est AS est, dp.df AS df,
          (robust != 'none' OR cluster_col IS NOT NULL) AS robactive,
          (dp.est AND dp.df > 0.0 AND robust = 'none' AND cluster_col IS NULL) AS uset,
@@ -2762,7 +2776,7 @@ __reg_final AS (
                 THEN -t_ppf((1.0-conf_level)/2.0, dp.df)
               ELSE -norm_ppf((1.0-conf_level)/2.0) END AS crit
   FROM __reg_beta b CROSS JOIN __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_disp dp CROSS JOIN __reg_robvar rv
-       CROSS JOIN __reg_robchk rc WHERE rc.ok
+       CROSS JOIN __reg_robchk rc CROSS JOIN __reg_xunits u WHERE rc.ok
 ),
 -- per-coefficient SE with guards: NULL when the covariance is singular / non-finite / non-positive
 __reg_percoef AS (
@@ -2771,10 +2785,10 @@ __reg_percoef AS (
                 -- A singular design cannot identify coefficient uncertainty.
                 -- df <= 0 (saturated): robust variance is undefined; at n==d the
                 -- leverage h->1 makes hc2/hc3's sc^2/(1-h)^k a 0/0 finite artifact
-                CASE WHEN Rinv IS NOT NULL AND df > 0.0 AND isfinite(rv[gs.i]) AND rv[gs.i] > 0.0 THEN sqrt(rv[gs.i]) ELSE NULL END
+                CASE WHEN Rinv IS NOT NULL AND df > 0.0 AND isfinite(rv[gs.i]) AND rv[gs.i] > 0.0 THEN sqrt(rv[gs.i]) / units[gs.i] ELSE NULL END
               ELSE
                 CASE WHEN Rinv IS NOT NULL AND isfinite(phi * Rinv[gs.i][gs.i]) AND phi * Rinv[gs.i][gs.i] > 0.0
-                     THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] ELSE NULL END
+                     THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] / units[gs.i] ELSE NULL END
          END AS std_error
   FROM __reg_final, unnest(range(1, len(bvec)+1)) AS gs(i)
 )
@@ -2875,20 +2889,36 @@ __reg_feat AS (
   SELECT __reg_rid__, [1.0::DOUBLE], 0::INT FROM __reg_num
   WHERE NOT EXISTS (SELECT 1 FROM __reg_mdlj)
 ),
-__reg_rows0 AS (
+__reg_rowsraw AS (
   SELECT f.__reg_rid__, f.xs, y.y,
          CASE WHEN offset_col IS NULL THEN 0.0 ELSE o.o END AS off,
-         CASE WHEN weights_col IS NULL THEN 1.0
-              WHEN family IN ('linear','gamma','tweedie')
-                THEN w.wt / nullif(max(w.wt) OVER (),0.0)
-              ELSE w.wt END AS wt
+         CASE WHEN weights_col IS NULL THEN 1.0 ELSE w.wt END AS wt
   FROM __reg_feat f JOIN __reg_yv y ON y.__reg_rid__ = f.__reg_rid__
   LEFT JOIN __reg_ov o ON o.__reg_rid__ = f.__reg_rid__ LEFT JOIN __reg_wv w ON w.__reg_rid__ = f.__reg_rid__ CROSS JOIN __reg_beta
   WHERE f.nf = __reg_beta.k AND y.y IS NOT NULL AND (offset_col IS NULL OR o.o IS NOT NULL)
     AND (weights_col IS NULL OR w.wt IS NOT NULL)
 ),
+__reg_weightcheck AS (
+  SELECT CASE WHEN EXISTS (SELECT 1 FROM __reg_rowsraw WHERE NOT isfinite(wt))
+              THEN error(caller || ': weights must be finite')
+              WHEN EXISTS (SELECT 1 FROM __reg_rowsraw WHERE wt < 0)
+              THEN error(caller || ': weights must be non-negative')
+              ELSE true END AS ok
+),
+__reg_rows0 AS (
+  SELECT r.* REPLACE (CASE WHEN family IN ('linear','gamma','tweedie') THEN wt/nullif(max(wt) OVER (),0.0) ELSE wt END AS wt)
+  FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc WHERE wc.ok
+),
+-- Normalize feature units before any cross-products. The original vectors
+-- still form eta; covariance uses these units and is transformed back below.
+__reg_xunits AS (
+  SELECT list(unit ORDER BY i) AS units
+  FROM (SELECT ix.i, coalesce(nullif(max(abs(r.xs[ix.i])) FILTER (WHERE r.wt > 0),0.0),1.0) AS unit
+        FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
+        LEFT JOIN __reg_rows0 r ON true GROUP BY ix.i)
+),
 __reg_rww AS (
-  SELECT r.xs, r.y, r.wt, mu,
+  SELECT list_transform(r.xs, lambda v,j: v/u.units[j]) AS xs, r.y, r.wt, mu,
          r.wt * (CASE family WHEN 'logistic' THEN __reg_logit_var(r.eta) WHEN 'linear' THEN 1.0
                    WHEN 'poisson' THEN mu WHEN 'gamma' THEN 1.0
                    WHEN 'tweedie' THEN pow(mu, 2.0-power) WHEN 'nbinom' THEN mu/(1.0+alpha*mu) END) AS w,
@@ -2899,7 +2929,7 @@ __reg_rww AS (
                    WHEN 'nbinom' THEN (r.y-mu)*(r.y-mu)/(mu*(1.0+alpha*mu)) END) AS pearson
   FROM (SELECT xs, y, wt, eta, CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                             WHEN 'linear' THEN eta ELSE exp(greatest(-700.0,least(eta,700.0))) END AS mu
-        FROM (SELECT xs, y, wt, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0)) r
+        FROM (SELECT xs, y, wt, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0)) r CROSS JOIN __reg_xunits u
 ),
 __reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_rww),
 __reg_idx AS (SELECT unnest(range(1, (SELECT d FROM __reg_dims)+1)) AS i),
@@ -2939,10 +2969,10 @@ __reg_disp AS (
          (SELECT (n-d)::DOUBLE FROM __reg_dims) AS df
 ),
 __reg_cparams AS (
-  SELECT c.Rinv AS Rinv, s.dsc AS dsc, dp.phi AS phi, dp.uset AS uset, dp.df AS df,
+  SELECT c.Rinv AS Rinv, s.dsc AS dsc, u.units AS units, dp.phi AS phi, dp.uset AS uset, dp.df AS df,
          CASE WHEN dp.uset THEN -t_ppf((1.0-conf_level)/2.0, dp.df)
               ELSE -norm_ppf((1.0-conf_level)/2.0) END AS crit
-  FROM __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_disp dp
+  FROM __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_disp dp CROSS JOIN __reg_xunits u
 ),
 -- === score newdata (default = tbl) ===
 __reg_snum AS (SELECT row_number() OVER () AS __reg_srid__, * FROM query_table(coalesce(newdata, tbl))),
@@ -2968,8 +2998,8 @@ __reg_scored AS (
                    + list_dot_product(sf.xs, (SELECT bvec FROM __reg_beta)) END AS eta,
          CASE WHEN sf.nf = (SELECT k FROM __reg_beta) AND cp.Rinv IS NOT NULL
               THEN cp.phi * list_sum(list_transform(
-                       list_transform(sf.xs, lambda v, a: v / cp.dsc[a]),
-                       lambda va, a: va * list_dot_product(cp.Rinv[a], list_transform(sf.xs, lambda v2, a2: v2 / cp.dsc[a2]))))
+                       list_transform(sf.xs, lambda v, a: (v / cp.units[a]) / cp.dsc[a]),
+                       lambda va, a: va * list_dot_product(cp.Rinv[a], list_transform(sf.xs, lambda v2, a2: (v2 / cp.units[a2]) / cp.dsc[a2]))))
               END AS var_eta,
          cp.crit AS crit
   FROM __reg_snum sn
@@ -3063,7 +3093,7 @@ __reg_feat AS (
   SELECT __reg_rid__, [1.0::DOUBLE], 0::INT FROM __reg_num
   WHERE NOT EXISTS (SELECT 1 FROM __reg_mdlj)
 ),
-__reg_rows0 AS (
+__reg_rowsraw AS (
   SELECT f.__reg_rid__, f.xs, y.y,
          CASE WHEN offset_col IS NULL THEN 0.0 ELSE o.o END AS off,
          CASE WHEN weights_col IS NULL THEN 1.0 ELSE w.wt END AS wt
@@ -3072,9 +3102,28 @@ __reg_rows0 AS (
   WHERE f.nf = __reg_beta.k AND y.y IS NOT NULL AND (offset_col IS NULL OR o.o IS NOT NULL)
     AND (weights_col IS NULL OR w.wt IS NOT NULL)
 ),
+__reg_weightcheck AS (
+  SELECT CASE WHEN EXISTS (SELECT 1 FROM __reg_rowsraw WHERE NOT isfinite(wt))
+              THEN error(caller || ': weights must be finite')
+              WHEN EXISTS (SELECT 1 FROM __reg_rowsraw WHERE wt < 0)
+              THEN error(caller || ': weights must be non-negative')
+              ELSE true END AS ok
+),
+__reg_rows0 AS (
+  SELECT r.* REPLACE (wt AS wt)
+  FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc WHERE wc.ok
+),
+-- Normalize feature units before any cross-products. The original vectors
+-- still form eta; covariance uses these units and is transformed back below.
+__reg_xunits AS (
+  SELECT list(unit ORDER BY i) AS units
+  FROM (SELECT ix.i, coalesce(nullif(max(abs(r.xs[ix.i])) FILTER (WHERE r.wt > 0),0.0),1.0) AS unit
+        FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
+        LEFT JOIN __reg_rows0 r ON true GROUP BY ix.i)
+),
 -- per row: mu, observed weight hw, variance V, residual, unit deviance
 __reg_pr AS (
-  SELECT __reg_rid__, xs, wt, y, mu, eta,
+  SELECT __reg_rid__, list_transform(xs, lambda v,j: v/u.units[j]) AS xs, wt, y, mu, eta,
          wt * (CASE family WHEN 'logistic' THEN __reg_logit_var(eta) WHEN 'linear' THEN 1.0
                  WHEN 'poisson' THEN mu WHEN 'gamma' THEN y/mu
                  WHEN 'tweedie' THEN (2.0-power)*pow(mu,2.0-power)+(power-1.0)*y*pow(mu,1.0-power)
@@ -3092,7 +3141,7 @@ __reg_pr AS (
   FROM (SELECT __reg_rid__, xs, wt, y, eta,
                CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                            WHEN 'linear' THEN eta ELSE exp(greatest(-700.0,least(eta,700.0))) END AS mu
-        FROM (SELECT __reg_rid__, xs, wt, y, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0))
+        FROM (SELECT __reg_rid__, xs, wt, y, off + list_dot_product(xs, (SELECT bvec FROM __reg_beta)) AS eta FROM __reg_rows0)) r CROSS JOIN __reg_xunits u
 ),
 __reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_pr),
 __reg_idx AS (SELECT unnest(range(1, (SELECT d FROM __reg_dims)+1)) AS i),
@@ -3222,7 +3271,7 @@ __reg_feat AS (
 ),
 -- Shift logits before exponentiating and retain the reference probability
 -- last, so diagonal information can sum the other classes without 1-p.
-__reg_probs AS (
+__reg_probsraw AS (
   SELECT __reg_rid__, xs, list_transform(ee, lambda e: e/list_sum(ee)) AS p
   FROM (
     SELECT __reg_rid__, xs, list_transform(eta, lambda v: exp(v-list_max(eta))) AS ee
@@ -3233,6 +3282,16 @@ __reg_probs AS (
       CROSS JOIN __reg_kfeat WHERE f.nf = __reg_kfeat.k
     )
   )
+),
+__reg_xunits AS (
+  SELECT list(unit ORDER BY i) AS units
+  FROM (SELECT ix.i, coalesce(nullif(max(abs(r.xs[ix.i])),0.0),1.0) AS unit
+        FROM range(1,(SELECT k FROM __reg_kfeat)+2) ix(i)
+        LEFT JOIN __reg_probsraw r ON true GROUP BY ix.i)
+),
+__reg_probs AS (
+  SELECT r.* REPLACE (list_transform(xs, lambda v,j: v/u.units[j]) AS xs)
+  FROM __reg_probsraw r CROSS JOIN __reg_xunits u
 ),
 __reg_dims AS (
   SELECT (SELECT len(B) FROM __reg_bmat) AS km1,
@@ -3297,15 +3356,15 @@ __reg_covinv AS (
   FROM __reg_gj WHERE k = d OR d IS NULL
 ),
 __reg_final AS (
-  SELECT bm.B AS B, bm.cls AS cls, fn.fn AS fn, c.Rinv AS Rinv, s.dsc AS dsc,
+  SELECT bm.B AS B, bm.cls AS cls, fn.fn AS fn, c.Rinv AS Rinv, s.dsc AS dsc, u.units AS units,
          dm.d AS d, -norm_ppf((1.0-conf_level)/2.0) AS crit
-  FROM __reg_bmat bm CROSS JOIN __reg_featnames fn CROSS JOIN __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_dims dm
+  FROM __reg_bmat bm CROSS JOIN __reg_featnames fn CROSS JOIN __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_dims dm CROSS JOIN __reg_xunits u
 ),
 __reg_percoef AS (
   SELECT gs.a AS a, cls[(gs.a-1)//d + 1] AS class, fn[(gs.a-1)%d + 1] AS feature,
          B[(gs.a-1)//d + 1][(gs.a-1)%d + 1] AS coefficient, crit,
          CASE WHEN Rinv IS NOT NULL AND isfinite(Rinv[gs.a][gs.a]) AND Rinv[gs.a][gs.a] > 0.0
-              THEN sqrt(Rinv[gs.a][gs.a]) / dsc[gs.a] ELSE NULL END AS std_error
+              THEN sqrt(Rinv[gs.a][gs.a]) / dsc[gs.a] / units[(gs.a-1)%d + 1] ELSE NULL END AS std_error
   FROM __reg_final, unnest(range(1, len(B)*d + 1)) AS gs(a)
 )
 SELECT class, feature, coefficient, std_error,

@@ -604,3 +604,78 @@ def test_multinomial_information_preserves_large_logit_differences(con):
     actual=con.execute("SELECT std_error FROM multinom_summary('multi_model','multi_data','y') ORDER BY class,(feature='(Intercept)') DESC").fetchnumpy()['std_error']
     assert not np.ma.is_masked(actual)
     np.testing.assert_allclose(actual,np.sqrt(np.diag(np.linalg.inv(information))),rtol=1e-10)
+
+
+@pytest.mark.parametrize('family', ['linreg','logit','poisson','gamma','tweedie','nbinom'])
+@pytest.mark.parametrize('scale', [1e-160, 1e160])
+@pytest.mark.parametrize('robust', ['none', 'hc0', 'cluster'])
+def test_inference_preserves_extreme_feature_units(con, family, scale, robust):
+    model(con)
+    model(con, name='scaled_model')
+    con.execute("UPDATE scaled_model SET coefficient=coefficient/? WHERE feature='x'", [scale])
+    data = training().assign(w=np.linspace(0.25, 1.0, 48), grp=np.resize(np.arange(4), 48))
+    data['y'] = (data.y > 1).astype(float) if family == 'logit' else data.y + 0.2
+    load(con, 'base_units', data)
+    load(con, 'scaled_units', data.assign(x=data.x*scale))
+    extra = "cluster_col:='grp'" if robust == 'cluster' else f"robust:='{robust}'"
+    summaries, intervals, diagnostics = [], [], []
+    for mdl, table in [('edge_model','base_units'), ('scaled_model','scaled_units')]:
+        summary = con.execute(f"SELECT * FROM {family}_summary('{mdl}','{table}','y',weights_col:='w',{extra})").df()
+        if table == 'scaled_units':
+            summary.loc[summary.feature=='x', ['coefficient','std_error','conf_low','conf_high']] *= scale
+        summaries.append(summary.drop(columns='feature').to_numpy())
+        if robust == 'none':
+            intervals.append(con.execute(f"SELECT prediction,conf_low,conf_high FROM {family}_predict_ci('{mdl}','{table}','y',weights_col:='w')").df().to_numpy())
+            diagnostics.append(con.execute(f"SELECT hat,pearson_resid,deviance_resid,std_resid,cooks_distance FROM {family}_influence('{mdl}','{table}','y',weights_col:='w')").df().to_numpy())
+    assert np.isfinite(summaries).all()
+    np.testing.assert_allclose(summaries[1], summaries[0], rtol=1e-9, atol=1e-12)
+    if robust == 'none':
+        assert np.isfinite(intervals).all()
+        assert np.isfinite(diagnostics).all()
+        np.testing.assert_allclose(intervals[1], intervals[0], rtol=1e-9, atol=1e-12)
+        np.testing.assert_allclose(diagnostics[1], diagnostics[0], rtol=1e-9, atol=1e-12)
+
+
+@pytest.mark.parametrize('scale', [1e-160, 1e160])
+def test_multinomial_inference_preserves_extreme_feature_units(con, scale):
+    model(con, multinomial=True)
+    model(con, name='scaled_model', multinomial=True)
+    con.execute("UPDATE scaled_model SET coefficient=coefficient/? WHERE feature='x'", [scale])
+    data = training().assign(y=np.resize(['a','b','c'], 48))
+    load(con, 'base_units', data)
+    load(con, 'scaled_units', data.assign(x=data.x*scale))
+    summaries = []
+    for mdl, table in [('edge_model','base_units'), ('scaled_model','scaled_units')]:
+        summary = con.execute(f"SELECT * FROM multinom_summary('{mdl}','{table}','y') ORDER BY class,feature").df()
+        if table == 'scaled_units':
+            summary.loc[summary.feature=='x', ['coefficient','std_error','conf_low','conf_high']] *= scale
+        summaries.append(summary.drop(columns=['class','feature']).to_numpy())
+    assert np.isfinite(summaries).all()
+    np.testing.assert_allclose(summaries[1], summaries[0], rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize('family', ['linreg','logit','poisson','gamma','tweedie','nbinom'])
+@pytest.mark.parametrize('operation', ['summary','predict_ci','influence'])
+@pytest.mark.parametrize('weight', ['-1.0', "'NaN'::DOUBLE", "'Infinity'::DOUBLE", "'-Infinity'::DOUBLE"])
+def test_inference_rejects_invalid_retained_weights(con, family, operation, weight):
+    model(con)
+    data = training()
+    data['y'] = (data.y > 1).astype(float) if family == 'logit' else data.y + 0.2
+    load(con, 'invalid_weights', data)
+    con.execute(f'ALTER TABLE invalid_weights ADD COLUMN w DOUBLE DEFAULT {weight}')
+    with pytest.raises(duckdb.Error, match='weights must be (finite|non-negative)'):
+        con.execute(f"SELECT * FROM {family}_{operation}('edge_model','invalid_weights','y',weights_col:='w')").fetchall()
+
+
+@pytest.mark.parametrize('operation', ['summary','predict_ci','influence'])
+def test_inference_weight_validation_ignores_incomplete_rows(con, operation):
+    model(con)
+    load(con, 'retained_weights', training().assign(w=1.0))
+    call = f"SELECT * FROM poisson_{operation}('edge_model','retained_weights','y',weights_col:='w')"
+    expected = con.execute(call).df()
+    con.execute("INSERT INTO retained_weights VALUES (NULL,1.0,'NaN'::DOUBLE)")
+    actual = con.execute(call).df()
+    if operation == 'predict_ci':
+        assert actual.iloc[-1][['prediction','conf_low','conf_high']].isna().all()
+        actual = actual.iloc[:-1]
+    pd.testing.assert_frame_equal(actual, expected)
