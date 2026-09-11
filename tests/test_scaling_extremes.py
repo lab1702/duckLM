@@ -288,6 +288,39 @@ def test_weighted_logistic_fit_handles_overflowing_unweighted_coordinates(con, s
 
 
 @pytest.mark.parametrize('solver', ['auto', 'irls', 'gd'])
+@pytest.mark.parametrize('scale', [1e20, 1e100, 1e300])
+@pytest.mark.parametrize('l1', [0., .05])
+def test_negligible_weight_negative_outlier_preserves_penalty_standardization(con, solver, scale, l1):
+    con.execute('CREATE TABLE weighted_center(x DOUBLE,y DOUBLE,w DOUBLE)')
+    con.executemany('INSERT INTO weighted_center VALUES (?,?,?)',[(0.,0.,scale),(1.,1.,scale),(-scale,0.,1/scale)])
+    coefficients = dict(con.execute(f"SELECT * FROM linreg_fit('weighted_center','y',weights_col:='w',solver:='{solver}',l2:=.2,l1:={l1})").fetchall())
+    # Exact weighted moments approach mu_x=mu_y=.5, var_x=.75,
+    # var_y=.25 and cov_xy=.25; all omitted terms are below 1e-19.
+    slope = (.25-l1*np.sqrt(.75)*.5)/(.75*1.2)
+    assert coefficients == pytest.approx({'(Intercept)':.5-.5*slope,'x':slope},abs=1e-8)
+
+
+@pytest.mark.parametrize('solver', ['auto', 'irls', 'gd'])
+@pytest.mark.parametrize('family,power', [('poisson',None),('gamma',None),('tweedie',1.5),('tweedie',3.),('nbinom',None)])
+@pytest.mark.parametrize('slope', [0., .2])
+def test_log_link_fit_preserves_overflowing_mean_scaled_response_contributions(con, solver, family, power, slope):
+    con.execute('CREATE TABLE weighted_response(x DOUBLE,y DOUBLE,w DOUBLE)')
+    rows = [(-1.,1e-300,1.),(1.,1e-300,1.)]
+    if slope == 0:
+        rows += [(0.,1e300,1e-320)]
+        mean_unit = (1e-320*1e300)/2
+    else:
+        rows += [(x,1e300*np.exp(slope*x),1e-320) for x in [-1.,1.]]
+        mean_unit = 1e-320*1e300
+    con.executemany('INSERT INTO weighted_response VALUES (?,?,?)',rows)
+    extra = '' if power is None else f',power:={power}'
+    coefficients = dict(con.execute(f"SELECT * FROM {family}_fit('weighted_response','y',weights_col:='w',solver:='{solver}',max_iter:=1000{extra})").fetchall())
+    # Within each x group, every family has its likelihood/quasi-likelihood
+    # optimum at the weighted mean; symmetry fixes the intercept-only case.
+    assert coefficients == pytest.approx({'(Intercept)':np.log(mean_unit),'x':slope},abs=1e-8)
+
+
+@pytest.mark.parametrize('solver', ['auto', 'irls', 'gd'])
 def test_linear_intercept_cancels_before_restoring_outcome_units(con, solver):
     con.execute('CREATE TABLE finite_intercept AS SELECT * FROM (VALUES (-2.5,-1e308),(-2.,-5e307),(-1.5,0.))t(x,y)')
     con.execute(f"CREATE TABLE finite_model AS SELECT * FROM linreg_fit('finite_intercept','y',solver:='{solver}')")

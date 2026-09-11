@@ -435,8 +435,11 @@ __reg_w AS MATERIALIZED (
 ),
 -- Center the mean accumulation to preserve small spreads around large means.
 -- Retain a scale for observations whose centered sum can still overflow.
+-- Anchor on a largest-weight observation, preferring the value nearest zero
+-- on ties. A negligible-weight extreme must not determine the centering unit.
 __reg_moments AS MATERIALIZED (
-    SELECT s.col, s.v, w.w, w.sw, min(s.v) OVER (PARTITION BY s.col) AS vbase,
+    SELECT s.col, s.v, w.w, w.sw,
+           arg_min(s.v,struct_pack(weight := -w.sw,magnitude := abs(s.v),value := s.v)) OVER (PARTITION BY s.col) AS vbase,
            max(abs(s.v)) OVER (PARTITION BY s.col) AS vscale
     FROM __reg_clong s JOIN __reg_w w ON w.rid = s.rid
     WHERE w.sw > 0
@@ -529,18 +532,19 @@ __reg_offsets AS (
            END AS center
     FROM __reg_moments WHERE col = offset_col
 ),
--- The whole training set packed into one row: a list of {y, xs} structs where
+-- The whole training set packed into one row: a list of training-row structs where
 -- xs = [1.0 (intercept), standardized features in name order]. __reg_clong is
 -- already restricted to complete rows.
--- Each row carries y (transformed), xs (standardized features), and o, the
+-- Each row carries wy (root-weighted transformed response), xs (standardized
+-- features), and o, the
 -- internal offset. An offset is a known per-row term in the linear predictor
 -- eta = o + xs.beta; it is not fit and not penalized. For Tweedie its common
 -- weighted center is removed and restored in the model intercept; for linear
 -- the outcome is z-scored, so the offset is divided by
 -- sd_y to live on the same scale. o = 0 when no offset column is given.
--- Each row carries y (transformed), xs (standardized features), o (internal
--- offset), w (sample weight), sw (its root), and wxs (root-weighted features).
--- Weighted products use sw and wxs to preserve large features with tiny weights.
+-- Rows also carry w (sample weight), sw (its root), and wxs (root-weighted
+-- features). Scores retain the root weight to preserve large responses and
+-- features with tiny weights, without forming an overflowing unweighted y.
 -- Linear least squares packs the root-weighted response, design, and offset
 -- directly and uses unit optimizer weights. This avoids ever materializing an
 -- overflowing unweighted standardized observation. sumw retains the original
@@ -550,7 +554,7 @@ __reg_offsets AS (
 __reg_packed AS MATERIALIZED (
     -- Zero-weight observations do not participate in optimization, including
     -- the curvature maximum that damps gradient steps for log-link families.
-    SELECT list(struct_pack(y := y, xs := xs, wxs := wxs, o := o, w := w, sw := CASE WHEN family = 'linear' THEN 1.0 ELSE sw END)) FILTER (WHERE sw > 0) AS rows,
+    SELECT list(struct_pack(wy := wy, xs := xs, wxs := wxs, o := o, w := w, sw := CASE WHEN family = 'linear' THEN 1.0 ELSE sw END)) FILTER (WHERE sw > 0) AS rows,
            count(*)::DOUBLE AS n,
            sum(w) AS sumw
     FROM (
@@ -562,9 +566,7 @@ __reg_packed AS MATERIALIZED (
         -- collect unordered and sort the little list in list-land. list_sort orders
         -- a struct list lexicographically by field, hence j first.
         SELECT x.rid,
-               CASE WHEN family = 'linear'
-                    THEN __reg_weighted_center(any_value(yv.v),any_value(ys.mu_y),any_value(wt.sw),any_value(ys.sd_y))
-                    ELSE __reg_centered(any_value(yv.v),any_value(ys.mu_y),any_value(ys.sd_y)) END AS y,
+               __reg_weighted_center(any_value(yv.v),any_value(ys.mu_y),any_value(wt.sw),any_value(ys.sd_y)) AS wy,
                [any_value(wt.sw)] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_weighted_center(x.v,s.mu,wt.sw,s.sigma)))), zp -> zp.v) AS wxs,
                CASE WHEN family = 'linear' THEN wxs
                     ELSE [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), zp -> zp.v) END AS xs,
@@ -707,24 +709,23 @@ __reg_irls(it, betas, move) AS (
                                               WHEN 'gamma'    THEN 1.0
                                               WHEN 'tweedie'  THEN pow(e.mu, 2.0 - power)
                                               WHEN 'nbinom'   THEN __reg_nb_fit_info(ln(e.mu),log_alpha_int,l1=0 AND l2=0) END),
-                                   wr := e.w * ((CASE family
+                                   wr := (CASE family
                                               WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
                                               WHEN 'linear'   THEN 1.0
                                               WHEN 'poisson'  THEN e.mu
                                               WHEN 'gamma'    THEN 1.0
                                               WHEN 'tweedie'  THEN pow(e.mu, 2.0 - power)
                                               WHEN 'nbinom'   THEN __reg_nb_fit_info(ln(e.mu),log_alpha_int,l1=0 AND l2=0) END) * e.linpred
-                                          + (CASE family
-                                              WHEN 'gamma'    THEN e.y / e.mu - 1.0
-                                              WHEN 'tweedie'  THEN __reg_tw_score(e.y,e.mu,power)
-                                              WHEN 'nbinom'   THEN __reg_nb_fit_score(e.y,ln(e.mu),log_alpha_int,l1=0 AND l2=0)
-                                              ELSE e.y - e.mu END))
+                                         + __reg_weighted_fit_score(e.wy,e.w,
+                                             CASE WHEN family IN ('linear','logistic') THEN e.eta ELSE ln(e.mu) END,
+                                             family,power,log_alpha_int,l1=0 AND l2=0)
                                    )) AS res
                         FROM (
                             SELECT g.it, g.betas, p.sumw, c.log_alpha_int AS log_alpha_int,
                                    list_transform(p.rows, lambda rw: struct_pack(
-                                       xs := rw.wxs, w := rw.sw, y := rw.y,
-                                       linpred := __reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas),
+                                       xs := rw.wxs, w := rw.sw, wy := rw.wy,
+                                       linpred := list_dot_product(rw.wxs,g.betas),
+                                       eta := __reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas)+rw.o,
                                        mu := CASE family
                                                WHEN 'logistic' THEN 1.0 / (1.0 + exp(-greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o, 700.0), -700.0)))
                                                WHEN 'linear'   THEN __reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o
@@ -792,8 +793,20 @@ __reg_gd AS (
             SELECT it, betas, look, step * (l1 / damp) AS threshl1, step/damp AS prox_step,
                    -- Smooth data-loss gradient; both penalties are proximal.
                    list_transform(look, lambda b, j:
-                       b + step * ((list_sum(list_transform(res, lambda ob: ob.w * ob.xs[j] * ob.r)) / sumw) / damp)) AS zstep
+                       b + step * ((list_sum(list_transform(res, lambda ob: ob.xs[j] * ob.r)) / sumw) / damp)) AS zstep
             FROM (
+                SELECT it, betas, n, sumw, step, look, res,
+                       -- If an unweighted row factor is outside DOUBLE range,
+                       -- its weighted information trace can still provide a
+                       -- finite local curvature bound for the base step.
+                       CASE WHEN isfinite(raw_damp) THEN raw_damp
+                            ELSE greatest(1.0,
+                              list_sum(list_transform(res,lambda ob:
+                                list_sum(list_transform(ob.xs,lambda v: __reg_mul_div(abs(ob.hw),abs(v),ob.w)*abs(v)))))
+                                  /(sumw*len(look)),
+                              list_sum(list_transform(res,lambda ob: ob.w*abs(ob.r)))/sumw)
+                       END AS damp
+                FROM (
                 SELECT it, betas, n, sumw, step, look, res,
                    -- The log-link families (Poisson/Gamma/Tweedie) have
                    -- unbounded curvature, so damp the step by the largest
@@ -805,16 +818,17 @@ __reg_gd AS (
                    -- curvature alone can be arbitrarily small.
                    CASE WHEN family IN ('nbinom','tweedie')
                         THEN coalesce(nullif(list_aggregate(
-                               list_transform(res, lambda ob: abs(ob.hw) + abs(ob.r)), 'max'),0.0),1.0)
+                               list_transform(res, lambda ob: (abs(ob.hw)+abs(ob.r))/ob.w), 'max'),0.0),1.0)
                         WHEN family IN ('poisson', 'gamma')
                         THEN greatest(1.0, list_aggregate(
-                               list_transform(res, lambda ob: ob.hw), 'max'))
+                               list_transform(res, lambda ob: ob.hw/ob.w), 'max'))
                         ELSE 1.0
-                   END AS damp
+                   END AS raw_damp
             FROM (
                 SELECT it, betas, rows, n, sumw, step, look,
-                       -- Per training row: the residual r (the per-row gradient
-                       -- in z, so the beta-gradient is w*xs*r) and hw (the per-row
+                       -- Per training row: root-weighted residual r and curvature
+                       -- hw (the beta-gradient is wxs*r). Before weighting, the
+                       -- residual is the gradient in z and hw is the per-row
                        -- Hessian weight used to damp the step for the unbounded-
                        -- curvature log-link families). The linear predictor is
                        -- the offset plus xs . look; the offset is fixed, so it
@@ -828,33 +842,13 @@ __reg_gd AS (
                        -- with mu = exp(eta); Tweedie unifies p=1 (Poisson) and
                        -- p=2 (Gamma), and 1<p<2 admits exact zeros.
                        list_transform(rows, lambda rw: struct_pack(
-                           xs := rw.wxs,
-                           w  := rw.sw,
-                           r  := CASE WHEN family = 'logistic'
-                                      THEN rw.y - __reg_sigmoid(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o)
-                                      WHEN family = 'poisson'
-                                      THEN rw.y - exp(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o, 700.0))
-                                      WHEN family = 'gamma'
-                                      THEN rw.y / exp(greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o, 700.0), -700.0)) - 1.0
-                                      WHEN family = 'tweedie'
-                                      THEN __reg_tw_score(rw.y,exp(greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o, 700.0), -700.0)),power)
-                                      WHEN family = 'nbinom'
-                                      -- NB2: r = (y - mu) / (1 + alpha*mu), mu = exp(eta);
-                                      -- reduces to Poisson (y - mu) as alpha -> 0
-                                      THEN __reg_nb_fit_score(rw.y,least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o,700.0),log_alpha_int,l1=0 AND l2=0)
-                                      ELSE rw.y - (__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o)
-                                 END,
-                           hw := CASE WHEN family = 'poisson'
-                                      THEN exp(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o, 700.0))
-                                      WHEN family = 'gamma'
-                                      THEN rw.y / exp(greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o, 700.0), -700.0))
-                                      WHEN family = 'tweedie'
-                                      THEN __reg_tw_observed(rw.y,exp(greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o, 700.0), -700.0)),power)
-                                      WHEN family = 'nbinom'
-                                      -- NB Hessian weight mu(1+alpha*y)/(1+alpha*mu)^2
-                                      THEN __reg_nb_fit_observed(rw.y,least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,look) + rw.o,700.0),log_alpha_int,l1=0 AND l2=0)
-                                      ELSE 0.0
-                                 END)) AS res
+                           xs := rw.wxs, w := rw.sw,
+                           r := __reg_weighted_fit_score(rw.wy,rw.sw,
+                                  __reg_fit_dot(rw.xs,rw.wxs,rw.sw,look)+rw.o,
+                                  family,power,log_alpha_int,l1=0 AND l2=0),
+                           hw := __reg_weighted_fit_observed(rw.wy,rw.sw,
+                                  __reg_fit_dot(rw.xs,rw.wxs,rw.sw,look)+rw.o,
+                                  family,power,log_alpha_int,l1=0 AND l2=0))) AS res
                 FROM (
                     SELECT g.it, g.betas, p.rows, p.n, p.sumw, c.step, c.log_alpha_int,
                            -- Nesterov lookahead point
@@ -864,6 +858,7 @@ __reg_gd AS (
                     WHERE g.it < max_iter AND g.move >= tol
                 )
             )
+        )
         )
         )
     )
@@ -1167,6 +1162,35 @@ CREATE OR REPLACE MACRO __reg_nb_fit_observed(y, eta, logalpha, unpenalized) AS 
   exp(__reg_nb_fit_shift(logalpha,unpenalized)+eta
       + CASE WHEN y=0 THEN 0.0 ELSE __reg_softplus(logalpha+ln(y)) END
       - 2.0*__reg_softplus(logalpha+eta))
+);
+
+-- Root-weighted fitting scores keep a large mean-scaled response finite even
+-- when its unweighted ratio exceeds DOUBLE range. mu stays in response units.
+CREATE OR REPLACE MACRO __reg_weighted_fit_score(wy, sw, eta, family, power, logalpha, unpenalized) AS (
+  list_transform([exp(greatest(least(eta,700.0),-700.0))], lambda mu:
+    CASE family
+      WHEN 'linear' THEN wy-sw*eta
+      WHEN 'logistic' THEN wy-sw*__reg_sigmoid(eta)
+      WHEN 'poisson' THEN wy-sw*exp(least(eta,700.0))
+      WHEN 'gamma' THEN __reg_mul_div(wy,1.0,mu)-sw
+      WHEN 'tweedie' THEN __reg_mul_div(wy-sw*mu,pow(mu,2.0-power),mu)
+      WHEN 'nbinom' THEN CASE WHEN eta >= 0
+         THEN (wy/exp(least(eta,700.0))-sw)*__reg_nb_fit_info(least(eta,700.0),logalpha,unpenalized)
+         ELSE (wy-sw*exp(eta))*exp(__reg_nb_fit_shift(logalpha,unpenalized)-__reg_softplus(logalpha+eta)) END
+    END)[1]
+);
+CREATE OR REPLACE MACRO __reg_weighted_fit_observed(wy, sw, eta, family, power, logalpha, unpenalized) AS (
+  list_transform([exp(greatest(least(eta,700.0),-700.0))], lambda mu:
+    CASE family
+      WHEN 'poisson' THEN sw*exp(least(eta,700.0))
+      WHEN 'gamma' THEN __reg_mul_div(wy,1.0,mu)
+      WHEN 'tweedie' THEN sw*pow(mu,2.0-power)
+                            +(power-1.0)*__reg_mul_div(wy-sw*mu,pow(mu,2.0-power),mu)
+      WHEN 'nbinom' THEN exp(__reg_nb_fit_shift(logalpha,unpenalized)+least(eta,700.0)+ln(sw)
+                             +CASE WHEN wy=0 THEN 0.0 ELSE __reg_softplus(logalpha+ln(wy)-ln(sw)) END
+                             -2.0*__reg_softplus(logalpha+least(eta,700.0)))
+      ELSE 0.0
+    END)[1]
 );
 
 -- exp(s) * (exp(a*x)-1)/a, continuous at a=0. Expand the small
