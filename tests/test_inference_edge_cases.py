@@ -871,3 +871,68 @@ def test_prediction_intervals_scale_newdata_before_covariance_products(con, feat
     units = (new_x/feature_scale)*response_scale
     assert np.isfinite(actual).all()
     np.testing.assert_allclose(actual/units, [expected_prediction,expected_prediction-width,expected_prediction+width], rtol=1e-9)
+
+
+@pytest.mark.parametrize('family', ['linreg','logit','poisson','gamma','tweedie','nbinom'])
+@pytest.mark.parametrize('scale', [1e200,1e300])
+@pytest.mark.parametrize('robust', ['none','hc0','hc1','hc2','hc3'])
+def test_inference_preserves_positive_weights_below_relative_double_range(con, family, scale, robust):
+    sw = np.array([1.,1.,1/scale])
+    design = np.array([[1.,0.],[1.,1.],[1/scale,1.]])
+    linear = family == 'linreg'
+    binary = family == 'logit'
+    y = np.array([0.,1.,0.]) if linear or binary else np.array([.75,1.5,1.])
+    beta = [1/3,1/3] if linear else [0.,0.]
+    residual = np.array([-1/3,1/3,-1/3]) if linear else sw*(y-(.5 if binary else 1.))
+    variance = .25 if binary else 2. if family == 'nbinom' else 1.
+    fisher = .25 if binary else .5 if family == 'nbinom' else 1.
+    observed = y if family == 'gamma' else 2*y-1 if family == 'tweedie' else (1+y)/4 if family == 'nbinom' else np.full(3,fisher)
+    bread = np.linalg.inv(design.T@(observed[:,None]*design))
+    hat = observed*np.einsum('ij,jk,ik->i',design,bread,design)
+    estimated = family in ['linreg','gamma','tweedie']
+    phi = np.sum(residual**2/variance) if estimated else 1.
+    if robust == 'none':
+        covariance = phi*np.linalg.inv(fisher*(design.T@design))
+        expected_se = np.sqrt(np.diag(covariance))/(1. if estimated else np.sqrt(scale))
+    else:
+        score = residual/(2. if family == 'nbinom' else 1.)
+        meat = score**2
+        if robust == 'hc2': meat /= 1-hat
+        if robust == 'hc3': meat /= (1-hat)**2
+        covariance = bread@(design.T@(meat[:,None]*design))@bread
+        if robust == 'hc1': covariance *= 3.
+        expected_se = np.sqrt(np.diag(covariance))
+    con.execute('CREATE TABLE wide_weights(x DOUBLE,y DOUBLE,w DOUBLE)')
+    con.executemany('INSERT INTO wide_weights VALUES (?,?,?)', [(0.,float(y[0]),scale),(1.,float(y[1]),scale),(scale,float(y[2]),1/scale)])
+    con.execute('CREATE TABLE weight_model(feature VARCHAR,coefficient DOUBLE)')
+    con.executemany('INSERT INTO weight_model VALUES (?,?)',[('(Intercept)',beta[0]),('x',beta[1])])
+    extra = ',power:=3.' if family == 'tweedie' else ''
+    args = f"'weight_model','wide_weights','y',weights_col:='w'{extra}"
+    actual_se = np.array(con.execute(f"SELECT std_error FROM {family}_summary({args},robust:='{robust}')").fetchall()).ravel()
+    np.testing.assert_allclose(actual_se,expected_se,rtol=1e-9)
+    if robust == 'none':
+        diagnostics = np.array(con.execute(f'SELECT hat,pearson_resid,std_resid,cooks_distance FROM {family}_influence({args})').fetchall())
+        pearson = residual/np.sqrt(variance)
+        expected_std = pearson/np.sqrt(phi*(1-hat))
+        expected_cook = (pearson**2/phi)*hat/(2*(1-hat)**2)
+        np.testing.assert_allclose(diagnostics[:,0],hat,rtol=1e-9)
+        np.testing.assert_allclose(diagnostics[:,1]/np.sqrt(scale),pearson,rtol=1e-9,atol=1e-310)
+        np.testing.assert_allclose(diagnostics[:,2]/(1. if estimated else np.sqrt(scale)),expected_std,rtol=1e-9,atol=1e-310)
+        np.testing.assert_allclose(diagnostics[:,3]/(1. if estimated else scale),expected_cook,rtol=1e-9,atol=1e-310)
+        if linear:
+            intervals = np.array(con.execute(f'SELECT prediction,conf_low,conf_high FROM linreg_predict_ci({args})').fetchall())
+            assert np.isfinite(intervals).all()
+
+
+@pytest.mark.parametrize('power,scale', [(3.,1e-170),(3.,1e170),(2.,1e-310)])
+@pytest.mark.parametrize('robust', ['none','hc0','hc1','hc2','hc3'])
+def test_tweedie_inference_combines_mean_powers_before_scaling(con, power, scale, robust):
+    summaries, hats = [], []
+    for factor in [1.,scale]:
+        con.execute('CREATE OR REPLACE TABLE power_units AS SELECT i::DOUBLE/10 x,(1.0+i%3)*? y FROM range(12)t(i)',[factor])
+        con.execute(f"CREATE OR REPLACE TABLE power_model AS SELECT * FROM tweedie_fit('power_units','y',power:={power})")
+        summaries.append(con.execute(f"SELECT std_error FROM tweedie_summary('power_model','power_units','y',power:={power},robust:='{robust}')").fetchnumpy()['std_error'])
+        hats.append(con.execute(f"SELECT hat FROM tweedie_influence('power_model','power_units','y',power:={power})").fetchnumpy()['hat'])
+    assert np.isfinite(summaries).all() and np.isfinite(hats).all()
+    np.testing.assert_allclose(summaries[1],summaries[0],rtol=1e-8)
+    np.testing.assert_allclose(hats[1],hats[0],rtol=1e-8)

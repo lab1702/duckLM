@@ -38,11 +38,19 @@ def test_tiny_log_link_outcomes_keep_positive_mean_scaling(con, family, scale):
 @pytest.mark.parametrize('solver', ['auto', 'irls', 'gd'])
 def test_linear_back_transform_preserves_finite_coefficients_when_product_overflows(con, solver):
     con.execute('CREATE TABLE large_response AS SELECT * FROM (VALUES (-40.,-50.,1e308),(-20.,-10.,-1e308),(0.,-10.,1e308),(20.,30.,-1e308),(40.,30.,1e308))t(x,z,y)')
-    coefficients = dict(con.execute(f"SELECT * FROM linreg_fit('large_response','y',solver:='{solver}')").fetchall())
+    con.execute(f"CREATE TABLE large_model AS SELECT * FROM linreg_fit('large_response','y',solver:='{solver}')")
+    coefficients = dict(con.execute("SELECT * FROM large_model").fetchall())
     assert np.isfinite(list(coefficients.values())).all()
     assert coefficients['x']/1e307 == pytest.approx(1.0, abs=1e-8)
     assert coefficients['z']/1e307 == pytest.approx(-1.0, abs=1e-8)
     assert abs(coefficients['(Intercept)']/1e308) < 1e-8
+    predictions = np.array(con.execute("SELECT prediction/1e308 FROM linreg_predict('large_model','large_response')").fetchall()).ravel()
+    np.testing.assert_allclose(predictions, [1.,-1.,1.,-1.,1.], atol=1e-8)
+    rmse, r2 = con.execute("SELECT rmse/1e308,r2 FROM linreg_evaluate('large_model','large_response','y')").fetchone()
+    assert rmse < 1e-8 and r2 == pytest.approx(1.)
+    intervals = np.array(con.execute("SELECT prediction,conf_low,conf_high FROM linreg_predict_ci('large_model','large_response','y')").fetchall())
+    assert np.isfinite(intervals).all()
+
 
 
 @pytest.mark.parametrize('alpha', [100., 1e300])

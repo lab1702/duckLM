@@ -563,3 +563,29 @@ def test_exact_linear_fit_retains_r_squared_at_extreme_units(con, scale):
     assert metrics['r2'] == 1.0
     assert metrics['adj_r2'] == 1.0
     assert metrics['loglik'] == np.inf
+
+
+@pytest.mark.parametrize('family', ['linreg','logit','poisson','gamma','tweedie','nbinom'])
+@pytest.mark.parametrize('with_offset', [False,True])
+def test_scoring_cancels_overflowing_products_before_restoring_units(con, family, with_offset):
+    expected = .5 if family == 'logit' else 0. if family == 'linreg' else 1.
+    outcome = 0. if family == 'logit' else expected
+    offset = ', -1e308 expo' if with_offset else ''
+    argument = ",offset_col:='expo'" if with_offset else ''
+    con.execute(f'CREATE TABLE cancel_data AS SELECT 2.0 x,2.0 z,{outcome} y{offset} FROM range(2)')
+    con.execute('CREATE TABLE cancel_model(feature VARCHAR,coefficient DOUBLE)')
+    con.executemany('INSERT INTO cancel_model VALUES (?,?)', [('(Intercept)',1e308 if with_offset else 0.),('x',1e308),('z',-1e308)])
+    field = 'prob' if family == 'logit' else 'prediction'
+    actual = np.array(con.execute(f"SELECT {field} FROM {family}_predict('cancel_model','cancel_data'{argument})").fetchall()).ravel()
+    np.testing.assert_allclose(actual,expected,atol=1e-12)
+    metrics = _metrics(con,f"{family}_evaluate('cancel_model','cancel_data','y'{argument})")
+    assert metrics['n'] == 2
+    assert metrics['log_loss' if family == 'logit' else 'rmse'] == pytest.approx(np.log(2.) if family == 'logit' else 0.)
+
+
+def test_multinomial_scoring_cancels_overflowing_products(con):
+    con.execute("CREATE TABLE cancel_data AS SELECT 2.0 x,2.0 z,'b' y FROM range(2)")
+    con.execute("CREATE TABLE cancel_model AS SELECT * FROM (VALUES ('a','(Intercept)',0.),('a','x',0.),('a','z',0.),('b','(Intercept)',0.),('b','x',1e308),('b','z',-1e308))t(class,feature,coefficient)")
+    probabilities = con.execute("SELECT probs FROM multinom_predict('cancel_model','cancel_data')").fetchall()
+    assert all(p == {'a':.5,'b':.5} for p, in probabilities)
+    assert _metrics(con,"multinom_evaluate('cancel_model','cancel_data','y')")['log_loss'] == pytest.approx(np.log(2.))
