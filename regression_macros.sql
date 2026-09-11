@@ -224,6 +224,13 @@ CREATE OR REPLACE MACRO __reg_centered(v, mu, scale) AS (
 CREATE OR REPLACE MACRO __reg_center_scale(v, mu) AS (
   CASE WHEN isfinite(v-mu) THEN abs(v-mu) ELSE greatest(abs(v),abs(mu)) END
 );
+CREATE OR REPLACE MACRO __reg_mul_div(a, b, c) AS (
+  CASE WHEN a = 0 OR b = 0 THEN 0.0
+       WHEN isfinite(a*b) AND a*b != 0 THEN (a*b)/c
+       WHEN isfinite(a/c) AND a/c != 0 THEN (a/c)*b
+       WHEN isfinite(b/c) AND b/c != 0 THEN (b/c)*a
+       ELSE sign(a)*sign(b)*sign(c)*exp(ln(abs(a))+ln(abs(b))-ln(abs(c))) END
+);
 
 CREATE OR REPLACE MACRO __reg_fit(tbl, outcome, family, caller, max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1, alpha, solver) AS TABLE
 WITH RECURSIVE
@@ -520,8 +527,8 @@ __reg_cfg AS (
                            END)
            END AS step,
            -- Negative-binomial dispersion on the mean-scaled internal problem:
-           -- dividing y by its mean multiplies the effective alpha by that mean.
-           coalesce(alpha, 0.0) * (SELECT sd_y FROM __reg_ystats) AS alpha_int
+           -- dividing y by its mean adds ln(mean) to the effective log dispersion.
+           ln(alpha) + ln((SELECT sd_y FROM __reg_ystats)) AS log_alpha_int
     FROM __reg_feats f, __reg_packed p, __reg_ycheck y, __reg_namecheck nc
     WHERE y.ok AND nc.ok
 ),
@@ -584,22 +591,22 @@ __reg_irls(it, betas, move) AS (
                                               WHEN 'poisson'  THEN e.mu
                                               WHEN 'gamma'    THEN 1.0
                                               WHEN 'tweedie'  THEN pow(e.mu, 2.0 - power)
-                                              WHEN 'nbinom'   THEN e.mu / (1.0 + alpha_int * e.mu) END),
+                                              WHEN 'nbinom'   THEN __reg_nb_fit_info(ln(e.mu),log_alpha_int,l1=0 AND l2=0) END),
                                    wr := e.w * ((CASE family
                                               WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
                                               WHEN 'linear'   THEN 1.0
                                               WHEN 'poisson'  THEN e.mu
                                               WHEN 'gamma'    THEN 1.0
                                               WHEN 'tweedie'  THEN pow(e.mu, 2.0 - power)
-                                              WHEN 'nbinom'   THEN e.mu / (1.0 + alpha_int * e.mu) END) * e.linpred
+                                              WHEN 'nbinom'   THEN __reg_nb_fit_info(ln(e.mu),log_alpha_int,l1=0 AND l2=0) END) * e.linpred
                                           + (CASE family
                                               WHEN 'gamma'    THEN e.y / e.mu - 1.0
                                               WHEN 'tweedie'  THEN (e.y - e.mu) * pow(e.mu, 1.0 - power)
-                                              WHEN 'nbinom'   THEN (e.y - e.mu) / (1.0 + alpha_int * e.mu)
+                                              WHEN 'nbinom'   THEN __reg_nb_fit_score(e.y,ln(e.mu),log_alpha_int,l1=0 AND l2=0)
                                               ELSE e.y - e.mu END))
                                    )) AS res
                         FROM (
-                            SELECT g.it, g.betas, p.sumw, c.alpha_int AS alpha_int,
+                            SELECT g.it, g.betas, p.sumw, c.log_alpha_int AS log_alpha_int,
                                    list_transform(p.rows, lambda rw: struct_pack(
                                        xs := rw.xs, w := rw.w, y := rw.y,
                                        linpred := list_dot_product(rw.xs, g.betas),
@@ -724,7 +731,7 @@ __reg_gd AS (
                                       WHEN family = 'nbinom'
                                       -- NB2: r = (y - mu) / (1 + alpha*mu), mu = exp(eta);
                                       -- reduces to Poisson (y - mu) as alpha -> 0
-                                      THEN __reg_nb_score(rw.y,least(list_dot_product(rw.xs, look) + rw.o,700.0),alpha_int)
+                                      THEN __reg_nb_fit_score(rw.y,least(list_dot_product(rw.xs, look) + rw.o,700.0),log_alpha_int,l1=0 AND l2=0)
                                       ELSE rw.y - (list_dot_product(rw.xs, look) + rw.o)
                                  END,
                            hw := CASE WHEN family = 'poisson'
@@ -736,11 +743,11 @@ __reg_gd AS (
                                            + (power - 1.0) * rw.y * pow(exp(greatest(least(list_dot_product(rw.xs, look) + rw.o, 700.0), -700.0)), 1.0 - power)
                                       WHEN family = 'nbinom'
                                       -- NB Hessian weight mu(1+alpha*y)/(1+alpha*mu)^2
-                                      THEN __reg_nb_observed(rw.y,least(list_dot_product(rw.xs, look) + rw.o,700.0),alpha_int)
+                                      THEN __reg_nb_fit_observed(rw.y,least(list_dot_product(rw.xs, look) + rw.o,700.0),log_alpha_int,l1=0 AND l2=0)
                                       ELSE 0.0
                                  END)) AS res
                 FROM (
-                    SELECT g.it, g.betas, p.rows, p.n, p.sumw, c.step, c.alpha_int,
+                    SELECT g.it, g.betas, p.rows, p.n, p.sumw, c.step, c.log_alpha_int,
                            -- Nesterov lookahead point
                            list_transform(g.betas, lambda b, j:
                                b + (g.it::DOUBLE / (g.it + 3)) * (b - g.prev[j])) AS look
@@ -787,7 +794,7 @@ FROM (
     UNION ALL
     SELECT unnest(f.names),
            unnest(list_transform(f.names, lambda nm, j:
-               (CASE WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom') THEN 1.0 ELSE ys.sd_y END) * s.betas[j + 1] / f.sigmas[j]))
+               __reg_mul_div((CASE WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom') THEN 1.0 ELSE ys.sd_y END), s.betas[j + 1], f.sigmas[j])))
     FROM __reg_sol s, __reg_feats f, __reg_ystats ys
 )
 ORDER BY (feature = '(Intercept)') DESC, feature;
@@ -1032,6 +1039,25 @@ CREATE OR REPLACE MACRO __reg_nb_pearson(y, eta, alpha) AS (
 CREATE OR REPLACE MACRO __reg_nb_score(y, eta, alpha) AS (
   CASE WHEN eta >= 0 THEN (y/exp(eta)-1.0)/(exp(-eta)+alpha)
        ELSE (y-exp(eta))/(1.0+alpha*exp(eta)) END
+);
+
+-- Fitting retains log(alpha*mean(y)), even when the product is outside DOUBLE.
+-- Unpenalized fits may rescale the whole objective without changing its optimum;
+-- this keeps both gradient and information representable at large dispersion.
+CREATE OR REPLACE MACRO __reg_nb_fit_shift(logalpha, unpenalized) AS (
+  CASE WHEN unpenalized THEN greatest(logalpha,0.0) ELSE 0.0 END
+);
+CREATE OR REPLACE MACRO __reg_nb_fit_info(eta, logalpha, unpenalized) AS (
+  exp(__reg_nb_fit_shift(logalpha,unpenalized)+eta-__reg_softplus(logalpha+eta))
+);
+CREATE OR REPLACE MACRO __reg_nb_fit_score(y, eta, logalpha, unpenalized) AS (
+  CASE WHEN eta >= 0 THEN (y/exp(eta)-1.0)*__reg_nb_fit_info(eta,logalpha,unpenalized)
+       ELSE (y-exp(eta))*exp(__reg_nb_fit_shift(logalpha,unpenalized)-__reg_softplus(logalpha+eta)) END
+);
+CREATE OR REPLACE MACRO __reg_nb_fit_observed(y, eta, logalpha, unpenalized) AS (
+  exp(__reg_nb_fit_shift(logalpha,unpenalized)+eta
+      + CASE WHEN y=0 THEN 0.0 ELSE __reg_softplus(logalpha+ln(y)) END
+      - 2.0*__reg_softplus(logalpha+eta))
 );
 
 -- exp(s) * (exp(a*x)-1)/a, continuous at a=0. Expand the small
@@ -1780,14 +1806,14 @@ __reg_cv_foldsz AS (SELECT fold AS f, count(*)::DOUBLE AS sz FROM __reg_cv_yraw 
 -- per-model hyperparameters: model m = (g-1)*k + f + 1
 __reg_cv_marr AS (
   SELECT list(l2 ORDER BY m) AS ml2, list(l1 ORDER BY m) AS ml1,
-         list(pw ORDER BY m) AS mpow, list(alpi ORDER BY m) AS malp_int,
+         list(pw ORDER BY m) AS mpow, list(logalpi ORDER BY m) AS mlogalp_int,
          list(f ORDER BY m) AS mfold, list(ntrain ORDER BY m) AS mntrain, count(*)::INT AS M
   FROM (
     SELECT (g-1)*k + f + 1 AS m, f,
            CASE WHEN sweep='l2' THEN grid[g] ELSE 0.0 END AS l2,
            CASE WHEN sweep='l1' THEN grid[g] ELSE 0.0 END AS l1,
            CASE WHEN sweep='power' THEN grid[g] ELSE 1.5 END AS pw,
-           (CASE WHEN sweep='alpha' THEN grid[g] ELSE 1.0 END) * (SELECT sd_y FROM __reg_cv_ys) AS alpi,
+           ln(CASE WHEN sweep='alpha' THEN grid[g] ELSE 1.0 END) + ln((SELECT sd_y FROM __reg_cv_ys)) AS logalpi,
            (SELECT n FROM __reg_cv_n) - coalesce((SELECT sz FROM __reg_cv_foldsz z WHERE z.f=t.f),0) AS ntrain
     FROM range(1,len(grid)+1) tg(g), range(0,k) t(f)
   )
@@ -1874,8 +1900,7 @@ __reg_cv_irls(it, B, move) AS (
                           WHEN 'poisson'  THEN exp(greatest(least(l,700.0),-700.0))
                           WHEN 'gamma'    THEN 1.0
                           WHEN 'tweedie'  THEN pow(exp(greatest(least(l,700.0),-700.0)), 2.0-mpow[m])
-                          WHEN 'nbinom'   THEN exp(greatest(least(l,700.0),-700.0))
-                                             / (1.0 + malp_int[m]*exp(greatest(least(l,700.0),-700.0)))
+                          WHEN 'nbinom'   THEN __reg_nb_fit_info(greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                         END) END),
                    wr := list_transform(e.lp, lambda l, m:
                      CASE WHEN mfold[m] = e.fold THEN 0.0 ELSE
@@ -1886,22 +1911,20 @@ __reg_cv_irls(it, B, move) AS (
                           WHEN 'poisson'  THEN exp(greatest(least(l,700.0),-700.0))
                           WHEN 'gamma'    THEN 1.0
                           WHEN 'tweedie'  THEN pow(exp(greatest(least(l,700.0),-700.0)), 2.0-mpow[m])
-                          WHEN 'nbinom'   THEN exp(greatest(least(l,700.0),-700.0))
-                                             / (1.0 + malp_int[m]*exp(greatest(least(l,700.0),-700.0)))
+                          WHEN 'nbinom'   THEN __reg_nb_fit_info(greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                         END) * l
                      + (CASE family
                           WHEN 'gamma'    THEN e.yt / exp(greatest(least(l,700.0),-700.0)) - 1.0
                           WHEN 'tweedie'  THEN (e.yt - exp(greatest(least(l,700.0),-700.0)))
                                              * pow(exp(greatest(least(l,700.0),-700.0)), 1.0-mpow[m])
-                          WHEN 'nbinom'   THEN (e.yt - exp(greatest(least(l,700.0),-700.0)))
-                                             / (1.0 + malp_int[m]*exp(greatest(least(l,700.0),-700.0)))
+                          WHEN 'nbinom'   THEN __reg_nb_fit_score(e.yt,greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                           WHEN 'logistic' THEN e.yt - 1.0/(1.0+exp(-greatest(least(l,700.0),-700.0)))
                           WHEN 'linear'   THEN e.yt - l
                           WHEN 'poisson'  THEN e.yt - exp(greatest(least(l,700.0),-700.0))
                         END) END)
                  )) AS res
           FROM (
-            SELECT g.it, g.B, c.M, c.D1, ma.mfold, ma.ml2, ma.ml1, ma.mntrain, ma.mpow, ma.malp_int,
+            SELECT g.it, g.B, c.M, c.D1, ma.mfold, ma.ml2, ma.ml1, ma.mntrain, ma.mpow, ma.mlogalp_int,
                    -- one dot product per (row, model); mu is derived from it below
                    list_transform(p.rows, lambda rw: struct_pack(
                        xs := rw.xs, yt := rw.yt, fold := rw.fold,
@@ -1971,7 +1994,7 @@ __reg_cv_gd AS (
                              lambda ob: list_aggregate(ob.hw, 'max')), 'max'))
                            ELSE 1.0 END) END AS damp
         FROM (
-          SELECT it, B, look, step, mfold, ml2, ml1, mntrain, mpow, malp_int,
+          SELECT it, B, look, step, mfold, ml2, ml1, mntrain, mpow, mlogalp_int,
                  list_transform(rows, lambda rw: struct_pack(
                    xs := rw.xs, fold := rw.fold,
                    -- r = 0 for a row held out of model m's training folds, so the
@@ -1983,7 +2006,7 @@ __reg_cv_gd AS (
                            WHEN family='gamma'    THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)) - 1.0
                            WHEN family='tweedie'  THEN (rw.yt - exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)))
                                                        * pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)), 1.0 - mpow[m])
-                           WHEN family='nbinom'   THEN __reg_nb_score(rw.yt,least(list_dot_product(rw.xs,bm),700.0),malp_int[m])
+                           WHEN family='nbinom'   THEN __reg_nb_fit_score(rw.yt,least(list_dot_product(rw.xs,bm),700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                            ELSE rw.yt - list_dot_product(rw.xs,bm) END) END),
                    -- hw damps the step for the unbounded-curvature log-link families
                    -- only; for the others `damp` is the constant 1.0 and hw is never
@@ -1996,10 +2019,10 @@ __reg_cv_gd AS (
                            WHEN family='gamma'   THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0))
                            WHEN family='tweedie' THEN (2.0-mpow[m])*pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),2.0-mpow[m])
                                                      + (mpow[m]-1.0)*rw.yt*pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),1.0-mpow[m])
-                           WHEN family='nbinom'  THEN __reg_nb_observed(rw.yt,least(list_dot_product(rw.xs,bm),700.0),malp_int[m])
+                           WHEN family='nbinom'  THEN __reg_nb_fit_observed(rw.yt,least(list_dot_product(rw.xs,bm),700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                            ELSE 0.0 END) END) END)) AS res
           FROM (
-            SELECT g.it, g.B, p.rows, c.step, ma.mfold, ma.ml2, ma.ml1, ma.mntrain, ma.mpow, ma.malp_int,
+            SELECT g.it, g.B, p.rows, c.step, ma.mfold, ma.ml2, ma.ml1, ma.mntrain, ma.mpow, ma.mlogalp_int,
                    list_transform(g.B, lambda bm, m: list_transform(bm, lambda v, j:
                        v + (g.it::DOUBLE/(g.it+3)) * (v - g.prev[m][j]))) AS look
             FROM __reg_cv_gd g, __reg_cv_packed p, __reg_cv_cfg c, __reg_cv_marr ma
@@ -2157,10 +2180,10 @@ __reg_nbd_ys AS (
         FROM (SELECT *,min(y) OVER () AS ybase,max(abs(y)) OVER () AS yscale FROM __reg_nbd_yraw))
 ),
 __reg_nbd_n AS (SELECT count(*)::DOUBLE AS n FROM __reg_nbd_yraw),
--- one model per grid alpha (no folds); alpha_int = alpha * mean(y)
+-- one model per grid alpha (no folds); log_alpha_int = ln(alpha) + ln(mean(y))
 __reg_nbd_marr AS (
-  SELECT list(alpi ORDER BY g) AS malp_int, count(*)::INT AS M
-  FROM (SELECT g, alpha_grid[g] * (SELECT sd_y FROM __reg_nbd_ys) AS alpi FROM range(1,len(alpha_grid)+1) t(g))
+  SELECT list(logalpi ORDER BY g) AS mlogalp_int, count(*)::INT AS M
+  FROM (SELECT g, ln(alpha_grid[g]) + ln((SELECT sd_y FROM __reg_nbd_ys)) AS logalpi FROM range(1,len(alpha_grid)+1) t(g))
 ),
 __reg_nbd_rows AS MATERIALIZED (
   SELECT x.rid, any_value(yr.y) AS y, any_value(yr.y) / any_value(ys.sd_y) AS yt,
@@ -2189,18 +2212,18 @@ __reg_nbd_gd AS (
                lmj + step * ((list_sum(list_transform(res, lambda ob: ob.xs[j] * ob.r[m])) / n) / damp[m]))) AS newB
     FROM (
       SELECT it, B, look, step, n, res,
-             list_transform(malp_int, lambda al, m: coalesce(nullif(
+             list_transform(mlogalp_int, lambda al, m: coalesce(nullif(
                list_aggregate(list_transform(res, lambda ob: ob.hw[m]+abs(ob.r[m])), 'max'),0.0),1.0)) AS damp
       FROM (
-        SELECT it, B, look, step, n, malp_int,
+        SELECT it, B, look, step, n, mlogalp_int,
                list_transform(rows, lambda rw: struct_pack(
                  r := list_transform(look, lambda bm, m:
-                        __reg_nb_score(rw.yt,least(list_dot_product(rw.xs,bm),700.0),malp_int[m])),
+                        __reg_nb_fit_score(rw.yt,least(list_dot_product(rw.xs,bm),700.0),mlogalp_int[m],true)),
                  hw := list_transform(look, lambda bm, m:
-                        __reg_nb_observed(rw.yt,least(list_dot_product(rw.xs,bm),700.0),malp_int[m])),
+                        __reg_nb_fit_observed(rw.yt,least(list_dot_product(rw.xs,bm),700.0),mlogalp_int[m],true)),
                  xs := rw.xs)) AS res
         FROM (
-          SELECT g.it, g.B, p.rows, p.n, c.step, ma.malp_int,
+          SELECT g.it, g.B, p.rows, p.n, c.step, ma.mlogalp_int,
                  list_transform(g.B, lambda bm, m: list_transform(bm, lambda v, j:
                      v + (g.it::DOUBLE/(g.it+3)) * (v - g.prev[m][j]))) AS look
           FROM __reg_nbd_gd g, __reg_nbd_packed p, __reg_nbd_cfg c, __reg_nbd_marr ma

@@ -38,6 +38,19 @@ def test_negative_binomial_batch_curvature_preserves_exact_large_count_means(con
         assert loglik == pytest.approx(expected, abs=1e-8)
 
 
+def test_negative_binomial_batch_internal_dispersion_can_exceed_double(con):
+    con.execute('CREATE OR REPLACE TABLE large_counts AS SELECT i::DOUBLE/10 x,1e307*exp(.3*i/10) y FROM range(-10,11)t(i)')
+    con.execute("CREATE OR REPLACE TABLE exact_nb AS SELECT '(Intercept)' feature,ln(1e307) coefficient UNION ALL SELECT 'x',.3")
+    grid = '[10.,100.,1e300]'
+    scores = con.execute(f"SELECT cv_deviance FROM cv_alpha('large_counts','y',{grid},k:=3,max_iter:=1000)").fetchnumpy()['cv_deviance']
+    np.testing.assert_allclose(scores, 0.0, atol=1e-12)
+    profile = con.execute(f"SELECT * FROM nbinom_dispersion('large_counts','y',{grid},max_iter:=1000)").fetchall()
+    for alpha, loglik in profile:
+        expected = con.execute(f"SELECT loglik FROM nbinom_evaluate('exact_nb','large_counts','y',alpha:={alpha})").fetchone()[0]
+        assert np.isfinite(loglik)
+        assert loglik == pytest.approx(expected, abs=1e-8)
+
+
 @pytest.mark.parametrize("scales", [[1, 1, 1], [1e-6, 1e3, 1e6]])
 def test_matrix_inverse_rejects_general_dependency_at_any_scale(con, scales):
     matrix = np.array([[1., 2., 3.], [2., 5., 7.], [3., 7., 10.]])

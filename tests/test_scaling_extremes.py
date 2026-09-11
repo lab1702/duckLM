@@ -35,6 +35,51 @@ def test_tiny_log_link_outcomes_keep_positive_mean_scaling(con, family, scale):
     assert coefficients['(Intercept)'] == pytest.approx(.2+np.log(scale), abs=1e-9)
 
 
+@pytest.mark.parametrize('solver', ['auto', 'irls', 'gd'])
+def test_linear_back_transform_preserves_finite_coefficients_when_product_overflows(con, solver):
+    con.execute('CREATE TABLE large_response AS SELECT * FROM (VALUES (-40.,-50.,1e308),(-20.,-10.,-1e308),(0.,-10.,1e308),(20.,30.,-1e308),(40.,30.,1e308))t(x,z,y)')
+    coefficients = dict(con.execute(f"SELECT * FROM linreg_fit('large_response','y',solver:='{solver}')").fetchall())
+    assert np.isfinite(list(coefficients.values())).all()
+    assert coefficients['x']/1e307 == pytest.approx(1.0, abs=1e-8)
+    assert coefficients['z']/1e307 == pytest.approx(-1.0, abs=1e-8)
+    assert abs(coefficients['(Intercept)']/1e308) < 1e-8
+
+
+@pytest.mark.parametrize('alpha', [100., 1e300])
+@pytest.mark.parametrize('solver', ['auto', 'irls', 'gd'])
+@pytest.mark.parametrize('weighted_offset', [False, True])
+def test_negative_binomial_internal_dispersion_can_exceed_double(con, alpha, solver, weighted_offset):
+    expo = '.1*(i%3)' if weighted_offset else '0.0'
+    weight = '1.0+(i+10)%3' if weighted_offset else '1.0'
+    con.execute(f'CREATE TABLE large_nb AS SELECT i::DOUBLE/10 x,1e307*exp(.3*i/10+({expo})) y,({expo})::DOUBLE expo,({weight})::DOUBLE wt FROM range(-10,11)t(i)')
+    coefficients = dict(con.execute(f"SELECT * FROM nbinom_fit('large_nb','y',alpha:={alpha},solver:='{solver}',offset_col:='expo',weights_col:='wt',max_iter:=1000)").fetchall())
+    assert np.isfinite(list(coefficients.values())).all()
+    assert coefficients['x'] == pytest.approx(.3, abs=1e-8)
+    assert coefficients['(Intercept)'] == pytest.approx(np.log(1e307), abs=1e-8)
+
+
+def test_negative_binomial_log_dispersion_preserves_ridge_strength(con):
+    from scipy.optimize import minimize
+    x = np.arange(-10, 11)/10
+    y = 1e307*np.exp(.3*x)
+    mean_y = y[0]+np.mean(y-y[0])
+    design = np.column_stack([np.ones(len(x)), (x-x.mean())/x.std()])
+    scaled_y = y/mean_y
+    # Large-dispersion NB has the Gamma mean objective divided by alpha*mean(y).
+    penalty = (1e-310*100)*mean_y
+    def objective(beta):
+        eta = design@beta
+        return np.mean(scaled_y*np.exp(-eta)+eta)+penalty*beta[1]**2/2
+    def gradient(beta):
+        return design.T@(1-scaled_y*np.exp(-design@beta))/len(x)+[0, penalty*beta[1]]
+    reference = minimize(objective, [0., 0.], jac=gradient, method='BFGS', tol=1e-12).x
+    assert np.max(np.abs(gradient(reference))) < 1e-9
+    con.execute('CREATE TABLE large_nb AS SELECT i::DOUBLE/10 x,1e307*exp(.3*i/10) y FROM range(-10,11)t(i)')
+    coefficients = dict(con.execute("SELECT * FROM nbinom_fit('large_nb','y',alpha:=100,l2:=1e-310,max_iter:=5000)").fetchall())
+    assert coefficients['x'] == pytest.approx(reference[1]/x.std(), abs=1e-8)
+    assert coefficients['(Intercept)'] == pytest.approx(np.log(mean_y)+reference[0]-reference[1]*x.mean()/x.std(), abs=1e-8)
+
+
 @pytest.mark.parametrize('scale', [1e-170,1e170])
 @pytest.mark.parametrize('family', ['linreg','logit','poisson','gamma','tweedie','nbinom'])
 @pytest.mark.parametrize('weighted', [False,True])
