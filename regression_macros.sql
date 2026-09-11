@@ -446,8 +446,8 @@ __reg_cfg AS (
                THEN error(caller || ': weights must be non-negative')
              WHEN weights_col IS NOT NULL AND (SELECT coalesce(sum(w), 0) FROM __reg_w) <= 0
                THEN error(caller || ': sample weights sum to zero')
-             WHEN l2 < 0 THEN error(caller || ': l2 must be >= 0, got ' || l2)
-             WHEN l1 < 0 THEN error(caller || ': l1 must be >= 0, got ' || l1)
+             WHEN l2 IS NULL OR NOT isfinite(l2) OR l2 < 0 THEN error(caller || ': l2 must be >= 0 and finite')
+             WHEN l1 IS NULL OR NOT isfinite(l1) OR l1 < 0 THEN error(caller || ': l1 must be >= 0 and finite')
              WHEN solver NOT IN ('gd', 'irls', 'auto')
                THEN error(caller || ': solver must be ''auto'', ''gd'' or ''irls'', got ''' || solver || '''')
              -- Guaranteed-convergent steps: on standardized data the mean-loss
@@ -1049,7 +1049,7 @@ __reg_agg AS (
            sum(((y - yhat) / yhat) * ((y - yhat) / yhat)) AS pearson_gam,
            -- Tweedie unit half-deviance and Pearson chi-square (power = p).
            sum(__reg_tw_halfdev(y,z,power)) AS dev_tw_half,
-           sum((y - yhat) * (y - yhat) / pow(yhat, power)) AS pearson_tw,
+           sum(pow((y-yhat)/yhat * pow(yhat,1.0-power/2.0),2)) AS pearson_tw,
            -- Negative binomial (NB2, r = 1/alpha): log-likelihood, half-deviance,
            -- and Pearson chi-square (variance = mu + alpha*mu^2).
            sum(__reg_nb_ll(y,z,alpha)) AS ll_nb,
@@ -1358,8 +1358,8 @@ __reg_mchk AS (
       THEN error('multinom_fit: outcome column "' || outcome || '" must have at least 2 distinct classes')
     WHEN (SELECT d FROM __reg_mfeats) = 0
       THEN error('multinom_fit: no feature columns besides the outcome')
-    WHEN l2 < 0 THEN error('multinom_fit: l2 must be >= 0, got ' || l2)
-    WHEN l1 < 0 THEN error('multinom_fit: l1 must be >= 0, got ' || l1)
+    WHEN l2 IS NULL OR NOT isfinite(l2) OR l2 < 0 THEN error('multinom_fit: l2 must be >= 0 and finite')
+    WHEN l1 IS NULL OR NOT isfinite(l1) OR l1 < 0 THEN error('multinom_fit: l1 must be >= 0 and finite')
     ELSE true END AS ok
 ),
 __reg_mpacked AS MATERIALIZED (
@@ -2432,8 +2432,8 @@ __reg_rww AS (
                    WHEN 'logistic' THEN pow(__reg_logit_pearson(r.y,r.eta),2)
                    WHEN 'linear'   THEN (r.y-mu)*(r.y-mu)
                    WHEN 'poisson'  THEN (r.y-mu)*(r.y-mu)/mu
-                   WHEN 'gamma'    THEN (r.y-mu)*(r.y-mu)/(mu*mu)
-                   WHEN 'tweedie'  THEN (r.y-mu)*(r.y-mu)/pow(mu, power)
+                   WHEN 'gamma'    THEN pow((r.y-mu)/mu,2)
+                   WHEN 'tweedie'  THEN pow((r.y-mu)/mu * pow(mu,1.0-power/2.0),2)
                    WHEN 'nbinom'   THEN (r.y-mu)*(r.y-mu)/(mu*(1.0+alpha*mu)) END) AS pearson
   FROM (
     -- eta clamped to [-700, 700] (as the fit does) so mu = exp(eta) never overflows
@@ -2723,7 +2723,8 @@ __reg_rww AS (
                    WHEN 'tweedie' THEN pow(mu, 2.0-power) WHEN 'nbinom' THEN mu/(1.0+alpha*mu) END) AS w,
          r.wt * (CASE family WHEN 'logistic' THEN pow(__reg_logit_pearson(r.y,r.eta),2)
                    WHEN 'linear' THEN (r.y-mu)*(r.y-mu) WHEN 'poisson' THEN (r.y-mu)*(r.y-mu)/mu
-                   WHEN 'gamma' THEN (r.y-mu)*(r.y-mu)/(mu*mu) WHEN 'tweedie' THEN (r.y-mu)*(r.y-mu)/pow(mu,power)
+                   WHEN 'gamma' THEN pow((r.y-mu)/mu,2)
+                   WHEN 'tweedie' THEN pow((r.y-mu)/mu * pow(mu,1.0-power/2.0),2)
                    WHEN 'nbinom' THEN (r.y-mu)*(r.y-mu)/(mu*(1.0+alpha*mu)) END) AS pearson
   FROM (SELECT xs, y, wt, eta, CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                             WHEN 'linear' THEN eta ELSE exp(greatest(-700.0,least(eta,700.0))) END AS mu
@@ -2944,13 +2945,18 @@ __reg_lev AS (
 ),
 __reg_disp AS (
   SELECT CASE WHEN family IN ('linear','gamma','tweedie')
-              THEN (SELECT sum(wt*resid*resid/Vmu) FROM __reg_pr) / nullif((SELECT n-d FROM __reg_dims), 0) ELSE 1.0 END AS phi,
+              THEN (SELECT sum(wt * CASE family
+                     WHEN 'gamma' THEN pow(resid/mu,2)
+                     WHEN 'tweedie' THEN pow(resid/mu * pow(mu,1.0-power/2.0),2)
+                     ELSE resid*resid/Vmu END) FROM __reg_pr) / nullif((SELECT n-d FROM __reg_dims), 0) ELSE 1.0 END AS phi,
          (SELECT d FROM __reg_dims) AS d
 ),
 __reg_diag AS (
   SELECT p.__reg_rid__,
          CASE WHEN isfinite(l.h) THEN l.h ELSE NULL END AS hat,  -- NULL (not NaN) on singular bread
          CASE WHEN family = 'logistic' THEN sqrt(p.wt)*__reg_logit_pearson(p.y,p.eta)
+              WHEN family = 'gamma' THEN sqrt(p.wt)*(p.resid/p.mu)
+              WHEN family = 'tweedie' THEN sqrt(p.wt)*(p.resid/p.mu)*pow(p.mu,1.0-power/2.0)
               ELSE p.resid * sqrt(p.wt) / sqrt(p.Vmu) END AS pearson_resid,
          CASE WHEN family = 'logistic' THEN sqrt(p.wt)*__reg_logit_devres(p.y,p.eta)
               ELSE sign(p.resid) * sqrt(p.wt * greatest(p.udev, 0.0)) END AS deviance_resid,
@@ -2958,7 +2964,7 @@ __reg_diag AS (
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN
               CASE WHEN family = 'logistic'
                    THEN p.wt*p.wt*p.resid*p.resid*l.xax / (dp.d*(1.0-l.h)*(1.0-l.h))
-                   ELSE (p.resid*p.resid*p.wt/p.Vmu/dp.phi) * l.h / (dp.d*(1.0-l.h)*(1.0-l.h)) END END AS cooks_distance
+                   ELSE (pearson_resid*pearson_resid/dp.phi) * l.h / (dp.d*(1.0-l.h)*(1.0-l.h)) END END AS cooks_distance
   FROM __reg_pr p JOIN __reg_lev l ON l.__reg_rid__ = p.__reg_rid__ CROSS JOIN __reg_disp dp
 )
 SELECT n.* EXCLUDE (__reg_rid__), d.hat, d.pearson_resid, d.deviance_resid, d.std_resid, d.cooks_distance

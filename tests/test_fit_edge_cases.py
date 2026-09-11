@@ -168,3 +168,13 @@ def test_fit_accepts_shared_outcome_offset_and_weight_columns(con, family, offse
     actual = dict(con.execute(f"SELECT * FROM {family}_fit('shared_roles','y',offset_col:='{offset_col}',weights_col:='{weights_col}')").fetchall())
     expected = dict(con.execute(f"SELECT * FROM {family}_fit('separate_roles','y',offset_col:='offset_value',weights_col:='wt')").fetchall())
     assert actual == pytest.approx(expected, rel=1e-8, abs=1e-8)
+
+
+@pytest.mark.parametrize('family', ['linreg','logit','poisson','gamma','tweedie','nbinom','multinom'])
+@pytest.mark.parametrize('penalty', ['l1','l2'])
+@pytest.mark.parametrize('value', ['NULL',"'NaN'::DOUBLE","'Infinity'::DOUBLE"])
+def test_fit_rejects_missing_and_nonfinite_penalties(con,family,penalty,value):
+    outcome='i%2' if family=='logit' else '1.0+2*i'
+    con.execute(f'CREATE OR REPLACE TABLE penalty_data AS SELECT i::DOUBLE x,{outcome} y FROM range(6)t(i)')
+    with pytest.raises(duckdb.Error,match=penalty+' must be.*finite'):
+        con.execute(f"SELECT * FROM {family}_fit('penalty_data','y',{penalty}:={value})").fetchall()

@@ -428,3 +428,26 @@ def test_logistic_influence_retains_tiny_correct_prediction_residuals(con,eta):
     sign=1 if eta>0 else -1
     expected=sign*np.exp(-abs(eta)/2)
     np.testing.assert_allclose(actual,[expected,np.sqrt(2)*expected],rtol=1e-12,atol=0)
+
+
+@pytest.mark.parametrize('scale', [1e-170,1e170])
+@pytest.mark.parametrize('family', ['gamma','tweedie'])
+def test_gamma_inference_is_invariant_to_outcome_scale(con,scale,family):
+    extra=',power:=2.0' if family=='tweedie' else ''
+    con.execute('CREATE TABLE base_gamma AS SELECT (i%5)::DOUBLE x,(1+i%7)::DOUBLE y FROM range(30)t(i)')
+    con.execute(f'CREATE TABLE scaled_gamma AS SELECT x,y*{scale} y FROM base_gamma')
+    results=[]
+    for table in ['base_gamma','scaled_gamma']:
+        con.execute(f"CREATE OR REPLACE TABLE gamma_model AS SELECT * FROM {family}_fit('{table}','y'{extra})")
+        summary=con.execute(f"SELECT std_error,conf_low-coefficient,conf_high-coefficient FROM {family}_summary('gamma_model','{table}','y'{extra})").fetchnumpy()
+        ci=con.execute(f"SELECT prediction,conf_low,conf_high FROM {family}_predict_ci('gamma_model','{table}','y'{extra})").fetchnumpy()
+        influence=con.execute(f"SELECT hat,pearson_resid,deviance_resid,std_resid,cooks_distance FROM {family}_influence('gamma_model','{table}','y'{extra})").fetchnumpy()
+        evaluation=con.execute(f"SELECT dispersion FROM {family}_evaluate('gamma_model','{table}','y'{extra})").fetchnumpy()
+        results.append((summary,ci,influence,evaluation))
+    for kind in range(4):
+        for key,expected in results[0][kind].items():
+            actual=results[1][kind][key]
+            assert not np.ma.is_masked(actual)
+            if kind==1:
+                actual=actual/scale
+            np.testing.assert_allclose(actual,expected,rtol=1e-8,atol=1e-10)
