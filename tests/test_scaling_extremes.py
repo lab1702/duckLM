@@ -44,7 +44,7 @@ def test_linear_fit_preserves_extreme_outcome_units(con,scale,weighted):
     assert {key:value/scale for key,value in models[1].items()}==pytest.approx(models[0],rel=1e-7,abs=1e-8)
 
 
-@pytest.mark.parametrize('scale', [1e-170,1e170])
+@pytest.mark.parametrize('scale', [1e-170,1e170,1e308])
 def test_multinomial_fit_preserves_extreme_feature_units(con,scale):
     con.execute('CREATE TABLE base AS SELECT i/10.0 x,(i%3)::VARCHAR y FROM range(15)t(i)')
     con.execute(f'CREATE TABLE scaled AS SELECT * REPLACE(x*{scale} AS x) FROM base')
@@ -56,7 +56,7 @@ def test_multinomial_fit_preserves_extreme_feature_units(con,scale):
     assert actual==pytest.approx(models[0],rel=1e-7,abs=1e-8)
 
 
-@pytest.mark.parametrize('scale', [1e-170,1e170])
+@pytest.mark.parametrize('scale', [1e-170,1e170,1e308])
 @pytest.mark.parametrize('family', ['linear','logistic','poisson','gamma','tweedie','nbinom'])
 def test_cv_preserves_extreme_feature_units(con,scale,family):
     outcome='i%2' if family=='logistic' else '1.0+i/10.0'
@@ -69,7 +69,7 @@ def test_cv_preserves_extreme_feature_units(con,scale,family):
     assert scores[1]==pytest.approx(scores[0],rel=1e-7,abs=1e-9)
 
 
-@pytest.mark.parametrize('scale', [1e-170,1e170])
+@pytest.mark.parametrize('scale', [1e-170,1e170,1e308])
 def test_dispersion_profile_preserves_extreme_feature_units(con,scale):
     con.execute('CREATE TABLE base AS SELECT i/10.0 x,1.0+i%3 y FROM range(12)t(i)')
     con.execute(f'CREATE TABLE scaled AS SELECT * REPLACE(x*{scale} AS x) FROM base')
@@ -89,3 +89,35 @@ def test_fits_preserve_a_common_finite_weight_scale(con,scale,family):
     for table in ['base','scaled']:
         models.append(dict(con.execute(f"SELECT * FROM {family}_fit('{table}','y',weights_col:='wt',l2:=.1,max_iter:=300)").fetchall()))
     assert models[1]==pytest.approx(models[0],rel=1e-7,abs=1e-8)
+
+
+@pytest.mark.parametrize('weighted', [False, True])
+def test_linear_fit_handles_finite_observations_whose_sum_overflows(con, weighted):
+    weight = ',(i+1)/4.0 w' if weighted else ''
+    argument = ",weights_col:='w'" if weighted else ''
+    con.execute(f'CREATE TABLE huge_features AS SELECT (1.0+i/10.0)*1e308 x,1.0+i y{weight} FROM range(4)t(i)')
+    coefficients = dict(con.execute(f"SELECT * FROM linreg_fit('huge_features','y'{argument})").fetchall())
+    assert coefficients['(Intercept)'] == pytest.approx(-9.0, abs=1e-10)
+    assert coefficients['x'] * 1e308 == pytest.approx(10.0, abs=1e-10)
+
+    con.execute(f'CREATE TABLE huge_outcomes AS SELECT i::DOUBLE x,1e308 y{weight} FROM range(4)t(i)')
+    coefficients = dict(con.execute(f"SELECT * FROM linreg_fit('huge_outcomes','y'{argument})").fetchall())
+    assert coefficients['(Intercept)'] == 1e308
+    assert coefficients['x'] == 0.0
+
+    con.execute('UPDATE huge_outcomes SET y=(1.0+x/10.0)*1e308')
+    coefficients = dict(con.execute(f"SELECT * FROM linreg_fit('huge_outcomes','y'{argument})").fetchall())
+    assert coefficients['(Intercept)'] / 1e308 == pytest.approx(1.0, abs=1e-10)
+    assert coefficients['x'] / 1e307 == pytest.approx(1.0, abs=1e-10)
+
+
+def test_batch_outcome_means_remain_finite_when_sum_overflows(con):
+    con.execute('CREATE TABLE huge_outcomes AS SELECT i::DOUBLE x,1e308 y FROM range(6)t(i)')
+    score = con.execute("SELECT cv_deviance FROM cv_l2('huge_outcomes','y','linear',[.1],k:=3)").fetchone()[0]
+    assert score == 0.0
+    loglik = con.execute("SELECT loglik FROM nbinom_dispersion('huge_outcomes','y',[1e-308])").fetchone()[0]
+    # At this enormous count the NB2 density at its mean agrees with its
+    # local normal approximation beyond double precision; variance is 2*y.
+    expected = -3 * (np.log(2*np.pi) + np.log(1e308) + np.log(2.0))
+    assert np.isfinite(loglik)
+    assert loglik == pytest.approx(expected, abs=1e-9)

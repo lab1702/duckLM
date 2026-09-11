@@ -328,22 +328,29 @@ __reg_w AS MATERIALIZED (
     FROM __reg_wraw
     CROSS JOIN (SELECT coalesce(max(w) FILTER (WHERE w > 0 AND isfinite(w)),1.0) AS wscale FROM __reg_wraw)
 ),
+-- Center the mean accumulation to preserve small spreads around large means.
+-- Retain a scale for observations whose centered sum can still overflow.
+__reg_moments AS MATERIALIZED (
+    SELECT s.col, s.v, w.w, min(s.v) OVER (PARTITION BY s.col) AS vbase,
+           max(abs(s.v)) OVER (PARTITION BY s.col) AS vscale
+    FROM __reg_clong s JOIN __reg_w w ON w.rid = s.rid
+    WHERE w.w > 0
+),
 -- Standardization uses positive-weight complete rows. Center the observations
 -- before squaring: E[x^2] - E[x]^2 loses the variance when a feature has a
 -- large mean and a small spread. Zero-weight rows cannot change whether a
 -- feature is constant, nor its centering value.
 __reg_means AS MATERIALIZED (
-    SELECT s.col,
-           CASE WHEN min(s.v) FILTER (WHERE w.w > 0) = max(s.v) FILTER (WHERE w.w > 0)
-                  THEN min(s.v) FILTER (WHERE w.w > 0)
-                ELSE sum(w.w * s.v) FILTER (WHERE w.w > 0)
-                     / sum(w.w) FILTER (WHERE w.w > 0) END AS mu,
-           min(s.v) FILTER (WHERE w.w > 0) = max(s.v) FILTER (WHERE w.w > 0) AS constant
-    FROM __reg_clong s JOIN __reg_w w ON w.rid = s.rid
-    WHERE s.col != outcome
-      AND s.col != coalesce(offset_col, '')
-      AND s.col != coalesce(weights_col, '')
-    GROUP BY s.col
+    SELECT col,
+           CASE WHEN min(v) = max(v) THEN min(v)
+                WHEN isfinite(sum(w*(v-vbase))) THEN min(vbase)+sum(w*(v-vbase))/sum(w)
+                ELSE max(vscale)*(sum(w*(v/nullif(vscale,0.0)))/sum(w)) END AS mu,
+           min(v) = max(v) AS constant
+    FROM __reg_moments
+    WHERE col != outcome
+      AND col != coalesce(offset_col, '')
+      AND col != coalesce(weights_col, '')
+    GROUP BY col
 ),
 -- Scale centered deviations before squaring so finite extreme units do not
 -- overflow or underflow the variance calculation.
@@ -379,9 +386,10 @@ __reg_feats AS MATERIALIZED (
 -- in the back-transform below) and makes the optimizer start at fitted means
 -- ~= 1 from the zero initialization.
 __reg_ymean AS (
-    SELECT sum(w.w * s.v) / sum(w.w) AS mu
-    FROM __reg_clong s JOIN __reg_w w ON w.rid = s.rid
-    WHERE s.col = outcome AND w.w > 0
+    SELECT CASE WHEN min(v) = max(v) THEN min(v)
+                WHEN isfinite(sum(w*(v-vbase))) THEN min(vbase)+sum(w*(v-vbase))/sum(w)
+                ELSE max(vscale)*(sum(w*(v/nullif(vscale,0.0)))/sum(w)) END AS mu
+    FROM __reg_moments WHERE col = outcome
 ),
 __reg_ycenter AS (
     SELECT m.mu, s.v-m.mu AS delta, w.w,
@@ -479,6 +487,8 @@ __reg_cfg AS (
                                 AND colname NOT IN (SELECT colname FROM __reg_featcols))
                           || '; drop them (e.g. SELECT * EXCLUDE (...)) or fill them')
              WHEN p.n = 0 THEN error(caller || ': no complete (non-NULL) rows to train on')
+             WHEN weights_col IS NOT NULL AND EXISTS (SELECT 1 FROM __reg_wraw WHERE NOT isfinite(w))
+               THEN error(caller || ': weights must be finite')
              WHEN weights_col IS NOT NULL AND (SELECT min(w) FROM __reg_w) < 0
                THEN error(caller || ': weights must be non-negative')
              WHEN weights_col IS NOT NULL AND (SELECT coalesce(sum(w), 0) FROM __reg_w) <= 0
@@ -1402,7 +1412,11 @@ __reg_mstats AS MATERIALIZED (
          CASE WHEN min(v) = max(v) THEN 1.0
               ELSE max(scale)*sqrt(avg(pow((v-mu_raw)/nullif(scale,0.0),2))) END AS sigma
   FROM (SELECT *,max(abs(v-mu_raw)) OVER (PARTITION BY col) AS scale
-        FROM (SELECT *,avg(v) OVER (PARTITION BY col) AS mu_raw FROM __reg_mflong))
+        FROM (SELECT *,CASE WHEN isfinite(avg(v-vbase) OVER (PARTITION BY col))
+                            THEN vbase+avg(v-vbase) OVER (PARTITION BY col)
+                            ELSE vscale*avg(v/nullif(vscale,0.0)) OVER (PARTITION BY col) END AS mu_raw
+              FROM (SELECT *,min(v) OVER (PARTITION BY col) AS vbase,
+                             max(abs(v)) OVER (PARTITION BY col) AS vscale FROM __reg_mflong)))
   GROUP BY col
 ),
 __reg_mfeats AS MATERIALIZED (
@@ -1698,7 +1712,11 @@ __reg_cv_stats AS MATERIALIZED (
          CASE WHEN min(v)=max(v) THEN 1.0
               ELSE max(scale)*sqrt(avg(pow((v-mu_raw)/nullif(scale,0.0),2))) END AS sigma
   FROM (SELECT *,max(abs(v-mu_raw)) OVER (PARTITION BY col) AS scale
-        FROM (SELECT *,avg(v) OVER (PARTITION BY col) AS mu_raw FROM __reg_cv_flong))
+        FROM (SELECT *,CASE WHEN isfinite(avg(v-vbase) OVER (PARTITION BY col))
+                            THEN vbase+avg(v-vbase) OVER (PARTITION BY col)
+                            ELSE vscale*avg(v/nullif(vscale,0.0)) OVER (PARTITION BY col) END AS mu_raw
+              FROM (SELECT *,min(v) OVER (PARTITION BY col) AS vbase,
+                             max(abs(v)) OVER (PARTITION BY col) AS vscale FROM __reg_cv_flong)))
   GROUP BY col
 ),
 __reg_cv_feats AS MATERIALIZED (SELECT count(*)::INT AS d FROM __reg_cv_stats),
@@ -1707,9 +1725,12 @@ __reg_cv_ys AS (
          CASE WHEN family='logistic' THEN 1.0
               WHEN family IN ('poisson','gamma','tweedie','nbinom') THEN (CASE WHEN mu<1e-300 THEN 1.0 ELSE mu END)
               WHEN coalesce(sd,0)<1e-300 THEN 1.0 ELSE sd END AS sd_y
-  FROM (SELECT avg(y) AS mu,max(scale)*sqrt(avg(pow((y-mu_raw)/nullif(scale,0.0),2))) AS sd
+  FROM (SELECT any_value(mu_raw) AS mu,max(scale)*sqrt(avg(pow((y-mu_raw)/nullif(scale,0.0),2))) AS sd
         FROM (SELECT *,max(abs(y-mu_raw)) OVER () AS scale
-              FROM (SELECT *,avg(y) OVER () AS mu_raw FROM __reg_cv_yraw)))
+              FROM (SELECT *,CASE WHEN isfinite(avg(y-ybase) OVER ())
+                                  THEN ybase+avg(y-ybase) OVER ()
+                                  ELSE yscale*avg(y/nullif(yscale,0.0)) OVER () END AS mu_raw
+                    FROM (SELECT *,min(y) OVER () AS ybase,max(abs(y)) OVER () AS yscale FROM __reg_cv_yraw))))
 ),
 __reg_cv_n AS (SELECT count(*)::DOUBLE AS n FROM __reg_cv_yraw),
 __reg_cv_foldsz AS (SELECT fold AS f, count(*)::DOUBLE AS sz FROM __reg_cv_yraw GROUP BY fold),
@@ -2073,11 +2094,20 @@ __reg_nbd_stats AS MATERIALIZED (
          CASE WHEN min(v)=max(v) THEN 1.0
               ELSE max(scale)*sqrt(avg(pow((v-mu_raw)/nullif(scale,0.0),2))) END AS sigma
   FROM (SELECT *,max(abs(v-mu_raw)) OVER (PARTITION BY col) AS scale
-        FROM (SELECT *,avg(v) OVER (PARTITION BY col) AS mu_raw FROM __reg_nbd_flong))
+        FROM (SELECT *,CASE WHEN isfinite(avg(v-vbase) OVER (PARTITION BY col))
+                            THEN vbase+avg(v-vbase) OVER (PARTITION BY col)
+                            ELSE vscale*avg(v/nullif(vscale,0.0)) OVER (PARTITION BY col) END AS mu_raw
+              FROM (SELECT *,min(v) OVER (PARTITION BY col) AS vbase,
+                             max(abs(v)) OVER (PARTITION BY col) AS vscale FROM __reg_nbd_flong)))
   GROUP BY col
 ),
 __reg_nbd_feats AS MATERIALIZED (SELECT count(*)::INT AS d FROM __reg_nbd_stats),
-__reg_nbd_ys AS (SELECT CASE WHEN avg(y)<1e-300 THEN 1.0 ELSE avg(y) END AS sd_y FROM __reg_nbd_yraw),
+__reg_nbd_ys AS (
+  SELECT CASE WHEN mu<1e-300 THEN 1.0 ELSE mu END AS sd_y
+  FROM (SELECT CASE WHEN isfinite(avg(y-ybase)) THEN min(ybase)+avg(y-ybase)
+                    ELSE max(yscale)*avg(y/nullif(yscale,0.0)) END AS mu
+        FROM (SELECT *,min(y) OVER () AS ybase,max(abs(y)) OVER () AS yscale FROM __reg_nbd_yraw))
+),
 __reg_nbd_n AS (SELECT count(*)::DOUBLE AS n FROM __reg_nbd_yraw),
 -- one model per grid alpha (no folds); alpha_int = alpha * mean(y)
 __reg_nbd_marr AS (
@@ -2534,7 +2564,12 @@ __reg_feat AS (
 __reg_rows0 AS (
   SELECT f.__reg_rid__, f.xs, y.y,
          CASE WHEN offset_col IS NULL THEN 0.0 ELSE o.o END AS off,
-         CASE WHEN weights_col IS NULL THEN 1.0 ELSE w.wt END AS wt
+         -- Sandwich covariance is invariant to a common weight scale. Remove
+         -- it before both the bread and score products can overflow/underflow.
+         CASE WHEN weights_col IS NULL THEN 1.0
+              WHEN robust != 'none' OR cluster_col IS NOT NULL
+                THEN w.wt / nullif(max(w.wt) OVER (),0.0)
+              ELSE w.wt END AS wt
   FROM __reg_feat f
   JOIN __reg_yv y ON y.__reg_rid__ = f.__reg_rid__
   LEFT JOIN __reg_ov o ON o.__reg_rid__ = f.__reg_rid__

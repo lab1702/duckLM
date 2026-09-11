@@ -204,3 +204,17 @@ def test_zero_weight_outlier_does_not_limit_irls_steps(con,family):
     expected=dict(con.execute(call).fetchall())
     con.execute('INSERT INTO weighted_offsets VALUES (1e100,1.,-40.,0.)')
     assert dict(con.execute(call).fetchall())==pytest.approx(expected,rel=1e-10,abs=1e-10)
+
+
+@pytest.mark.parametrize('family', ['linreg', 'logit', 'poisson', 'gamma', 'tweedie', 'nbinom'])
+@pytest.mark.parametrize('weight', ['NaN', 'Infinity', '-Infinity'])
+def test_fit_rejects_nonfinite_sample_weights(con, family, weight):
+    outcome = 'i%2' if family == 'logit' else '1.0+i'
+    con.execute(f"""
+        CREATE OR REPLACE TABLE invalid_weights AS
+        SELECT i::DOUBLE x, {outcome} y,
+               CASE WHEN i=1 THEN '{weight}'::DOUBLE ELSE 1.0 END w
+        FROM range(8)t(i)
+    """)
+    with pytest.raises(duckdb.Error, match='weights must be finite'):
+        con.execute(f"SELECT * FROM {family}_fit('invalid_weights', 'y', weights_col:='w', max_iter:=3)").fetchall()

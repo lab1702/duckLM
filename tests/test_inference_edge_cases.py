@@ -131,11 +131,34 @@ def test_analytic_weight_robust_covariance_matches_sandwich(con, robust, zero_we
     if robust == "hc1":
         cov *= len(data) / (len(data) - x.shape[1])
     expected = np.sqrt(np.diag(cov))
-    for scale in [1.0, 7.0]:
+    for scale in [1.0, 7.0, 1e160, 1e-170]:
         load(con, "edge_train", data.assign(w=a * scale))
         actual = con.execute(f"SELECT std_error FROM poisson_summary('edge_model', 'edge_train', 'y', weights_col := 'w', robust := '{robust}')").df()["std_error"].to_numpy()
         assert np.isfinite(actual).all()
         np.testing.assert_allclose(actual, expected, rtol=1e-10)
+
+
+@pytest.mark.parametrize('family', ['linreg', 'logit', 'poisson', 'gamma', 'tweedie', 'nbinom'])
+@pytest.mark.parametrize('robust', ['hc0', 'hc1', 'hc2', 'hc3', 'cluster'])
+def test_robust_summary_preserves_extreme_common_weight_scale(con, family, robust):
+    model(con)
+    data = training().assign(w=np.linspace(0.25, 1.0, 48), grp=np.resize(np.arange(4), 48))
+    if family == 'logit':
+        data['y'] = (data['y'] > 1).astype(float)
+    elif family in ['gamma', 'tweedie']:
+        data['y'] += 0.2
+    extra = "cluster_col:='grp'" if robust == 'cluster' else f"robust:='{robust}'"
+    values = []
+    for scale in [1.0, 1e308, 1e-308]:
+        load(con, 'edge_train', data.assign(w=data.w * scale))
+        result = con.execute(f"""
+            SELECT std_error FROM {family}_summary(
+                'edge_model', 'edge_train', 'y', weights_col:='w', {extra})
+        """).fetchnumpy()['std_error']
+        assert not np.ma.getmaskarray(result).any()
+        assert np.isfinite(result).all()
+        values.append(result)
+    np.testing.assert_allclose(values[1:], np.tile(values[0], (2, 1)), rtol=1e-10)
 
 
 @pytest.mark.parametrize("power, family", [(1.0, "poisson"), (2.0, "gamma")])
