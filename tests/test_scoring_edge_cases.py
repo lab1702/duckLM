@@ -490,3 +490,26 @@ def test_large_count_poisson_likelihood_retains_normalization(con,mean,relative_
     assert metrics['loglik']==pytest.approx(expected,rel=1e-7,abs=1e-10)
     assert metrics['aic']==pytest.approx(-2*expected+2,rel=1e-7,abs=1e-10)
     assert metrics['bic']==pytest.approx(-2*expected,rel=1e-7,abs=1e-10)
+
+
+@pytest.mark.parametrize('call', ['predict','evaluate'])
+@pytest.mark.parametrize('column', ['__reg_rid__','__REG_RID__','__reg_extra'])
+@pytest.mark.parametrize('n', [0,2])
+def test_multinomial_scoring_rejects_reserved_columns(con,call,column,n):
+    con.execute("CREATE TABLE model AS SELECT * FROM (VALUES ('a','(Intercept)',0.),('b','(Intercept)',0.))t(class,feature,coefficient)")
+    con.execute(f'CREATE TABLE observations AS SELECT i x,\'a\' y,42 "{column}" FROM range({n})t(i)')
+    outcome=",'y'" if call=='evaluate' else ''
+    with pytest.raises(duckdb.Error,match='column names beginning with.*__reg_.*reserved'):
+        con.execute(f"SELECT * FROM multinom_{call}('model','observations'{outcome})").fetchall()
+
+
+@pytest.mark.parametrize('call', ['predict','evaluate'])
+@pytest.mark.parametrize('reserved_table', ['model','observations'])
+def test_multinomial_scoring_rejects_reserved_tables(con,call,reserved_table):
+    model='__REG_model' if reserved_table=='model' else 'model'
+    table='__REG_observations' if reserved_table=='observations' else 'observations'
+    con.execute(f"CREATE TABLE {model} AS SELECT * FROM (VALUES ('a','(Intercept)',0.),('b','(Intercept)',0.))t(class,feature,coefficient)")
+    con.execute(f"CREATE TABLE {table} AS SELECT 1.0 x,'a' y")
+    outcome=",'y'" if call=='evaluate' else ''
+    with pytest.raises(duckdb.Error,match='table names beginning with.*__reg_.*reserved'):
+        con.execute(f"SELECT * FROM multinom_{call}('{model}','{table}'{outcome})").fetchall()

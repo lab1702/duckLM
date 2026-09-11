@@ -1503,16 +1503,21 @@ SELECT rid, class,
             THEN e - maxe - ln(sum(exp(e - maxe)) OVER (PARTITION BY rid)) END AS log_p
 FROM __reg_meta2;
 
-CREATE OR REPLACE MACRO multinom_predict(model, tbl) AS TABLE
-WITH __reg_minput AS MATERIALIZED (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
-__reg_mncheck AS (
-  SELECT CASE WHEN coalesce(bool_or(lower(colname) IN ('pred', 'probs')), false)
+CREATE OR REPLACE MACRO __reg_mscore_check(model, tbl, caller) AS TABLE
+  SELECT CASE WHEN starts_with(lower(tbl),'__reg_') OR starts_with(lower(model),'__reg_')
+              THEN error(caller || ': table names beginning with "__reg_" are reserved for internal use; please rename')
+              WHEN coalesce(bool_or(starts_with(lower(colname),'__reg_')),false)
+              THEN error(caller || ': column names beginning with "__reg_" are reserved for internal use; please rename')
+              WHEN caller = 'multinom_predict' AND coalesce(bool_or(lower(colname) IN ('pred', 'probs')), false)
               THEN error('multinom_predict: the input table already has a "pred" or "probs" column; rename or drop it first (e.g. SELECT * EXCLUDE (pred, probs))')
               ELSE true END AS ok
   FROM (SELECT * FROM (SELECT 1 AS __reg_one)
         LEFT JOIN (SELECT CAST(COLUMNS(*) AS VARCHAR) FROM query_table(tbl) LIMIT 1) ON true)
-       UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
-),
+       UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))));
+
+CREATE OR REPLACE MACRO multinom_predict(model, tbl) AS TABLE
+WITH __reg_minput AS MATERIALIZED (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+__reg_mncheck AS (SELECT * FROM __reg_mscore_check(model,tbl,'multinom_predict')),
 __reg_magg AS (
   SELECT rid, arg_max(class, p) AS pred, map(list(class ORDER BY class), list(p ORDER BY class)) AS probs
   FROM __reg_msoftmax(model, '__reg_minput') GROUP BY rid
@@ -1525,6 +1530,7 @@ ORDER BY n.__reg_rid__;
 CREATE OR REPLACE MACRO multinom_evaluate(model, tbl, outcome) AS TABLE
 WITH
 __reg_minput AS MATERIALIZED (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
+__reg_mncheck AS (SELECT * FROM __reg_mscore_check(model,tbl,'multinom_evaluate')),
 __reg_mtrue AS (
   SELECT __reg_rid__ AS rid, val AS lab
   FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != '__reg_rid__') AS VARCHAR) FROM __reg_minput)
@@ -1542,7 +1548,7 @@ SELECT count(*)::BIGINT AS n,
        -- Preserve finite log probabilities even when exp(log_p) underflows.
        -- A label absent from the model has probability zero and infinite loss.
        -avg(coalesce(log_p_true, '-Infinity'::DOUBLE)) AS log_loss
-FROM __reg_mrm;
+FROM __reg_mrm WHERE (SELECT ok FROM __reg_mncheck);
 
 
 -- ---------------------------------------------------------------------------
