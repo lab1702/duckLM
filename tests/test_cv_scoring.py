@@ -68,3 +68,21 @@ def test_duplicate_dispersion_candidates_preserve_likelihood(con):
     repeated=con.execute("SELECT * FROM nbinom_dispersion('dispersion_counts','y',[.5,.5,1.])").fetchall()
     assert len(repeated)==len(unique)==2
     np.testing.assert_allclose(np.asarray(repeated,dtype=float),np.asarray(unique,dtype=float),rtol=1e-12)
+
+
+def test_single_point_refinement_keeps_best_candidate(con):
+    coarse=con.execute("SELECT * FROM cv_l2('balanced','y','linear',[0.,1.]) ORDER BY cv_deviance,l2 LIMIT 1").fetchone()
+    refined=con.execute("SELECT * FROM cv_l2_refine('balanced','y','linear',[0.,1.],n_refine:=1)").fetchall()
+    assert len(refined)==1
+    assert np.isfinite(float(refined[0][0])) and np.isfinite(refined[0][1])
+    assert refined[0][1]==pytest.approx(coarse[1])
+    assert con.execute('SELECT __reg_refine_grid([0.,1.,2.],1.,1)').fetchone()[0]==[1.0]
+
+
+@pytest.mark.parametrize('macro',['cv_l2_refine','nbinom_dispersion_refine'])
+def test_refinement_does_not_shadow_legal_table_names(con,macro):
+    con.execute('CREATE TABLE __rr_best AS SELECT * FROM balanced')
+    args=",'linear',[0.,1.]" if macro=='cv_l2_refine' else ',[.5,1.]'
+    expected=con.execute(f"SELECT * FROM {macro}('balanced','y'{args},n_refine:=2)").fetchall()
+    actual=con.execute(f"SELECT * FROM {macro}('__rr_best','y'{args},n_refine:=2)").fetchall()
+    np.testing.assert_allclose(np.asarray(actual,dtype=float),np.asarray(expected,dtype=float),rtol=1e-10,atol=1e-12)

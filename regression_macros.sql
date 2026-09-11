@@ -891,6 +891,39 @@ ORDER BY __reg_rid__;
 -- (intercept included); log-likelihoods, deviances, R^2 and AUC follow the
 -- standard statsmodels/scikit-learn definitions.
 -- ---------------------------------------------------------------------------
+-- Stable log(1+x) and NB2 scoring, including the small-alpha Poisson limit.
+CREATE OR REPLACE MACRO __reg_log1p(x) AS (
+  list_transform([x::DOUBLE], lambda v:
+    CASE WHEN abs(v) < 1e-4 THEN v*(1.0-v*(0.5-v*(1.0/3.0-v*(0.25-v/5.0))))
+         ELSE ln(1.0+v) END)[1]
+);
+CREATE OR REPLACE MACRO __reg_softplus(x) AS (
+  greatest(x,0.0) + __reg_log1p(exp(-abs(x)))
+);
+CREATE OR REPLACE MACRO __reg_nb_ll(y, eta, alpha) AS (
+  list_transform([y::DOUBLE], lambda yy:
+    list_transform([1.0/alpha], lambda r:
+      -- Stirling's gamma-ratio expansion avoids subtracting two huge lgammas.
+      (CASE WHEN r >= 1e6 THEN
+         (r+yy-0.5)*__reg_log1p(yy/r)-yy
+         + (1.0/(r+yy)-1.0/r)/12.0
+         - (pow(1.0/(r+yy),3)-pow(1.0/r,3))/360.0
+       ELSE lgamma(r+yy)-lgamma(r)-yy*ln(r) END)
+      - lgamma(yy+1.0) + yy*eta - (r+yy)*__reg_softplus(eta-ln(r))
+    )[1]
+  )[1]
+);
+CREATE OR REPLACE MACRO __reg_nb_halfdev(y, eta, alpha) AS (
+  list_transform([exp(eta)], lambda mu:
+    list_transform([alpha*(y-mu)/(1.0+alpha*mu)], lambda delta:
+      (CASE WHEN y > 0 THEN y*(ln(y)-eta) ELSE 0.0 END)
+      - (y+1.0/alpha) * (CASE WHEN isfinite(delta) AND abs(delta) < 0.5
+          THEN __reg_log1p(delta)
+          ELSE __reg_log1p(alpha*y)-__reg_softplus(ln(alpha)+eta) END)
+    )[1]
+  )[1]
+);
+
 CREATE OR REPLACE MACRO __reg_eval(model, tbl, outcome, family, caller, offset_col, power, alpha) AS TABLE
 WITH RECURSIVE
 __reg_numbered AS MATERIALIZED (
@@ -948,6 +981,13 @@ __reg_rows AS (
 __reg_evalcheck AS (
     SELECT CASE WHEN (SELECT count(*) FROM __reg_rows) = 0
                 THEN error(caller || ': no rows with a non-NULL prediction and outcome to evaluate')
+                WHEN family = 'logistic' AND EXISTS (SELECT 1 FROM __reg_rows WHERE y NOT IN (0,1))
+                THEN error(caller || ': outcome must be binary (0/1 or boolean)')
+                WHEN family IN ('poisson','nbinom','tweedie') AND EXISTS (SELECT 1 FROM __reg_rows WHERE y < 0)
+                THEN error(caller || ': outcome must be non-negative')
+                WHEN (family = 'gamma' OR (family = 'tweedie' AND power >= 2))
+                     AND EXISTS (SELECT 1 FROM __reg_rows WHERE y <= 0)
+                THEN error(caller || ': outcome must be strictly positive')
                 ELSE true END AS ok
 ),
 -- AUC via the Mann-Whitney statistic on average ranks of yhat (logistic only).
@@ -982,12 +1022,8 @@ __reg_agg AS (
            sum((y - yhat) * (y - yhat) / pow(yhat, power)) AS pearson_tw,
            -- Negative binomial (NB2, r = 1/alpha): log-likelihood, half-deviance,
            -- and Pearson chi-square (variance = mu + alpha*mu^2).
-           sum(lgamma(y + 1.0 / alpha) - lgamma(1.0 / alpha) - lgamma(y + 1)
-               - (1.0 / alpha) * (greatest(z + ln(alpha), 0.0) + ln(1.0 + exp(-abs(z + ln(alpha)))))
-               - y * (greatest(-z - ln(alpha), 0.0) + ln(1.0 + exp(-abs(z + ln(alpha)))))) AS ll_nb,
-           sum((CASE WHEN y > 0 THEN y * (ln(y) - z) ELSE 0.0 END)
-               - (y + 1.0 / alpha) * (ln(y + 1.0 / alpha) + ln(alpha)
-                   - greatest(z + ln(alpha), 0.0) - ln(1.0 + exp(-abs(z + ln(alpha)))))) AS dev_nb_half,
+           sum(__reg_nb_ll(y,z,alpha)) AS ll_nb,
+           sum(__reg_nb_halfdev(y,z,alpha)) AS dev_nb_half,
            sum((y - yhat) * (y - yhat) / (yhat + alpha * yhat * yhat)) AS pearson_nb
     FROM __reg_rows
 ),
@@ -1051,8 +1087,8 @@ __reg_null AS (
                     ELSE pow(greatest(y, 0.0), 2.0 - power) / ((1.0 - power) * (2.0 - power))
                - y * pow(r.mu0, 1.0 - power) / (1.0 - power)
                + pow(r.mu0, 2.0 - power) / (2.0 - power) END) AS null_dev_tw_half,
-           sum((CASE WHEN y > 0 THEN y * ln(y / r.mu0) ELSE 0.0 END)
-               - (y + 1.0 / alpha) * ln((y + 1.0 / alpha) / (r.mu0 + 1.0 / alpha))) AS null_dev_nb_half
+           sum(CASE WHEN y = 0 AND r.mu0 = 0 THEN 0.0
+                    ELSE __reg_nb_halfdev(y,ln(r.mu0),alpha) END) AS null_dev_nb_half
     FROM __reg_null_rows r, __reg_agg a
 )
 SELECT
@@ -1749,13 +1785,14 @@ __reg_cv_gd AS (
                    hw := CASE WHEN family NOT IN ('poisson','gamma','tweedie','nbinom')
                               THEN []::DOUBLE[] ELSE
                          list_transform(look, lambda bm, m:
+                     CASE WHEN mfold[m] = rw.fold THEN 0.0 ELSE
                      (CASE WHEN family='poisson' THEN exp(least(list_dot_product(rw.xs,bm),700.0))
                            WHEN family='gamma'   THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0))
                            WHEN family='tweedie' THEN (2.0-mpow[m])*pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),2.0-mpow[m])
                                                      + (mpow[m]-1.0)*rw.yt*pow(exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),1.0-mpow[m])
                            WHEN family='nbinom'  THEN exp(least(list_dot_product(rw.xs,bm),700.0))*(1.0+malp_int[m]*rw.yt)
                                                      / pow(1.0+malp_int[m]*exp(least(list_dot_product(rw.xs,bm),700.0)),2.0)
-                           ELSE 0.0 END)) END)) AS res
+                           ELSE 0.0 END) END) END)) AS res
           FROM (
             SELECT g.it, g.B, p.rows, c.step, ma.mfold, ma.ml2, ma.ml1, ma.mntrain, ma.mpow, ma.malp_int,
                    list_transform(g.B, lambda bm, m: list_transform(bm, lambda v, j:
@@ -1952,13 +1989,11 @@ __reg_nbd_sol AS (SELECT B FROM __reg_nbd_gd ORDER BY it DESC LIMIT 1),
 -- Average duplicate candidate copies so repeated grid entries do not alter scores.
 __reg_nbd_ll AS (
   SELECT gg.g AS g, r.y AS y, alpha_grid[gg.g] AS alpha,
-         ys.sd_y * exp(list_dot_product(r.xs, s.B[gg.g])) AS mu
+         ln(ys.sd_y) + list_dot_product(r.xs, s.B[gg.g]) AS eta
   FROM __reg_nbd_sol s, __reg_nbd_rows r, __reg_nbd_ys ys, range(1,len(alpha_grid)+1) gg(g)
 )
 SELECT alpha,
-       sum(lgamma(y + 1.0/alpha) - lgamma(1.0/alpha) - lgamma(y + 1)
-           + (1.0/alpha) * ln((1.0/alpha)/(1.0/alpha + mu))
-           + y * ln(mu/(1.0/alpha + mu))) / count(DISTINCT g) AS loglik
+       sum(__reg_nb_ll(y,eta,alpha)) / count(DISTINCT g) AS loglik
 FROM __reg_nbd_ll
 GROUP BY alpha
 ORDER BY alpha;
@@ -1999,20 +2034,20 @@ CREATE OR REPLACE MACRO __reg_refine_grid(grid, best, n) AS (
     SELECT coalesce((SELECT max(g) FROM unnest(grid) AS t(g) WHERE g < best), best) AS lo,
            coalesce((SELECT min(g) FROM unnest(grid) AS t(g) WHERE g > best), best) AS hi
   )
-  SELECT CASE WHEN lo = hi THEN [best::DOUBLE]
+  SELECT CASE WHEN n < 2 OR lo = hi THEN [best::DOUBLE]
               ELSE list_transform(range(n), lambda i: lo + (hi-lo)*i/(n-1.0)) END
   FROM nb
 );
 
 -- two-stage CV engine: sweep coarse grid, then a finer grid around the best
 CREATE OR REPLACE MACRO __reg_cv_refine(tbl, outcome, family, grid, sweep, k, n_refine, max_iter, learning_rate, tol) AS TABLE
-WITH __rr_best AS (
+WITH __reg_refine_best AS (
   SELECT param AS b FROM __reg_cv(tbl, outcome, family, grid, sweep, k, max_iter, learning_rate, tol)
   ORDER BY cv_deviance LIMIT 1
 )
 SELECT param, cv_deviance
 FROM __reg_cv(tbl, outcome, family,
-              (SELECT __reg_refine_grid(grid, b, n_refine) FROM __rr_best),
+              (SELECT __reg_refine_grid(grid, b, n_refine) FROM __reg_refine_best),
               sweep, k, max_iter, learning_rate, tol);
 
 CREATE OR REPLACE MACRO cv_l2_refine(tbl, outcome, family, l2_grid, k := 5, n_refine := 10, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
@@ -2026,13 +2061,13 @@ SELECT param AS alpha, cv_deviance FROM __reg_cv_refine(tbl, outcome, 'nbinom', 
 
 -- two-stage dispersion estimation: refine around the profile-likelihood peak
 CREATE OR REPLACE MACRO nbinom_dispersion_refine(tbl, outcome, alpha_grid, n_refine := 10, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
-WITH __rr_best AS (
+WITH __reg_refine_best AS (
   SELECT alpha AS b FROM nbinom_dispersion(tbl, outcome, alpha_grid, max_iter, learning_rate, tol)
   ORDER BY loglik DESC LIMIT 1
 )
 SELECT alpha, loglik
 FROM nbinom_dispersion(tbl, outcome,
-       (SELECT __reg_refine_grid(alpha_grid, b, n_refine) FROM __rr_best),
+       (SELECT __reg_refine_grid(alpha_grid, b, n_refine) FROM __reg_refine_best),
        max_iter, learning_rate, tol);
 
 

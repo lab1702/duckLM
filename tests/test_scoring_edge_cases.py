@@ -260,3 +260,25 @@ def test_count_evaluation_retains_finite_log_likelihood_after_underflow(con,fami
     expected=0 if outcome==0 else 1598 if family=='poisson' else 1600-4*np.log(2)
     assert result['deviance']==pytest.approx(expected)
     assert result['aic']==pytest.approx(1600*outcome+2)
+
+
+@pytest.mark.parametrize('alpha',[1e-5,1e-6,1e-12,1e-16])
+@pytest.mark.parametrize('outcome',[0,1,5,100])
+def test_negative_binomial_metrics_near_poisson_limit(con,alpha,outcome):
+    import math
+    mu=2.5
+    con.execute("CREATE TABLE limit_model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient",[np.log(mu)])
+    con.execute('CREATE TABLE limit_data AS SELECT ?::DOUBLE y',[outcome])
+    result=_metrics(con,f"nbinom_evaluate('limit_model','limit_data','y',alpha:={alpha})")
+    # Integer-count gamma ratio evaluated as a stable finite product.
+    expected=sum(math.log1p(j*alpha) for j in range(outcome))-math.lgamma(outcome+1)+outcome*math.log(mu)-(1/alpha+outcome)*math.log1p(alpha*mu)
+    expected_dev=2*((outcome*math.log(outcome/mu) if outcome else 0)-(outcome+1/alpha)*math.log1p(alpha*(outcome-mu)/(1+alpha*mu)))
+    assert result['loglik']==pytest.approx(expected,abs=1e-8)
+    assert result['deviance']==pytest.approx(expected_dev,abs=1e-8)
+
+
+def test_binary_evaluation_rejects_nonbinary_holdout(con):
+    con.execute("CREATE TABLE binary_model AS SELECT * FROM (VALUES ('(Intercept)',0.),('x',1.))t(feature,coefficient)")
+    con.execute('CREATE TABLE bad_holdout AS SELECT i::DOUBLE x,i::DOUBLE y FROM range(6)t(i)')
+    with pytest.raises(duckdb.Error,match='outcome must be binary'):
+        con.execute("SELECT * FROM logit_evaluate('binary_model','bad_holdout','y')").fetchall()

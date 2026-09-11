@@ -138,3 +138,13 @@ def test_cv_gd_step_accounts_for_training_fold_curvature(con):
     deviance=con.execute("SELECT cv_deviance FROM cv_l2('fold_curvature','y','linear',[0.0],k:=2)").fetchone()[0]
     assert np.isfinite(deviance)
     assert deviance < 1e-9
+
+
+def test_cv_curvature_ignores_held_out_outcomes(con):
+    con.execute('''CREATE OR REPLACE TABLE different_fold_scales AS
+        SELECT 1.0 x,CASE WHEN i%2=0 THEN 1e8 ELSE 1.0 END y FROM range(10)t(i)''')
+    actual=con.execute("SELECT cv_deviance FROM cv_l2('different_fold_scales','y','gamma',[0.0],k:=2)").fetchone()[0]
+    # Each intercept-only training fold predicts its own constant outcome.
+    ratios=np.array([1e8,1e-8])
+    expected=np.mean(2*(-np.log(ratios)+ratios-1))
+    assert actual==pytest.approx(expected,rel=1e-6)
