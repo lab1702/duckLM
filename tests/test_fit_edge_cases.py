@@ -156,3 +156,15 @@ def test_fit_rejects_missing_or_nonfinite_distribution_parameters(con,family,par
     con.execute('CREATE OR REPLACE TABLE distribution_input AS SELECT i::DOUBLE x,1.0+i%3 y FROM range(10)t(i)')
     with pytest.raises(duckdb.Error,match=parameter+'.*finite'):
         con.execute(f"SELECT * FROM {family}_fit('distribution_input','y',{parameter}:={value})").fetchall()
+
+
+@pytest.mark.parametrize('offset_col,weights_col', [('w','w'),('y','w'),('w','y'),('y','y')])
+@pytest.mark.parametrize('family', ['linreg','poisson','gamma','tweedie','nbinom'])
+def test_fit_accepts_shared_outcome_offset_and_weight_columns(con, family, offset_col, weights_col):
+    con.execute('CREATE OR REPLACE TABLE shared_roles AS SELECT i::DOUBLE/10 x,1.0+i%2 w,exp(.3*i/10) y FROM range(10)t(i)')
+    # A distinct column for each role expresses the identical statistical problem.
+    con.execute(f'CREATE OR REPLACE TABLE separate_roles AS SELECT x,y,{offset_col} offset_value,{weights_col} wt'
+                + (',w' if offset_col == weights_col == 'y' else '') + ' FROM shared_roles')
+    actual = dict(con.execute(f"SELECT * FROM {family}_fit('shared_roles','y',offset_col:='{offset_col}',weights_col:='{weights_col}')").fetchall())
+    expected = dict(con.execute(f"SELECT * FROM {family}_fit('separate_roles','y',offset_col:='offset_value',weights_col:='wt')").fetchall())
+    assert actual == pytest.approx(expected, rel=1e-8, abs=1e-8)

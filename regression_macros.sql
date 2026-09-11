@@ -251,12 +251,10 @@ __reg_featcols AS (
       AND col != coalesce(offset_col, '')
       AND col != coalesce(weights_col, '')
 ),
--- Number of columns every complete row must have non-NULL: features + outcome
--- + offset + weights (each when supplied).
+-- Count distinct required column names: one column may serve several roles.
 __reg_reqn AS (
-    SELECT (SELECT count(*) FROM __reg_featcols) + 1
-           + CASE WHEN offset_col IS NOT NULL THEN 1 ELSE 0 END
-           + CASE WHEN weights_col IS NOT NULL THEN 1 ELSE 0 END AS req
+    SELECT (SELECT count(*) FROM __reg_featcols)
+           + len(list_distinct([outcome, offset_col, weights_col])) AS req
 ),
 -- Rows used for training: every feature column, the outcome, the offset and
 -- the weight (each if any) non-NULL. Standardization (below) is computed over
@@ -626,7 +624,13 @@ __reg_gd AS (
                    -- The log-link families (Poisson/Gamma/Tweedie) have
                    -- unbounded curvature, so damp the step by the largest
                    -- per-row Hessian weight hw. 1 for the bounded families.
-                   CASE WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom')
+                   -- NB mean-scaling can make curvature far below one. Use
+                   -- its actual curvature (plus ridge) to avoid tiny steps
+                   -- being mistaken for convergence on large-count data.
+                   CASE WHEN family = 'nbinom'
+                        THEN greatest(1e-300, l2 + list_aggregate(
+                               list_transform(res, lambda ob: ob.hw), 'max'))
+                        WHEN family IN ('poisson', 'gamma', 'tweedie')
                         THEN greatest(1.0, list_aggregate(
                                list_transform(res, lambda ob: ob.hw), 'max'))
                         ELSE 1.0
@@ -1446,7 +1450,9 @@ __reg_meta AS (
 __reg_meta2 AS (SELECT rid, class, e, nm, max(e) OVER (PARTITION BY rid) AS maxe FROM __reg_meta)
 SELECT rid, class,
        CASE WHEN nm = (SELECT nf FROM __reg_mnf)
-            THEN exp(e - maxe) / sum(exp(e - maxe)) OVER (PARTITION BY rid) END AS p
+            THEN exp(e - maxe) / sum(exp(e - maxe)) OVER (PARTITION BY rid) END AS p,
+       CASE WHEN nm = (SELECT nf FROM __reg_mnf)
+            THEN e - maxe - ln(sum(exp(e - maxe)) OVER (PARTITION BY rid)) END AS log_p
 FROM __reg_meta2;
 
 CREATE OR REPLACE MACRO multinom_predict(model, tbl) AS TABLE
@@ -1478,14 +1484,16 @@ __reg_mtrue AS (
   WHERE name = outcome
 ),
 __reg_mrm AS (
-  SELECT s.rid, max(CASE WHEN s.class = t.lab THEN s.p END) AS p_true,
+  SELECT s.rid, max(CASE WHEN s.class = t.lab THEN s.log_p END) AS log_p_true,
          arg_max(s.class, s.p) AS pred, any_value(t.lab) AS truelab
   FROM __reg_msoftmax(model, '__reg_minput') s JOIN __reg_mtrue t ON t.rid = s.rid
   WHERE s.p IS NOT NULL GROUP BY s.rid
 )
 SELECT count(*)::BIGINT AS n,
        avg(CASE WHEN pred = truelab THEN 1.0 ELSE 0.0 END) AS accuracy,
-       -avg(ln(greatest(p_true, 1e-15))) AS log_loss
+       -- Preserve finite log probabilities even when exp(log_p) underflows.
+       -- A label absent from the model has probability zero and infinite loss.
+       -avg(coalesce(log_p_true, '-Infinity'::DOUBLE)) AS log_loss
 FROM __reg_mrm;
 
 
@@ -1772,7 +1780,7 @@ __reg_cv_gd AS (
            -- L1 prox on the L2-inclusive gradient step, per model per coef
            list_transform(zstep, lambda zm, m: list_transform(zm, lambda zmj, j:
                CASE WHEN j = 1 THEN zmj
-                    ELSE sign(zmj) * greatest(abs(zmj) - (step/damp)*ml1[m], 0.0) END)) AS newB
+                    ELSE sign(zmj) * greatest(abs(zmj) - (step/damp[m])*ml1[m], 0.0) END)) AS newB
     FROM (
       SELECT it, B, look, step, damp, ml1,
              -- The held-out rows are zeroed in `r` (below), not here: this inner
@@ -1780,15 +1788,22 @@ __reg_cv_gd AS (
              -- here would index mfold[m] and compare it D1 times per (row, model).
              -- A zero residual contributes nothing to the gradient either way.
              list_transform(look, lambda bm, m: list_transform(bm, lambda lmj, j:
-                 lmj + (step/damp) * (
+                 lmj + (step/damp[m]) * (
                    list_sum(list_transform(res, lambda ob: ob.xs[j] * ob.r[m])) / mntrain[m]
                    - CASE WHEN j = 1 THEN 0.0 ELSE ml2[m] * lmj END))) AS zstep
       FROM (
         SELECT it, B, look, step, mfold, ml2, ml1, mntrain, res,
-               CASE WHEN family IN ('poisson','gamma','tweedie','nbinom')
-                    THEN greatest(1.0, list_aggregate(list_transform(res,
-                           lambda ob: list_aggregate(ob.hw, 'max')), 'max'))
-                    ELSE 1.0 END AS damp
+               -- NB candidates can differ by many orders of magnitude in
+               -- curvature; condition each fold/model independently.
+               CASE WHEN family = 'nbinom'
+                    THEN list_transform(mfold, lambda mf, m:
+                           greatest(1e-300, ml2[m] + list_aggregate(
+                             list_transform(res, lambda ob: ob.hw[m]), 'max')))
+                    ELSE list_resize([]::DOUBLE[], len(mfold),
+                         CASE WHEN family IN ('poisson','gamma','tweedie')
+                           THEN greatest(1.0, list_aggregate(list_transform(res,
+                             lambda ob: list_aggregate(ob.hw, 'max')), 'max'))
+                           ELSE 1.0 END) END AS damp
         FROM (
           SELECT it, B, look, step, mfold, ml2, ml1, mntrain, mpow, malp_int,
                  list_transform(rows, lambda rw: struct_pack(
@@ -1988,10 +2003,11 @@ __reg_nbd_gd AS (
   FROM (
     SELECT it, B, look,
            list_transform(look, lambda bm, m: list_transform(bm, lambda lmj, j:
-               lmj + (step/damp) * (list_sum(list_transform(res, lambda ob: ob.xs[j] * ob.r[m])) / n))) AS newB
+               lmj + (step/damp[m]) * (list_sum(list_transform(res, lambda ob: ob.xs[j] * ob.r[m])) / n))) AS newB
     FROM (
       SELECT it, B, look, step, n, res,
-             greatest(1.0, list_aggregate(list_transform(res, lambda ob: list_aggregate(ob.hw,'max')), 'max')) AS damp
+             list_transform(malp_int, lambda al, m: greatest(1e-300,
+               list_aggregate(list_transform(res, lambda ob: ob.hw[m]), 'max'))) AS damp
       FROM (
         SELECT it, B, look, step, n, malp_int,
                list_transform(rows, lambda rw: struct_pack(

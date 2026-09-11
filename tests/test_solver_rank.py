@@ -148,3 +148,39 @@ def test_cv_curvature_ignores_held_out_outcomes(con):
     ratios=np.array([1e8,1e-8])
     expected=np.mean(2*(-np.log(ratios)+ratios-1))
     assert actual==pytest.approx(expected,rel=1e-6)
+
+
+@pytest.mark.parametrize('scale', [1e8, 1e10])
+@pytest.mark.parametrize('solver', ['auto', 'gd'])
+@pytest.mark.parametrize('constant', [False, True])
+def test_negative_binomial_gd_recovers_large_count_trends(con, scale, solver, constant):
+    extra = ',1.0 c' if constant else ''
+    con.execute(f'CREATE OR REPLACE TABLE large_counts AS SELECT i::DOUBLE/10 x,{scale}*exp(.3*i/10) y{extra} FROM range(-10,11)t(i)')
+    coefs = dict(con.execute(f"SELECT * FROM nbinom_fit('large_counts','y',solver:='{solver}',max_iter:=2000)").fetchall())
+    assert coefs['x'] == pytest.approx(.3, abs=1e-6)
+    assert coefs['(Intercept)'] == pytest.approx(np.log(scale), abs=1e-6)
+    if constant:
+        assert coefs['c'] == 0
+
+
+@pytest.mark.parametrize('l1', [0.0, 1e-12])
+def test_negative_binomial_curvature_preserves_penalty_objective(con, l1):
+    con.execute('CREATE OR REPLACE TABLE penalized_counts AS SELECT i::DOUBLE/10 x,1e10*exp(.3*i/10) y FROM range(-10,11)t(i)')
+    fits = [dict(con.execute(f"SELECT * FROM nbinom_fit('penalized_counts','y',solver:='{solver}',l2:=1e-11,l1:={l1},max_iter:=2000)").fetchall()) for solver in ['irls','gd']]
+    assert fits[1] == pytest.approx(fits[0], rel=1e-6, abs=1e-6)
+
+
+def test_negative_binomial_cv_conditions_each_dispersion_candidate(con):
+    con.execute('CREATE OR REPLACE TABLE cv_large_counts AS SELECT i::DOUBLE/10 x,1e8*exp(.3*i/10) y,1.0 c FROM range(-10,11)t(i)')
+    scores = con.execute("SELECT cv_deviance FROM cv_alpha('cv_large_counts','y',[1e-4,1.,1e4],k:=3,max_iter:=2000)").fetchnumpy()['cv_deviance']
+    np.testing.assert_allclose(scores, 0.0, atol=1e-6)
+
+
+def test_negative_binomial_dispersion_profiles_large_count_trends(con):
+    con.execute('CREATE OR REPLACE TABLE profile_counts AS SELECT i::DOUBLE/10 x,1e8*exp(.3*i/10) y FROM range(-10,11)t(i)')
+    # This noiseless log-linear relationship has known fitted means for every alpha.
+    con.execute("CREATE OR REPLACE TABLE exact_count_model AS SELECT '(Intercept)' feature,ln(1e8) coefficient UNION ALL SELECT 'x',.3")
+    actual = dict(con.execute("SELECT * FROM nbinom_dispersion('profile_counts','y',[1e-4,1.,1e4],max_iter:=2000)").fetchall())
+    for alpha, loglik in actual.items():
+        expected = con.execute(f"SELECT loglik FROM nbinom_evaluate('exact_count_model','profile_counts','y',alpha:={alpha})").fetchone()[0]
+        assert loglik == pytest.approx(expected, rel=1e-8, abs=1e-5)

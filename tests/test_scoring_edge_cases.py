@@ -360,3 +360,26 @@ def test_evaluation_rejects_invalid_distribution_parameters(con,family,parameter
     for value in values:
         with pytest.raises(duckdb.Error,match=parameter+' must be finite'):
             con.execute(f"SELECT * FROM {family}_evaluate('invalid_parameter_model','invalid_parameter_data','y',{parameter}:={value})").fetchall()
+
+
+@pytest.mark.parametrize('magnitude', [100.0, 1000.0])
+def test_multinomial_loss_preserves_finite_extreme_logits(con, magnitude):
+    con.execute("CREATE TABLE multiclass_model AS SELECT * FROM "
+                "(VALUES ('a','(Intercept)',0.),('a','x',0.),"
+                "('b','(Intercept)',0.),('b','x',1.))t(class,feature,coefficient)")
+    con.execute(f"CREATE TABLE confident_errors AS SELECT * FROM "
+                f"(VALUES ({magnitude},'a'),(-{magnitude},'b'))t(x,y)")
+    metrics = _metrics(con, "multinom_evaluate('multiclass_model','confident_errors','y')")
+    assert metrics['n'] == 2
+    assert metrics['accuracy'] == 0
+    assert metrics['log_loss'] == pytest.approx(np.logaddexp(0, magnitude), rel=1e-12)
+
+
+def test_multinomial_loss_is_infinite_for_an_unseen_class(con):
+    con.execute("CREATE TABLE multiclass_model AS SELECT * FROM "
+                "(VALUES ('a','(Intercept)',0.),('b','(Intercept)',0.))t(class,feature,coefficient)")
+    con.execute("CREATE TABLE unseen_class AS SELECT 'c' y")
+    metrics = _metrics(con, "multinom_evaluate('multiclass_model','unseen_class','y')")
+    assert metrics['n'] == 1
+    assert metrics['accuracy'] == 0
+    assert metrics['log_loss'] == np.inf

@@ -418,6 +418,10 @@ standardized coefficients, intercepts excluded); offset and weights aren't
 available for multinomial. Coefficient standard errors are available via
 [`multinom_summary`](#inference).
 
+Evaluation computes log loss directly from the class logits, preserving large
+finite losses even when a predicted probability underflows to zero. An observed
+label absent from the model has probability zero and infinite log loss.
+
 ## Tuning hyperparameters
 
 `cv_l2` / `cv_l1` / `cv_power` / `cv_alpha` run **k-fold cross-validation** over
