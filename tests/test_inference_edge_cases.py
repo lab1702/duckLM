@@ -801,6 +801,58 @@ def test_tweedie_inference_cancels_extreme_information_and_dispersion_units(con,
         np.testing.assert_allclose(scaled,baseline,rtol=1e-8,atol=1e-10)
 
 
+@pytest.mark.parametrize('exponent', [100,200,300])
+@pytest.mark.parametrize('weight_scale', [1.,1e100])
+@pytest.mark.parametrize('feature_scale', [1e-100,1.,1e100])
+def test_poisson_inference_preserves_joint_information_and_feature_scales(con, exponent, weight_scale, feature_scale):
+    from scipy.stats import norm
+
+    small,big = 10.**(-exponent),10.**exponent
+    x = feature_scale/np.sqrt(small)
+    con.execute("CREATE TABLE joint_model AS SELECT * FROM (VALUES ('(Intercept)',0.),('x',0.))t(feature,coefficient)")
+    con.execute('CREATE TABLE joint_data(x DOUBLE,y DOUBLE,w DOUBLE,expo DOUBLE)')
+    con.executemany('INSERT INTO joint_data VALUES (?,?,?,?)',
+                    [(-x,small,weight_scale,np.log(small)),(x,small,weight_scale,np.log(small)),(0.,big,weight_scale/big,np.log(big))])
+    args = "'joint_model','joint_data','y',weights_col:='w',offset_col:='expo'"
+    errors = dict(con.execute(f'SELECT feature,std_error FROM poisson_summary({args})').fetchall())
+    # Joint Fisher information is diag(weight_scale,2*weight_scale*feature_scale^2).
+    assert errors['(Intercept)']*np.sqrt(weight_scale) == pytest.approx(1.,rel=1e-10)
+    assert errors['x']*feature_scale*np.sqrt(weight_scale) == pytest.approx(1/np.sqrt(2),rel=1e-10)
+    hats = con.execute(f'SELECT hat FROM poisson_influence({args}) ORDER BY x').fetchnumpy()['hat']
+    np.testing.assert_allclose(hats,[.5,1.,.5],rtol=1e-10,atol=1e-12)
+    con.execute('CREATE TABLE joint_score AS SELECT 0.0 x,0.0 expo')
+    interval = con.execute(f"SELECT prediction,conf_low,conf_high FROM poisson_predict_ci({args},newdata:='joint_score')").fetchone()
+    margin = norm.ppf(.975)/np.sqrt(weight_scale)
+    np.testing.assert_allclose(interval,[1.,np.exp(-margin),np.exp(margin)],rtol=1e-10,atol=0.)
+
+
+@pytest.mark.parametrize('exponent', [100,200,300])
+@pytest.mark.parametrize('robust', ['hc0','hc1'])
+def test_poisson_sandwich_preserves_joint_information_scales(con, exponent, robust):
+    small,big = 10.**(-exponent),10.**exponent
+    x = 1/np.sqrt(small)
+    con.execute("CREATE TABLE joint_model AS SELECT * FROM (VALUES ('(Intercept)',0.),('x',0.))t(feature,coefficient)")
+    con.execute('CREATE TABLE joint_data(x DOUBLE,y DOUBLE,w DOUBLE,expo DOUBLE)')
+    con.executemany('INSERT INTO joint_data VALUES (?,?,?,?)',
+                    [(-x,1.1*small,1.,np.log(small)),(x,.9*small,1.,np.log(small)),(0.,1.2*big,1/big,np.log(big))])
+    errors = dict(con.execute(f"SELECT feature,std_error FROM poisson_summary('joint_model','joint_data','y',weights_col:='w',offset_col:='expo',robust:='{robust}')").fetchall())
+    correction = np.sqrt(3) if robust == 'hc1' else 1.
+    assert errors['(Intercept)']/correction == pytest.approx(.2,rel=1e-9)
+    assert errors['x']/np.sqrt(small)/correction == pytest.approx(.1/np.sqrt(2),rel=1e-9)
+
+
+@pytest.mark.parametrize('offset', [1000.,2000.])
+def test_logistic_score_coordinates_survive_vanishing_information(con, offset):
+    con.execute("CREATE TABLE confident_model AS SELECT * FROM (VALUES ('(Intercept)',-ln(3.)),('x',0.))t(feature,coefficient)")
+    con.execute(f"CREATE TABLE confident_data AS SELECT * FROM (VALUES (-1.,0.,0.),(-1.,1.,0.),(1.,0.,0.),(1.,1.,0.),(0.,0.,{offset}))t(x,y,expo)")
+    # Ordinary rows contribute Fisher diag(.75,.75); score outer products
+    # including the confidently wrong final row give diag(2.25,1.25).
+    errors = dict(con.execute("SELECT feature,std_error FROM logit_summary('confident_model','confident_data','y',offset_col:='expo',robust:='hc0')").fetchall())
+    assert errors == pytest.approx({'(Intercept)':2.,'x':np.sqrt(20)/3},rel=1e-10)
+    cook = con.execute("SELECT cooks_distance FROM logit_influence('confident_model','confident_data','y',offset_col:='expo') WHERE expo>0").fetchone()[0]
+    assert cook == pytest.approx(2/3,rel=1e-10)
+
+
 @pytest.mark.parametrize('scale', [1e-305, 1e-170, 1e170, 1e305])
 @pytest.mark.parametrize('robust', ['none', 'hc0', 'hc1', 'hc2', 'hc3', 'cluster'])
 def test_linear_inference_preserves_extreme_response_units(con, scale, robust):

@@ -680,3 +680,20 @@ def test_logistic_predictions_preserve_representable_negative_tail_probabilities
         assert probability > 0.
         assert probability == pytest.approx(expected,rel=1e-12,abs=0.)
         assert classification == predicted_class
+
+
+@pytest.mark.parametrize('family', ['logit','multinom'])
+@pytest.mark.parametrize('n', [1,2,3,8])
+@pytest.mark.parametrize('all_errors', [False,True])
+def test_mean_log_loss_preserves_finite_extreme_losses_when_rows_repeat(con, family, n, all_errors):
+    if family == 'logit':
+        con.execute("CREATE TABLE model AS SELECT * FROM (VALUES ('(Intercept)',0.),('x',1.))t(feature,coefficient)")
+        label = '0.0'
+    else:
+        con.execute("CREATE TABLE model AS SELECT * FROM (VALUES ('a','(Intercept)',0.),('a','x',0.),('b','(Intercept)',0.),('b','x',1.))t(class,feature,coefficient)")
+        label = "'a'"
+    score = '1e308::DOUBLE' if all_errors else 'CASE WHEN i=0 THEN 1e308 ELSE 0.0 END'
+    con.execute(f'CREATE TABLE observations AS SELECT {score} x,{label} y FROM range({n})t(i)')
+    loss = con.execute(f"SELECT log_loss FROM {family}_evaluate('model','observations','y')").fetchone()[0]
+    assert np.isfinite(loss)
+    assert loss/1e308 == pytest.approx(1. if all_errors else 1/n,rel=1e-12)

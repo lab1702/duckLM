@@ -1323,7 +1323,8 @@ __reg_errorunits AS (
     SELECT coalesce(nullif(max(CASE WHEN isfinite(y) AND isfinite(yhat)
                                    THEN __reg_center_scale(y,yhat) ELSE 0.0 END),0.0),
                     nullif(max(abs(y)),0.0),1.0) AS eunit,
-           coalesce(nullif(max(abs(y)),0.0),1.0) AS yunit
+           coalesce(nullif(max(abs(y)),0.0),1.0) AS yunit,
+           coalesce(nullif(max(__reg_softplus(CASE WHEN y=1 THEN -z ELSE z END)),0.0),1.0) AS lossunit
     FROM __reg_rows
 ),
 __reg_agg AS (
@@ -1334,7 +1335,10 @@ __reg_agg AS (
            any_value(eunit) AS eunit,
            sum(pow(__reg_centered(y,yhat,eunit),2)) AS sse,
            sum(abs(__reg_centered(y,yhat,eunit))) AS sae,
-           sum(-y*greatest(-z,0.0) - (1-y)*greatest(z,0.0) - __reg_log1p(exp(-abs(z)))) AS ll_bin,
+           -sum(__reg_softplus(CASE WHEN y=1 THEN -z ELSE z END)) AS ll_bin,
+           CASE WHEN isfinite(any_value(lossunit))
+                THEN any_value(lossunit)*avg(__reg_softplus(CASE WHEN y=1 THEN -z ELSE z END)/lossunit)
+                ELSE 'Infinity'::DOUBLE END AS mean_bin_loss,
            avg(CASE WHEN (yhat >= 0.5) = (y >= 0.5) THEN 1.0 ELSE 0.0 END) AS accuracy,
            sum(CASE WHEN y = 0 THEN -exp(z)
                     ELSE -__reg_stirlerr(y)-0.5*(1.8378770664093453+ln(y))
@@ -1432,7 +1436,7 @@ SELECT
          THEN 1.0 - (a.sse / (a.n - m.kparams)) / (nu.sst / (a.n - 1)) END AS adj_r2,
     a.accuracy AS accuracy,
     au.auc AS auc,
-    CASE WHEN family = 'logistic' THEN -a.ll_bin / a.n END AS log_loss,
+    CASE WHEN family = 'logistic' THEN a.mean_bin_loss END AS log_loss,
     CASE family WHEN 'linear'   THEN CASE WHEN a.sse = 0 THEN 'Infinity'::DOUBLE
                                          ELSE -a.n / 2.0 * (ln(2 * pi()) + 2.0*ln(a.eunit) + ln(a.sse / a.n) + 1.0) END
                 WHEN 'logistic' THEN a.ll_bin
@@ -1810,13 +1814,18 @@ __reg_mrm AS (
          arg_max(s.class, s.p) AS pred, any_value(t.lab) AS truelab
   FROM __reg_msoftmax(model, '__reg_minput') s JOIN __reg_mtrue t ON t.rid = s.rid
   WHERE s.p IS NOT NULL GROUP BY s.rid
+),
+__reg_mlossunit AS (
+  SELECT coalesce(nullif(max(-coalesce(log_p_true,'-Infinity'::DOUBLE)),0.0),1.0) AS unit
+  FROM __reg_mrm
 )
 SELECT count(*)::BIGINT AS n,
        avg(CASE WHEN pred = truelab THEN 1.0 ELSE 0.0 END) AS accuracy,
        -- Preserve finite log probabilities even when exp(log_p) underflows.
        -- A label absent from the model has probability zero and infinite loss.
-       -avg(coalesce(log_p_true, '-Infinity'::DOUBLE)) AS log_loss
-FROM __reg_mrm WHERE (SELECT ok FROM __reg_mncheck);
+       CASE WHEN isfinite(any_value(unit)) THEN -avg(log_p_true/unit)*any_value(unit)
+            ELSE 'Infinity'::DOUBLE END AS log_loss
+FROM __reg_mrm CROSS JOIN __reg_mlossunit WHERE (SELECT ok FROM __reg_mncheck);
 
 
 -- ---------------------------------------------------------------------------
@@ -2723,6 +2732,40 @@ CREATE OR REPLACE MACRO __reg_logit_devres(y, eta) AS (
             y*greatest(-eta,0.0)+(1-y)*greatest(eta,0.0)+__reg_log1p(exp(-abs(eta))))) END
 );
 
+-- Retain information scales in logs until they are combined with sample
+-- weights and feature coordinates. Separate global scales can erase finite
+-- X'WX contributions when large features have small information weights.
+CREATE OR REPLACE MACRO __reg_log_info(eta, family, power, alpha) AS (
+  CASE family WHEN 'linear' THEN 0.0 WHEN 'gamma' THEN 0.0
+       WHEN 'logistic' THEN -abs(eta)-2.0*__reg_log1p(exp(-abs(eta)))
+       WHEN 'poisson' THEN eta WHEN 'tweedie' THEN (2.0-power)*eta
+       WHEN 'nbinom' THEN CASE WHEN eta>=0 THEN -ln(alpha+exp(-eta))
+                              ELSE eta-__reg_softplus(ln(alpha)+eta) END END
+);
+CREATE OR REPLACE MACRO __reg_exp_scale(value, logscale) AS (
+  CASE WHEN value=0 THEN 0.0 WHEN logscale=0 THEN value
+       WHEN exp(logscale)>0 AND isfinite(exp(logscale))
+            AND value*exp(logscale)!=0 AND isfinite(value*exp(logscale)) THEN value*exp(logscale)
+       ELSE sign(value)*exp(ln(abs(value))+logscale) END
+);
+CREATE OR REPLACE MACRO __reg_observed_ratio(y, eta, family, power, alpha) AS (
+  CASE family WHEN 'gamma' THEN y/exp(eta)
+       WHEN 'tweedie' THEN 1.0+(power-1.0)*(y/exp(eta)-1.0)
+       WHEN 'nbinom' THEN exp(CASE WHEN y=0 THEN 0.0 ELSE __reg_softplus(ln(alpha)+ln(y)) END
+                              -__reg_softplus(ln(alpha)+eta))
+       ELSE 1.0 END
+);
+-- Score coordinates remain finite for a confidently wrong Bernoulli row
+-- even if its leverage rounds to zero and its Pearson square overflows.
+CREATE OR REPLACE MACRO __reg_logit_score_coord(v, sw, y, eta, logunit) AS (
+  CASE WHEN v=0 OR sw=0 THEN 0.0 ELSE
+    (CASE WHEN y=1 THEN 1.0 WHEN y=0 THEN -1.0 ELSE sign(__reg_logit_resid(y,eta)) END)
+      *__reg_exp_scale(v,2.0*ln(nullif(sw,0.0))-logunit
+        +CASE WHEN y=1 THEN -__reg_softplus(eta) WHEN y=0 THEN -__reg_softplus(-eta)
+              ELSE coalesce(ln(nullif(abs(__reg_logit_resid(y,eta)),0.0)),'-Infinity'::DOUBLE) END)
+  END
+);
+
 -- ---- Shared coefficient-inference core -------------------------------------
 CREATE OR REPLACE MACRO __reg_summary(model, tbl, outcome, family, caller,
                                       conf_level, offset_col, weights_col, power, alpha,
@@ -2843,39 +2886,35 @@ __reg_resunits AS (
               ELSE 1.0 END AS runit
   FROM __reg_rows0
 ),
--- Normalize root-weighted feature units before cross-products. The original
--- vectors still form eta; covariance uses these units and is transformed back.
+-- Joint root-information/feature scales, stored in logs so even a scale
+-- outside DOUBLE range can cancel before coordinates or standard errors form.
 __reg_xunits AS (
-  SELECT list(unit ORDER BY i) AS units
-  FROM (SELECT ix.i, coalesce(nullif(max(r.sw*abs(r.xs[ix.i])) FILTER (WHERE r.sw > 0),0.0),1.0) AS unit
+  SELECT list(logunit ORDER BY i) AS units
+  FROM (SELECT ix.i, coalesce(nullif(max(ln(nullif(abs(r.xs[ix.i]),0.0))+ln(nullif(r.sw,0.0))
+                   +0.5*__reg_log_info(__reg_dot(r.xs || [r.off],r.bvec || [1.0])-tu.shift,family,power,alpha))
+                   FILTER (WHERE r.sw>0 AND r.xs[ix.i]!=0),'-Infinity'::DOUBLE),0.0) AS logunit
         FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
-        LEFT JOIN __reg_rows0 r ON true GROUP BY ix.i)
+        LEFT JOIN __reg_rows0 r ON true CROSS JOIN __reg_responseunits tu GROUP BY ix.i)
 ),
 __reg_rww AS (
-  SELECT r.__reg_rid__, list_transform(r.xs, lambda v,j: __reg_mul_div(r.sw,v,u.units[j])) AS xs,
+  SELECT r.__reg_rid__, list_transform(r.xs, lambda v,j: __reg_exp_scale(v,ln(nullif(r.sw,0.0))+0.5*__reg_log_info(r.eta,family,power,alpha)-u.units[j])) AS xs,
          r.y, r.wt, r.sw, mu, r.eta,
-         CASE WHEN r.sw = 0 THEN 0.0 ELSE
-           CASE family WHEN 'logistic' THEN __reg_logit_var(r.eta) WHEN 'linear' THEN 1.0
-             WHEN 'poisson' THEN mu WHEN 'gamma' THEN 1.0
-             WHEN 'tweedie' THEN pow(mu,2.0-power) WHEN 'nbinom' THEN __reg_nb_info(r.eta,alpha) END END AS w,
-         pow(CASE family
-             WHEN 'linear' THEN __reg_weighted_center(r.y,mu,r.sw,(SELECT runit FROM __reg_resunits))
+         (CASE family
+             WHEN 'linear' THEN __reg_weighted_center(r.y,mu,r.sw,ru.runit)
              WHEN 'logistic' THEN r.sw*__reg_logit_pearson(r.y,r.eta)
              WHEN 'poisson' THEN __reg_mul_div(r.sw,r.y-mu,sqrt(mu))
              WHEN 'gamma' THEN __reg_mul_div(r.sw,r.y-mu,mu)
              WHEN 'tweedie' THEN r.sw*((r.y-mu)/mu*pow(mu,1.0-power/2.0))
-             WHEN 'nbinom' THEN r.sw*__reg_nb_pearson(r.y,r.eta,alpha) END,2) AS pearson
+             WHEN 'nbinom' THEN r.sw*__reg_nb_pearson(r.y,r.eta,alpha) END) AS pres,
+         pow(pres,2) AS pearson,
+         CASE WHEN family='logistic' THEN list_transform(r.xs,lambda v,j:
+              __reg_logit_score_coord(v,r.sw,r.y,r.eta,u.units[j])) END AS logit_scores
   FROM (SELECT *, CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                              WHEN 'linear' THEN eta ELSE exp(eta) END AS mu
         FROM (SELECT r.* REPLACE (__reg_response_scale(y,tu.shift) AS y),
                      __reg_dot(xs || [off],bvec || [1.0])-tu.shift AS eta
               FROM __reg_rows0 r CROSS JOIN __reg_responseunits tu)) r
-  CROSS JOIN __reg_xunits u
-),
--- Remove the common Fisher-information scale before accumulation/inversion;
--- restore it after square roots, so finite standard errors need no finite variance.
-__reg_infounit AS (
-  SELECT coalesce(nullif(max(w),0.0),1.0) AS wunit FROM __reg_rww
+  CROSS JOIN __reg_xunits u CROSS JOIN __reg_resunits ru
 ),
 __reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_rww),
 __reg_idx AS (SELECT unnest(range(1, (SELECT d FROM __reg_dims)+1)) AS i),
@@ -2883,7 +2922,7 @@ __reg_pairs AS (SELECT a.i AS a, b.i AS b FROM __reg_idx a, __reg_idx b),
 __reg_xwx AS (
   SELECT list(rowlist ORDER BY a) AS A FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
-      SELECT p.a AS a, p.b AS b, sum((__reg_rww.w/(SELECT wunit FROM __reg_infounit)) * __reg_rww.xs[p.a] * __reg_rww.xs[p.b]) AS val
+      SELECT p.a AS a, p.b AS b, sum(__reg_rww.xs[p.a] * __reg_rww.xs[p.b]) AS val
       FROM __reg_rww, __reg_pairs p GROUP BY p.a, p.b
     ) GROUP BY a
   )
@@ -2951,19 +2990,10 @@ __reg_disp AS (
 -- Dispersion-free -> z inference. e_i = the GD residual.
 __reg_robraw AS (
   SELECT __reg_rww.__reg_rid__, __reg_rww.xs, __reg_rww.wt, cl.cl AS cl,
-         CASE WHEN __reg_rww.sw = 0 THEN 0.0 ELSE (CASE family
-                     WHEN 'logistic' THEN __reg_logit_var(__reg_rww.eta) WHEN 'linear' THEN 1.0
-                     WHEN 'poisson'  THEN mu
-                     WHEN 'gamma'    THEN __reg_rww.y/mu
-                     WHEN 'tweedie'  THEN __reg_tw_observed(__reg_rww.y,mu,power)
-                     WHEN 'nbinom'   THEN __reg_nb_observed(__reg_rww.y,__reg_rww.eta,alpha) END) END AS hwt,
-         (CASE family
-                     WHEN 'logistic' THEN __reg_rww.sw*__reg_logit_resid(__reg_rww.y,__reg_rww.eta)
-                     WHEN 'gamma'   THEN __reg_mul_div(__reg_rww.sw,__reg_rww.y-mu,mu)
-                     WHEN 'tweedie' THEN __reg_rww.sw*__reg_tw_score(__reg_rww.y,mu,power)
-                     WHEN 'nbinom'  THEN __reg_rww.sw*__reg_nb_score(__reg_rww.y,__reg_rww.eta,alpha)
-                     WHEN 'linear'  THEN __reg_weighted_center(__reg_rww.y,mu,__reg_rww.sw,(SELECT runit FROM __reg_resunits))
-                     ELSE __reg_rww.sw*(__reg_rww.y-mu) END) AS sc                       -- xs supplies the other root weight in each score product
+         CASE WHEN __reg_rww.sw=0 THEN 0.0
+              ELSE __reg_observed_ratio(__reg_rww.y,__reg_rww.eta,family,power,alpha) END AS hwt,
+         CASE WHEN family='logistic' THEN __reg_rww.logit_scores
+              ELSE list_transform(__reg_rww.xs,lambda v: __reg_rww.pres*v) END AS sg
   FROM __reg_rww LEFT JOIN __reg_clv cl ON cl.__reg_rid__ = __reg_rww.__reg_rid__
 ),
 -- A common information scale cancels between sandwich bread and scores.
@@ -2972,7 +3002,7 @@ __reg_robscale AS (
   SELECT coalesce(nullif(max(abs(hwt)),0.0),1.0) AS hunit FROM __reg_robraw
 ),
 __reg_robrow AS (
-  SELECT r.* REPLACE (hwt/s.hunit AS hwt, sc/s.hunit AS sc)
+  SELECT r.* REPLACE (hwt/s.hunit AS hwt, list_transform(sg,lambda v: v/s.hunit) AS sg)
   FROM __reg_robraw r CROSS JOIN __reg_robscale s
 ),
 __reg_rdims AS (SELECT count(DISTINCT cl)::INT AS G FROM __reg_robrow),
@@ -2988,7 +3018,7 @@ __reg_breadinv AS (
         FROM (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 0.0 THEN sqrt(row[i]) ELSE 1.0 END) AS dscA FROM __reg_breada))
 ),
 __reg_lev AS (
-  SELECT r.xs, r.sc, r.cl, r.wt,
+  SELECT r.xs, r.sg, r.cl, r.wt,
          r.hwt * list_sum(list_transform(r.xs, lambda xa, a: xa * list_dot_product(bi.Ainv[a], r.xs))) AS h
   FROM __reg_robrow r CROSS JOIN __reg_breadinv bi
 ),
@@ -2996,14 +3026,14 @@ __reg_meat_hc AS (
   SELECT list(rowlist ORDER BY a) AS B FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
       SELECT p.a AS a, p.b AS b,
-             sum((CASE WHEN robust = 'hc2' THEN m.sc*m.sc/(1.0-m.h)
-                       WHEN robust = 'hc3' THEN m.sc*m.sc/((1.0-m.h)*(1.0-m.h))
-                       ELSE m.sc*m.sc END) * m.xs[p.a] * m.xs[p.b]) AS val
+             sum(m.sg[p.a]*m.sg[p.b] /
+                 (CASE WHEN robust='hc2' THEN 1.0-m.h
+                       WHEN robust='hc3' THEN (1.0-m.h)*(1.0-m.h) ELSE 1.0 END)) AS val
       FROM __reg_lev m, __reg_pairs p GROUP BY p.a, p.b) GROUP BY a)
 ),
 __reg_clsg AS (
   SELECT cl, list(sga ORDER BY a) AS sg FROM (
-    SELECT l.cl, ix.i AS a, sum(l.sc * l.xs[ix.i]) AS sga FROM __reg_lev l, __reg_idx ix GROUP BY l.cl, ix.i) GROUP BY cl
+    SELECT l.cl, ix.i AS a, sum(l.sg[ix.i]) AS sga FROM __reg_lev l, __reg_idx ix GROUP BY l.cl, ix.i) GROUP BY cl
 ),
 __reg_meat_cl AS (
   SELECT list(rowlist ORDER BY a) AS B FROM (
@@ -3030,7 +3060,6 @@ __reg_robchk AS (
 ),
 __reg_final AS (
   SELECT b.names AS names, b.bvec AS bvec, c.Rinv AS Rinv, s.dsc AS dsc, rv.rv AS rv, u.units AS units, ws.wscale AS wscale,
-         (SELECT wunit FROM __reg_infounit) AS wunit,
          dp.phi AS phi, dp.est AS est, dp.df AS df,
          (robust != 'none' OR cluster_col IS NOT NULL) AS robactive,
          (dp.est AND dp.df > 0.0 AND robust = 'none' AND cluster_col IS NULL) AS uset,
@@ -3042,7 +3071,7 @@ __reg_final AS (
 ),
 -- per-coefficient SE with guards: NULL when the covariance is singular / non-finite / non-positive
 __reg_percoef AS (
-  SELECT gs.i AS i, names[gs.i] AS feature, bvec[gs.i] AS coefficient, uset, df, crit, units[gs.i] AS feature_unit,
+  SELECT gs.i AS i, names[gs.i] AS feature, bvec[gs.i] AS coefficient, uset, df, crit, units[gs.i] AS feature_logunit,
          CASE WHEN robactive THEN
                 -- A singular design cannot identify coefficient uncertainty.
                 -- df <= 0 (saturated): robust variance is undefined; at n==d the
@@ -3050,11 +3079,11 @@ __reg_percoef AS (
                 CASE WHEN Rinv IS NOT NULL AND df > 0.0 AND isfinite(rv[gs.i]) AND rv[gs.i] > 0.0 THEN sqrt(rv[gs.i]) ELSE NULL END
               ELSE
                 CASE WHEN Rinv IS NOT NULL AND isfinite(phi * Rinv[gs.i][gs.i]) AND phi * Rinv[gs.i][gs.i] > 0.0
-                     THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] / (CASE WHEN est THEN 1.0 ELSE sqrt(wscale) END) / sqrt(wunit) ELSE NULL END
+                     THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] / (CASE WHEN est THEN 1.0 ELSE sqrt(wscale) END) ELSE NULL END
          END AS scaled_std_error
   FROM __reg_final, unnest(range(1, len(bvec)+1)) AS gs(i)
 )
-SELECT feature, coefficient, __reg_mul_div(scaled_std_error,ru.runit,feature_unit) AS std_error,
+SELECT feature, coefficient, __reg_exp_scale(scaled_std_error,ln(ru.runit)-feature_logunit) AS std_error,
        coefficient / std_error AS statistic,
        CASE WHEN std_error IS NULL THEN NULL
             WHEN uset THEN 2.0 * __reg_t_sf(abs(coefficient / std_error), df)
@@ -3201,39 +3230,33 @@ __reg_resunits AS (
               ELSE 1.0 END AS runit
   FROM __reg_rows0
 ),
--- Normalize root-weighted feature units before cross-products. The original
--- vectors still form eta; covariance uses these units and is transformed back.
+-- Joint root-information/feature scales, stored in logs so even a scale
+-- outside DOUBLE range can cancel before coordinates or standard errors form.
 __reg_xunits AS (
-  SELECT list(unit ORDER BY i) AS units
-  FROM (SELECT ix.i, coalesce(nullif(max(r.sw*abs(r.xs[ix.i])) FILTER (WHERE r.sw > 0),0.0),1.0) AS unit
+  SELECT list(logunit ORDER BY i) AS units
+  FROM (SELECT ix.i, coalesce(nullif(max(ln(nullif(abs(r.xs[ix.i]),0.0))+ln(nullif(r.sw,0.0))
+                   +0.5*__reg_log_info(__reg_dot(r.xs || [r.off],r.bvec || [1.0])-tu.shift,family,power,alpha))
+                   FILTER (WHERE r.sw>0 AND r.xs[ix.i]!=0),'-Infinity'::DOUBLE),0.0) AS logunit
         FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
-        LEFT JOIN __reg_rows0 r ON true GROUP BY ix.i)
+        LEFT JOIN __reg_rows0 r ON true CROSS JOIN __reg_responseunits tu GROUP BY ix.i)
 ),
 __reg_rww AS (
-  SELECT r.__reg_rid__, list_transform(r.xs, lambda v,j: __reg_mul_div(r.sw,v,u.units[j])) AS xs,
+  SELECT r.__reg_rid__, list_transform(r.xs, lambda v,j: __reg_exp_scale(v,ln(nullif(r.sw,0.0))+0.5*__reg_log_info(r.eta,family,power,alpha)-u.units[j])) AS xs,
          r.y, r.wt, r.sw, mu, r.eta,
-         CASE WHEN r.sw = 0 THEN 0.0 ELSE
-           CASE family WHEN 'logistic' THEN __reg_logit_var(r.eta) WHEN 'linear' THEN 1.0
-             WHEN 'poisson' THEN mu WHEN 'gamma' THEN 1.0
-             WHEN 'tweedie' THEN pow(mu,2.0-power) WHEN 'nbinom' THEN __reg_nb_info(r.eta,alpha) END END AS w,
-         pow(CASE family
-             WHEN 'linear' THEN __reg_weighted_center(r.y,mu,r.sw,(SELECT runit FROM __reg_resunits))
+         (CASE family
+             WHEN 'linear' THEN __reg_weighted_center(r.y,mu,r.sw,ru.runit)
              WHEN 'logistic' THEN r.sw*__reg_logit_pearson(r.y,r.eta)
              WHEN 'poisson' THEN __reg_mul_div(r.sw,r.y-mu,sqrt(mu))
              WHEN 'gamma' THEN __reg_mul_div(r.sw,r.y-mu,mu)
              WHEN 'tweedie' THEN r.sw*((r.y-mu)/mu*pow(mu,1.0-power/2.0))
-             WHEN 'nbinom' THEN r.sw*__reg_nb_pearson(r.y,r.eta,alpha) END,2) AS pearson
+             WHEN 'nbinom' THEN r.sw*__reg_nb_pearson(r.y,r.eta,alpha) END) AS pres,
+         pow(pres,2) AS pearson
   FROM (SELECT *, CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                              WHEN 'linear' THEN eta ELSE exp(eta) END AS mu
         FROM (SELECT r.* REPLACE (__reg_response_scale(y,tu.shift) AS y),
                      __reg_dot(xs || [off],bvec || [1.0])-tu.shift AS eta
               FROM __reg_rows0 r CROSS JOIN __reg_responseunits tu)) r
-  CROSS JOIN __reg_xunits u
-),
--- Remove the common Fisher-information scale before accumulation/inversion;
--- restore it after square roots, so finite standard errors need no finite variance.
-__reg_infounit AS (
-  SELECT coalesce(nullif(max(w),0.0),1.0) AS wunit FROM __reg_rww
+  CROSS JOIN __reg_xunits u CROSS JOIN __reg_resunits ru
 ),
 __reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_rww),
 __reg_idx AS (SELECT unnest(range(1, (SELECT d FROM __reg_dims)+1)) AS i),
@@ -3241,7 +3264,7 @@ __reg_pairs AS (SELECT a.i AS a, b.i AS b FROM __reg_idx a, __reg_idx b),
 __reg_xwx AS (
   SELECT list(rowlist ORDER BY a) AS A FROM (
     SELECT a, list(val ORDER BY b) AS rowlist FROM (
-      SELECT p.a AS a, p.b AS b, sum((__reg_rww.w/(SELECT wunit FROM __reg_infounit)) * __reg_rww.xs[p.a] * __reg_rww.xs[p.b]) AS val
+      SELECT p.a AS a, p.b AS b, sum(__reg_rww.xs[p.a] * __reg_rww.xs[p.b]) AS val
       FROM __reg_rww, __reg_pairs p GROUP BY p.a, p.b) GROUP BY a)
 ),
 __reg_scal AS (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 0.0 THEN sqrt(row[i]) ELSE 1.0 END) AS dsc FROM __reg_xwx),
@@ -3274,8 +3297,7 @@ __reg_disp AS (
 ),
 __reg_cparams AS (
   SELECT c.Rinv AS Rinv, s.dsc AS dsc, u.units AS units, dp.phi AS phi, dp.uset AS uset, dp.df AS df,
-         (CASE WHEN family IN ('linear','gamma','tweedie') THEN 1.0 ELSE sqrt(ws.wscale) END)
-         * sqrt((SELECT wunit FROM __reg_infounit)) AS se_weight_scale,
+         (CASE WHEN family IN ('linear','gamma','tweedie') THEN 1.0 ELSE sqrt(ws.wscale) END) AS se_weight_scale,
          CASE WHEN dp.uset THEN -t_ppf((1.0-conf_level)/2.0, dp.df)
               ELSE -norm_ppf((1.0-conf_level)/2.0) END AS crit
   FROM __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_disp dp CROSS JOIN __reg_xunits u CROSS JOIN __reg_weightscale ws
@@ -3299,7 +3321,7 @@ __reg_sfeat AS (
 __reg_scoords AS (
   -- Combine response and feature units before forming large extrapolation
   -- coordinates; the interval standard error then already has response units.
-  SELECT sf.*, list_transform(sf.xs, lambda v,a: __reg_mul_div(v,ru.runit,cp.units[a])/cp.dsc[a]) AS zs
+  SELECT sf.*, list_transform(sf.xs, lambda v,a: __reg_exp_scale(v,ln(ru.runit)-cp.units[a])/cp.dsc[a]) AS zs
   FROM __reg_sfeat sf CROSS JOIN __reg_cparams cp CROSS JOIN __reg_resunits ru
 ),
 __reg_sdesign AS (
@@ -3466,21 +3488,22 @@ __reg_resunits AS (
               ELSE 1.0 END AS runit
   FROM __reg_rows0
 ),
--- Normalize root-weighted feature units before cross-products. The original
--- vectors still form eta; covariance uses these units and is transformed back.
+-- Joint root-information/feature scales, stored in logs so even a scale
+-- outside DOUBLE range can cancel before coordinates or standard errors form.
 __reg_xunits AS (
-  SELECT list(unit ORDER BY i) AS units
-  FROM (SELECT ix.i, coalesce(nullif(max(r.sw*abs(r.xs[ix.i])) FILTER (WHERE r.sw > 0),0.0),1.0) AS unit
+  SELECT list(logunit ORDER BY i) AS units
+  FROM (SELECT ix.i, coalesce(nullif(max(ln(nullif(abs(r.xs[ix.i]),0.0))+ln(nullif(r.sw,0.0))
+                   +0.5*__reg_log_info(__reg_dot(r.xs || [r.off],r.bvec || [1.0])-tu.shift,family,power,alpha))
+                   FILTER (WHERE r.sw>0 AND r.xs[ix.i]!=0),'-Infinity'::DOUBLE),0.0) AS logunit
         FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
-        LEFT JOIN __reg_rows0 r ON true GROUP BY ix.i)
+        LEFT JOIN __reg_rows0 r ON true CROSS JOIN __reg_responseunits tu GROUP BY ix.i)
 ),
 -- per row: mu, observed weight hw, variance V, residual, unit deviance
 __reg_pr AS (
-  SELECT __reg_rid__, list_transform(xs, lambda v,j: __reg_mul_div(sw,v,u.units[j])) AS xs, wt, sw, y, mu, eta,
-         CASE WHEN sw = 0 THEN 0.0 ELSE (CASE family WHEN 'logistic' THEN __reg_logit_var(eta) WHEN 'linear' THEN 1.0
-                 WHEN 'poisson' THEN mu WHEN 'gamma' THEN y/mu
-                 WHEN 'tweedie' THEN __reg_tw_observed(y,mu,power)
-                 WHEN 'nbinom' THEN __reg_nb_observed(y,eta,alpha) END) END AS hwt,
+  SELECT __reg_rid__, list_transform(xs, lambda v,j: __reg_exp_scale(v,ln(nullif(sw,0.0))+0.5*__reg_log_info(eta,family,power,alpha)-u.units[j])) AS xs, wt, sw, y, mu, eta,
+         CASE WHEN family='logistic' THEN list_transform(r.xs,lambda v,j:
+              __reg_logit_score_coord(v,sw,y,eta,u.units[j])) END AS logit_scores,
+         CASE WHEN sw=0 THEN 0.0 ELSE __reg_observed_ratio(y,eta,family,power,alpha) END AS hwt,
          CASE WHEN family = 'logistic' THEN __reg_logit_resid(y,eta)
               WHEN family = 'linear' THEN __reg_weighted_center(y,mu,sw,ru.runit) ELSE y-mu END AS resid,
          (CASE family WHEN 'logistic' THEN __reg_logit_var(eta) WHEN 'linear' THEN 1.0 WHEN 'poisson' THEN mu
@@ -3519,7 +3542,8 @@ __reg_breadinv AS (
 __reg_lev AS (
   SELECT p.__reg_rid__,
          list_sum(list_transform(p.xs, lambda xa, a: xa * list_dot_product(bi.Ainv[a], p.xs))) AS xax,
-         (p.hwt/bs.hunit) * xax AS h, bs.hunit AS hunit
+         (p.hwt/bs.hunit) * xax AS h, bs.hunit AS hunit,
+         list_sum(list_transform(p.logit_scores,lambda v,j: v*list_dot_product(bi.Ainv[j],p.logit_scores)))/bs.hunit AS score_xax
   FROM __reg_pr p CROSS JOIN __reg_breadinv bi CROSS JOIN __reg_breadscale bs
 ),
 __reg_disp AS (
@@ -3546,7 +3570,7 @@ __reg_diag AS (
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN pearson_resid / sqrt(dp.phi*(1.0-l.h)) END AS std_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN
               CASE WHEN family = 'logistic'
-                   THEN (p.sw*p.resid)*((p.sw*p.resid)/l.hunit)*l.xax / (dp.d*(1.0-l.h)*(1.0-l.h))
+                   THEN l.score_xax/(dp.d*(1.0-l.h)*(1.0-l.h))
                    ELSE (pearson_resid*pearson_resid/dp.phi) * l.h / (dp.d*(1.0-l.h)*(1.0-l.h)) END END AS cooks_distance
   FROM __reg_pr p JOIN __reg_lev l ON l.__reg_rid__ = p.__reg_rid__ CROSS JOIN __reg_disp dp
 )
