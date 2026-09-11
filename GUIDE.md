@@ -204,6 +204,9 @@ SELECT * FROM tweedie_predict('pure_premium', 'renewals');
 SELECT * FROM nbinom_predict('visits_model', 'new_patients');
 ```
 
+Confidence levels for all summaries and prediction intervals must be finite
+and strictly between 0 and 1.
+
 **Prediction intervals** (`*_predict_ci`) add a **confidence band on the
 predicted mean** to the point prediction. The coefficient covariance
 `φ·(XᵀWX)⁻¹` is estimated from the training table, giving each row's linear

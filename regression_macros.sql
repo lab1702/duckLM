@@ -979,7 +979,11 @@ __reg_rows AS (
     WHERE z.z IS NOT NULL AND y.y IS NOT NULL
 ),
 __reg_evalcheck AS (
-    SELECT CASE WHEN (SELECT count(*) FROM __reg_rows) = 0
+    SELECT CASE WHEN family = 'nbinom' AND (alpha IS NULL OR NOT isfinite(alpha) OR alpha <= 0)
+                THEN error(caller || ': alpha must be finite and > 0')
+                WHEN family = 'tweedie' AND (power IS NULL OR NOT isfinite(power) OR power < 1)
+                THEN error(caller || ': power must be finite and >= 1')
+                WHEN (SELECT count(*) FROM __reg_rows) = 0
                 THEN error(caller || ': no rows with a non-NULL prediction and outcome to evaluate')
                 WHEN family = 'logistic' AND EXISTS (SELECT 1 FROM __reg_rows WHERE y NOT IN (0,1))
                 THEN error(caller || ': outcome must be binary (0/1 or boolean)')
@@ -1157,7 +1161,9 @@ FROM __reg_eval(model, tbl, outcome, 'tweedie', 'tweedie_evaluate', offset_col, 
 
 CREATE OR REPLACE MACRO nbinom_evaluate(model, tbl, outcome, alpha := 1.0, offset_col := NULL) AS TABLE
 SELECT n, rmse, mae, loglik, deviance, null_deviance, pseudo_r2, dispersion, aic, bic
-FROM __reg_eval(model, tbl, outcome, 'nbinom', 'nbinom_evaluate', offset_col, NULL, alpha);
+FROM __reg_eval(model, tbl, outcome, 'nbinom', 'nbinom_evaluate', offset_col, NULL,
+  CASE WHEN alpha IS NULL OR NOT isfinite(alpha) OR alpha <= 0
+       THEN error('nbinom_evaluate: alpha must be finite and > 0') ELSE alpha END);
 
 
 -- ---------------------------------------------------------------------------
@@ -2257,7 +2263,9 @@ __reg_cols AS (
        UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
 ),
 __reg_inputcheck AS (
-  SELECT CASE WHEN starts_with(lower(tbl), '__reg_') OR starts_with(lower(model), '__reg_')
+  SELECT CASE WHEN conf_level IS NULL OR NOT isfinite(conf_level) OR conf_level <= 0 OR conf_level >= 1
+              THEN error(caller || ': conf_level must be finite and strictly between 0 and 1')
+              WHEN starts_with(lower(tbl), '__reg_') OR starts_with(lower(model), '__reg_')
               THEN error(caller || ': table names beginning with "__reg_" are reserved for internal use; please rename')
               WHEN EXISTS (SELECT 1 FROM __reg_cols WHERE starts_with(lower(colname), '__reg_'))
               THEN error(caller || ': column names beginning with "__reg_" are reserved for internal use; please rename')
@@ -2553,7 +2561,9 @@ __reg_scorecols AS (
        UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
 ),
 __reg_inputcheck AS (
-  SELECT CASE WHEN starts_with(lower(tbl), '__reg_') OR starts_with(lower(model), '__reg_')
+  SELECT CASE WHEN conf_level IS NULL OR NOT isfinite(conf_level) OR conf_level <= 0 OR conf_level >= 1
+              THEN error(caller || ': conf_level must be finite and strictly between 0 and 1')
+              WHEN starts_with(lower(tbl), '__reg_') OR starts_with(lower(model), '__reg_')
                 OR starts_with(lower(coalesce(newdata, tbl)), '__reg_')
               THEN error(caller || ': table names beginning with "__reg_" are reserved for internal use; please rename')
               WHEN EXISTS (SELECT 1 FROM __reg_cols WHERE starts_with(lower(colname), '__reg_'))
@@ -2874,7 +2884,9 @@ __reg_cols AS (
        UNPIVOT INCLUDE NULLS (v FOR colname IN (COLUMNS(* EXCLUDE (__reg_one))))
 ),
 __reg_inputcheck AS (
-  SELECT CASE WHEN starts_with(lower(tbl), '__reg_') OR starts_with(lower(model), '__reg_')
+  SELECT CASE WHEN conf_level IS NULL OR NOT isfinite(conf_level) OR conf_level <= 0 OR conf_level >= 1
+              THEN error('multinom_summary' || ': conf_level must be finite and strictly between 0 and 1')
+              WHEN starts_with(lower(tbl), '__reg_') OR starts_with(lower(model), '__reg_')
               THEN error('multinom_summary: table names beginning with "__reg_" are reserved for internal use; please rename')
               WHEN EXISTS (SELECT 1 FROM __reg_cols WHERE starts_with(lower(colname), '__reg_'))
               THEN error('multinom_summary: column names beginning with "__reg_" are reserved for internal use; please rename')

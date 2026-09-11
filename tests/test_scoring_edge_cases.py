@@ -282,3 +282,15 @@ def test_binary_evaluation_rejects_nonbinary_holdout(con):
     con.execute('CREATE TABLE bad_holdout AS SELECT i::DOUBLE x,i::DOUBLE y FROM range(6)t(i)')
     with pytest.raises(duckdb.Error,match='outcome must be binary'):
         con.execute("SELECT * FROM logit_evaluate('binary_model','bad_holdout','y')").fetchall()
+
+
+@pytest.mark.parametrize('family,parameter,values',[
+    ('nbinom','alpha',['0','-1','NULL',"'NaN'::DOUBLE","'Infinity'::DOUBLE"]),
+    ('tweedie','power',['.5','-1','NULL',"'NaN'::DOUBLE","'Infinity'::DOUBLE"]),
+])
+def test_evaluation_rejects_invalid_distribution_parameters(con,family,parameter,values):
+    con.execute("CREATE TABLE invalid_parameter_model AS SELECT '(Intercept)' feature,0.0 coefficient")
+    con.execute('CREATE TABLE invalid_parameter_data AS SELECT 1.0 y')
+    for value in values:
+        with pytest.raises(duckdb.Error,match=parameter+' must be finite'):
+            con.execute(f"SELECT * FROM {family}_evaluate('invalid_parameter_model','invalid_parameter_data','y',{parameter}:={value})").fetchall()

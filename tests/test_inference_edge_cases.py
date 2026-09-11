@@ -364,3 +364,17 @@ def test_nb_influence_deviance_has_poisson_limit(con,alpha):
     actual=con.execute(f"SELECT deviance_resid FROM nbinom_influence('nb_residual_model','nb_residual_data','y',alpha:={alpha})").fetchone()[0]
     expected=-np.sqrt(2*(-np.log(2)-(1+1/alpha)*np.log1p(-alpha/(1+2*alpha))))
     assert actual==pytest.approx(expected,abs=1e-10)
+
+
+@pytest.mark.parametrize('confidence',['-0.95','0','1','1.1','NULL',"'NaN'::DOUBLE", "'Infinity'::DOUBLE"])
+@pytest.mark.parametrize('kind',['summary','predict_ci','multinom_summary'])
+def test_inference_rejects_invalid_confidence_levels(con,confidence,kind):
+    con.execute("CREATE TABLE bad_conf_data AS SELECT i::DOUBLE x,1.0+i y FROM range(4)t(i)")
+    if kind=='multinom_summary':
+        con.execute("CREATE TABLE bad_conf_model AS SELECT * FROM (VALUES ('a','(Intercept)',0.),('b','(Intercept)',0.)) t(class,feature,coefficient)")
+        call='multinom_summary'
+    else:
+        con.execute("CREATE TABLE bad_conf_model AS SELECT '(Intercept)' feature,1.0 coefficient")
+        call='linreg_'+kind
+    with pytest.raises(duckdb.Error,match='conf_level must be finite and strictly between 0 and 1'):
+        con.execute(f"SELECT * FROM {call}('bad_conf_model','bad_conf_data','y',conf_level:={confidence})").fetchall()
