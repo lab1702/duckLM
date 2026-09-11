@@ -894,6 +894,50 @@ def test_logistic_score_coordinates_survive_vanishing_information(con, offset):
     assert cook == pytest.approx(2/3,rel=1e-10)
 
 
+@pytest.mark.parametrize('robust', ['hc0','hc1','hc2','hc3','cluster'])
+@pytest.mark.parametrize('repeats', [1,3])
+@pytest.mark.parametrize('weight', [1e-100,1.,1e100])
+def test_poisson_robust_covariance_preserves_finite_large_count_errors(con, robust, repeats, weight):
+    con.execute("CREATE TABLE count_model AS SELECT * FROM (VALUES ('(Intercept)',ln(8e307)),('x',0.))t(feature,coefficient)")
+    con.execute(f'CREATE TABLE large_counts AS SELECT i%4//2 AS x,CASE WHEN i%2=0 THEN 0. ELSE 1.6e308 END y,{weight} w,i grp FROM range({4*repeats})t(i)')
+    extra = "cluster_col:='grp'" if robust == 'cluster' else f"robust:='{robust}'"
+    errors = dict(con.execute(f"SELECT feature,std_error FROM poisson_summary('count_model','large_counts','y',weights_col:='w',{extra})").fetchall())
+    n = 4*repeats
+    correction = {'hc0':1.,'hc1':np.sqrt(n/(n-2)),
+                  'hc2':1/np.sqrt(1-2/n),'hc3':1/(1-2/n),
+                  'cluster':np.sqrt(n/(n-2))}[robust]
+    assert errors == pytest.approx({'(Intercept)':correction/np.sqrt(2*repeats),
+                                    'x':correction/np.sqrt(repeats)},rel=1e-10)
+
+
+@pytest.mark.parametrize('direction', [-1.,1.])
+@pytest.mark.parametrize('magnitude', [1e308,1.6e308])
+@pytest.mark.parametrize('weight', [1e-100,1.,1e100])
+def test_logistic_deviance_residual_takes_root_before_doubling_loss(con, direction, magnitude, weight):
+    outcome = 0. if direction > 0 else 1.
+    con.execute(f"CREATE TABLE loss_model AS SELECT * FROM (VALUES ('(Intercept)',{-direction}*ln(3.)),('x',0.))t(feature,coefficient)")
+    con.execute(f'CREATE TABLE loss_rows AS SELECT *,{weight} w FROM (VALUES (-1.,0.,0.),(-1.,1.,0.),(1.,0.,0.),(1.,1.,0.),(0.,{outcome},{direction*magnitude}))t(x,y,expo)')
+    residual,cook = con.execute("SELECT deviance_resid,cooks_distance FROM logit_influence('loss_model','loss_rows','y',offset_col:='expo',weights_col:='w') WHERE expo!=0").fetchone()
+    expected = -direction*np.sqrt(2)*np.sqrt(magnitude)*np.sqrt(weight)
+    assert np.isfinite(residual)
+    assert residual/expected == pytest.approx(1.,rel=1e-12)
+    assert cook/weight == pytest.approx(2/3,rel=1e-10)
+
+
+@pytest.mark.parametrize('family', ['poisson','gamma','nbinom'])
+def test_log_link_deviance_residual_takes_root_before_doubling_loss(con, family):
+    mean,outcome = (1.,1.6e308) if family == 'gamma' else (1.6e308,0.)
+    con.execute("CREATE TABLE halfdev_model AS SELECT '(Intercept)' feature,ln(?) coefficient",[mean])
+    con.execute('CREATE TABLE halfdev_rows AS SELECT ?::DOUBLE y FROM range(3)',[outcome])
+    extra = ',alpha:=1e-308' if family == 'nbinom' else ''
+    rows = con.execute(f"SELECT deviance_resid FROM {family}_influence('halfdev_model','halfdev_rows','y'{extra})").fetchall()
+    halfdev = np.log1p(1e-308*mean)/1e-308 if family == 'nbinom' else 1.6e308
+    expected = (1 if family == 'gamma' else -1)*np.sqrt(2)*np.sqrt(halfdev)
+    for residual, in rows:
+        assert np.isfinite(residual)
+        assert residual/expected == pytest.approx(1.,rel=1e-10)
+
+
 @pytest.mark.parametrize('scale', [1e-305, 1e-170, 1e170, 1e305])
 @pytest.mark.parametrize('robust', ['none', 'hc0', 'hc1', 'hc2', 'hc3', 'cluster'])
 def test_linear_inference_preserves_extreme_response_units(con, scale, robust):

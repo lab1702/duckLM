@@ -2728,8 +2728,8 @@ CREATE OR REPLACE MACRO __reg_logit_devres(y, eta) AS (
        THEN (2*y-1)*sqrt(2.0)*exp(-abs(eta)/2.0)
             * CASE WHEN abs(eta) > 30 THEN 1.0
                    ELSE sqrt(__reg_log1p(exp(-abs(eta)))/exp(-abs(eta))) END
-       ELSE sign(__reg_logit_resid(y,eta))*sqrt(2.0*(
-            y*greatest(-eta,0.0)+(1-y)*greatest(eta,0.0)+__reg_log1p(exp(-abs(eta))))) END
+       ELSE sign(__reg_logit_resid(y,eta))*sqrt(2.0)*sqrt(
+            y*greatest(-eta,0.0)+(1-y)*greatest(eta,0.0)+__reg_log1p(exp(-abs(eta)))) END
 );
 
 -- Retain information scales in logs until they are combined with sample
@@ -3005,6 +3005,12 @@ __reg_robrow AS (
   SELECT r.* REPLACE (hwt/s.hunit AS hwt, list_transform(sg,lambda v: v/s.hunit) AS sg)
   FROM __reg_robraw r CROSS JOIN __reg_robscale s
 ),
+-- Score squares and their sum may overflow although the final sandwich SE
+-- is finite. Restore this common scale only after taking the square root.
+__reg_scoreunit AS (
+  SELECT coalesce(nullif(max(list_max(list_transform(sg,lambda v: abs(v)))),0.0),1.0) AS unit
+  FROM __reg_robrow
+),
 __reg_rdims AS (SELECT count(DISTINCT cl)::INT AS G FROM __reg_robrow),
 __reg_breada AS (
   SELECT list(rowlist ORDER BY a) AS A FROM (
@@ -3018,9 +3024,9 @@ __reg_breadinv AS (
         FROM (SELECT A, list_transform(A, lambda row, i: CASE WHEN row[i] > 0.0 THEN sqrt(row[i]) ELSE 1.0 END) AS dscA FROM __reg_breada))
 ),
 __reg_lev AS (
-  SELECT r.xs, r.sg, r.cl, r.wt,
+  SELECT r.xs, list_transform(r.sg,lambda v: v/su.unit) AS sg, r.cl, r.wt,
          r.hwt * list_sum(list_transform(r.xs, lambda xa, a: xa * list_dot_product(bi.Ainv[a], r.xs))) AS h
-  FROM __reg_robrow r CROSS JOIN __reg_breadinv bi
+  FROM __reg_robrow r CROSS JOIN __reg_breadinv bi CROSS JOIN __reg_scoreunit su
 ),
 __reg_meat_hc AS (
   SELECT list(rowlist ORDER BY a) AS B FROM (
@@ -3072,6 +3078,7 @@ __reg_final AS (
 -- per-coefficient SE with guards: NULL when the covariance is singular / non-finite / non-positive
 __reg_percoef AS (
   SELECT gs.i AS i, names[gs.i] AS feature, bvec[gs.i] AS coefficient, uset, df, crit, units[gs.i] AS feature_logunit,
+         CASE WHEN robactive THEN ln((SELECT unit FROM __reg_scoreunit)) ELSE 0.0 END AS score_logunit,
          CASE WHEN robactive THEN
                 -- A singular design cannot identify coefficient uncertainty.
                 -- df <= 0 (saturated): robust variance is undefined; at n==d the
@@ -3083,7 +3090,7 @@ __reg_percoef AS (
          END AS scaled_std_error
   FROM __reg_final, unnest(range(1, len(bvec)+1)) AS gs(i)
 )
-SELECT feature, coefficient, __reg_exp_scale(scaled_std_error,ln(ru.runit)-feature_logunit) AS std_error,
+SELECT feature, coefficient, __reg_exp_scale(scaled_std_error,ln(ru.runit)+score_logunit-feature_logunit) AS std_error,
        coefficient / std_error AS statistic,
        CASE WHEN std_error IS NULL THEN NULL
             WHEN uset THEN 2.0 * __reg_t_sf(abs(coefficient / std_error), df)
@@ -3509,12 +3516,10 @@ __reg_pr AS (
          (CASE family WHEN 'logistic' THEN __reg_logit_var(eta) WHEN 'linear' THEN 1.0 WHEN 'poisson' THEN mu
                  WHEN 'gamma' THEN mu*mu WHEN 'tweedie' THEN pow(mu,power) WHEN 'nbinom' THEN mu*(1.0+alpha*mu) END) AS Vmu,
          (CASE family
-            WHEN 'logistic' THEN 2.0*(y*greatest(-eta,0.0)+(1-y)*greatest(eta,0.0)+__reg_log1p(exp(-abs(eta))))
-            WHEN 'linear'   THEN resid*resid
-            WHEN 'poisson'  THEN 2.0*__reg_tw_halfdev(y,eta,1.0)
-            WHEN 'gamma'    THEN 2.0*__reg_tw_halfdev(y,eta,2.0)
-            WHEN 'tweedie'  THEN 2.0*__reg_tw_halfdev(y,eta,power)
-            WHEN 'nbinom'   THEN 2.0*__reg_nb_halfdev(y,eta,alpha) END) AS udev
+            WHEN 'poisson'  THEN __reg_tw_halfdev(y,eta,1.0)
+            WHEN 'gamma'    THEN __reg_tw_halfdev(y,eta,2.0)
+            WHEN 'tweedie'  THEN __reg_tw_halfdev(y,eta,power)
+            WHEN 'nbinom'   THEN __reg_nb_halfdev(y,eta,alpha) END) AS halfdev
   FROM (SELECT __reg_rid__, xs, wt, sw, y, eta,
                CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                            WHEN 'linear' THEN eta ELSE exp(eta) END AS mu
@@ -3566,7 +3571,7 @@ __reg_diag AS (
               ELSE __reg_mul_div(p.sw,p.resid,sqrt(p.Vmu)) END AS pearson_resid,
          CASE WHEN family = 'logistic' THEN p.sw*__reg_logit_devres(p.y,p.eta)
               WHEN family = 'linear' THEN p.resid
-              ELSE sign(p.resid) * p.sw * sqrt(greatest(p.udev, 0.0)) END AS deviance_resid,
+              ELSE sign(p.resid) * p.sw * sqrt(2.0) * sqrt(greatest(p.halfdev, 0.0)) END AS deviance_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN pearson_resid / sqrt(dp.phi*(1.0-l.h)) END AS std_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN
               CASE WHEN family = 'logistic'
