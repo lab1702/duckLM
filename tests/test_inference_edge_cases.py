@@ -21,6 +21,17 @@ def load(con, name, data):
     con.unregister("edge_source")
 
 
+@pytest.mark.parametrize('robust', ['none','hc0','hc1','hc2','hc3','cluster'])
+def test_exact_linear_fit_preserves_zero_coefficient_uncertainty(con, robust):
+    con.execute('CREATE TABLE exact_fit AS SELECT i::DOUBLE x,3.0::DOUBLE y FROM range(6)t(i)')
+    con.execute("CREATE TABLE exact_model AS SELECT * FROM linreg_fit('exact_fit','y')")
+    con.execute('ALTER TABLE exact_fit ADD COLUMN cl INTEGER')
+    con.execute('UPDATE exact_fit SET cl=x::INTEGER%2')
+    extra = "cluster_col:='cl'" if robust == 'cluster' else f"robust:='{robust}'"
+    rows = con.execute(f"SELECT coefficient,std_error,conf_low,conf_high FROM linreg_summary('exact_model','exact_fit','y',{extra})").fetchall()
+    assert rows == [(3.,0.,3.,3.),(0.,0.,0.,0.)]
+
+
 def model(con, feature="x", name="edge_model", multinomial=False):
     data = pd.DataFrame({"feature": ["(Intercept)", feature], "coefficient": [0.3, 0.2]})
     if multinomial:

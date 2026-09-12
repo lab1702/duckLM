@@ -3090,7 +3090,8 @@ __reg_final AS (
   FROM __reg_beta b CROSS JOIN __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_disp dp CROSS JOIN __reg_robvar rv
        CROSS JOIN __reg_robchk rc CROSS JOIN __reg_xunits u CROSS JOIN __reg_weightscale ws WHERE rc.ok
 ),
--- per-coefficient SE with guards: NULL when the covariance is singular / non-finite / non-positive
+-- per-coefficient SE with guards: NULL when covariance is singular / non-finite / negative.
+-- An exact fit can have valid zero variance, giving a collapsed interval.
 __reg_percoef AS (
   SELECT gs.i AS i, names[gs.i] AS feature, bvec[gs.i] AS coefficient, uset, df, crit, units[gs.i] AS feature_logunit,
          CASE WHEN robactive THEN ln((SELECT unit FROM __reg_scoreunit)) ELSE 0.0 END AS score_logunit,
@@ -3098,9 +3099,10 @@ __reg_percoef AS (
                 -- A singular design cannot identify coefficient uncertainty.
                 -- df <= 0 (saturated): robust variance is undefined; at n==d the
                 -- leverage h->1 makes hc2/hc3's sc^2/(1-h)^k a 0/0 finite artifact
-                CASE WHEN Rinv IS NOT NULL AND df > 0.0 AND isfinite(rv[gs.i]) AND rv[gs.i] > 0.0 THEN sqrt(rv[gs.i]) ELSE NULL END
+                CASE WHEN Rinv IS NOT NULL AND df > 0.0 AND isfinite(rv[gs.i]) AND rv[gs.i] >= 0.0 THEN sqrt(rv[gs.i]) ELSE NULL END
               ELSE
-                CASE WHEN Rinv IS NOT NULL AND isfinite(phi * Rinv[gs.i][gs.i]) AND phi * Rinv[gs.i][gs.i] > 0.0
+                CASE WHEN Rinv IS NOT NULL AND (NOT est OR df > 0.0)
+                          AND isfinite(phi * Rinv[gs.i][gs.i]) AND phi * Rinv[gs.i][gs.i] >= 0.0
                      THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] / (CASE WHEN est THEN 1.0 ELSE sqrt(wscale) END) ELSE NULL END
          END AS scaled_std_error
   FROM __reg_final, unnest(range(1, len(bvec)+1)) AS gs(i)

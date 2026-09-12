@@ -350,7 +350,10 @@ penalty). Collinear, constant, or severely ill-conditioned features make `XᵀWX
 singular/indefinite, so every `std_error`/`statistic`/`p_value`/CI is returned
 as **NULL** rather than a fabricated value (the `coefficient` column is still
 reported); the same happens for the estimated-dispersion families when residual
-df `n − d ≤ 0`. Degenerate inputs return NULL, never an error.
+df `n − d ≤ 0`. An exact fit with an identifiable design and positive residual
+df retains zero standard errors and confidence intervals collapsed to the
+coefficients. A zero coefficient divided by zero SE gives an undefined (`NaN`)
+statistic and p-value. Undefined covariance returns NULL, never an error.
 
 **Multinomial** inference is `multinom_summary(model, tbl, outcome, conf_level := 0.95)`.
 It inverts the baseline-category softmax Fisher information (the block matrix
