@@ -1176,14 +1176,16 @@ CREATE OR REPLACE MACRO __reg_nb_score(y, eta, alpha) AS (
 );
 
 -- Pearson residual for variance mu^power, restoring its log scale only after
--- taking the response difference. This includes Gamma (power=2).
-CREATE OR REPLACE MACRO __reg_tw_pearson(y, eta, power) AS (
-  CASE WHEN eta >= 0 THEN
+-- taking the response difference. This includes Gamma (power=2). Incorporate
+-- root weights before exponentiation so finite weighted residuals survive.
+CREATE OR REPLACE MACRO __reg_tw_pearson(y, eta, power, root_weight := 1.0) AS (
+  CASE WHEN root_weight=0 THEN 0.0
+       WHEN eta >= 0 THEN
          __reg_exp_scale((CASE WHEN isfinite(exp(eta)) THEN y/exp(eta)
-                              ELSE __reg_exp_scale(y,-eta) END)-1.0,(1.0-power/2.0)*eta)
-       WHEN exp(eta)>0 THEN __reg_exp_scale(y-exp(eta),-(power/2.0)*eta)
-       WHEN y=0 THEN -exp((1.0-power/2.0)*eta)
-       ELSE __reg_exp_scale(1.0-exp(eta-ln(y)),ln(y)-(power/2.0)*eta) END
+                              ELSE __reg_exp_scale(y,-eta) END)-1.0,(1.0-power/2.0)*eta+ln(root_weight))
+       WHEN exp(eta)>0 THEN __reg_exp_scale(y-exp(eta),-(power/2.0)*eta+ln(root_weight))
+       WHEN y=0 THEN -exp((1.0-power/2.0)*eta+ln(root_weight))
+       ELSE __reg_exp_scale(1.0-exp(eta-ln(y)),ln(y)-(power/2.0)*eta+ln(root_weight)) END
 );
 
 -- Fitting retains log(alpha*mean(y)), even when the product is outside DOUBLE.
@@ -2802,8 +2804,8 @@ CREATE OR REPLACE MACRO __reg_log_info(eta, family, power, alpha) AS (
                               ELSE eta-__reg_softplus(ln(alpha)+eta) END END
 );
 CREATE OR REPLACE MACRO __reg_observed_ratio(y, eta, family, power, alpha) AS (
-  CASE family WHEN 'gamma' THEN y/exp(eta)
-       WHEN 'tweedie' THEN 1.0+(power-1.0)*(y/exp(eta)-1.0)
+  CASE family WHEN 'gamma' THEN __reg_exp_scale(y,-eta)
+       WHEN 'tweedie' THEN 1.0+(power-1.0)*(__reg_exp_scale(y,-eta)-1.0)
        WHEN 'nbinom' THEN exp(CASE WHEN y=0 THEN 0.0 ELSE __reg_softplus(ln(alpha)+ln(y)) END
                               -__reg_softplus(ln(alpha)+eta))
        ELSE 1.0 END
@@ -2956,8 +2958,8 @@ __reg_rww AS (
              WHEN 'linear' THEN __reg_weighted_center(r.y,mu,r.sw,ru.runit)
              WHEN 'logistic' THEN r.sw*__reg_logit_pearson(r.y,r.eta)
              WHEN 'poisson' THEN r.sw*__reg_nb_pearson(r.y,r.eta,0.0)
-             WHEN 'gamma' THEN __reg_mul_div(r.sw,r.y-mu,mu)
-             WHEN 'tweedie' THEN r.sw*((r.y-mu)/mu*pow(mu,1.0-power/2.0))
+             WHEN 'gamma' THEN __reg_tw_pearson(r.y,r.eta,2.0,r.sw)
+             WHEN 'tweedie' THEN __reg_tw_pearson(r.y,r.eta,power,r.sw)
              WHEN 'nbinom' THEN r.sw*__reg_nb_pearson(r.y,r.eta,alpha) END) AS pres,
          pow(pres,2) AS pearson,
          CASE WHEN family='logistic' THEN list_transform(r.xs,lambda v,j:
@@ -3309,8 +3311,8 @@ __reg_rww AS (
              WHEN 'linear' THEN __reg_weighted_center(r.y,mu,r.sw,ru.runit)
              WHEN 'logistic' THEN r.sw*__reg_logit_pearson(r.y,r.eta)
              WHEN 'poisson' THEN r.sw*__reg_nb_pearson(r.y,r.eta,0.0)
-             WHEN 'gamma' THEN __reg_mul_div(r.sw,r.y-mu,mu)
-             WHEN 'tweedie' THEN r.sw*((r.y-mu)/mu*pow(mu,1.0-power/2.0))
+             WHEN 'gamma' THEN __reg_tw_pearson(r.y,r.eta,2.0,r.sw)
+             WHEN 'tweedie' THEN __reg_tw_pearson(r.y,r.eta,power,r.sw)
              WHEN 'nbinom' THEN r.sw*__reg_nb_pearson(r.y,r.eta,alpha) END) AS pres,
          pow(pres,2) AS pearson
   FROM (SELECT *, CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
@@ -3610,8 +3612,8 @@ __reg_disp AS (
   SELECT CASE WHEN family IN ('linear','gamma','tweedie')
               THEN (SELECT sum(CASE family
                      WHEN 'linear' THEN resid*resid
-                     WHEN 'gamma' THEN pow(__reg_mul_div(sw,resid,mu),2)
-                     WHEN 'tweedie' THEN pow(sw*(resid/mu * pow(mu,1.0-power/2.0)),2)
+                     WHEN 'gamma' THEN pow(__reg_tw_pearson(y,eta,2.0,sw),2)
+                     WHEN 'tweedie' THEN pow(__reg_tw_pearson(y,eta,power,sw),2)
                      ELSE pow(__reg_mul_div(sw,resid,sqrt(Vmu)),2) END) FROM __reg_pr) / nullif((SELECT n-d FROM __reg_dims), 0) ELSE 1.0 END AS phi,
          (SELECT d FROM __reg_dims) AS d
 ),
@@ -3621,8 +3623,8 @@ __reg_diag AS (
          CASE WHEN family = 'logistic' THEN p.sw*__reg_logit_pearson(p.y,p.eta)
               WHEN family = 'poisson' THEN p.sw*__reg_nb_pearson(p.y,p.eta,0.0)
               WHEN family = 'nbinom' THEN p.sw*__reg_nb_pearson(p.y,p.eta,alpha)
-              WHEN family = 'gamma' THEN p.sw*(p.resid/p.mu)
-              WHEN family = 'tweedie' THEN p.sw*(p.resid/p.mu)*pow(p.mu,1.0-power/2.0)
+              WHEN family = 'gamma' THEN __reg_tw_pearson(p.y,p.eta,2.0,p.sw)
+              WHEN family = 'tweedie' THEN __reg_tw_pearson(p.y,p.eta,power,p.sw)
               WHEN family = 'linear' THEN p.resid
               ELSE __reg_mul_div(p.sw,p.resid,sqrt(p.Vmu)) END AS pearson_resid,
          CASE WHEN family = 'logistic' THEN p.sw*__reg_logit_devres(p.y,p.eta)

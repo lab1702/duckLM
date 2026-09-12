@@ -1224,3 +1224,73 @@ def test_tweedie_inference_combines_mean_powers_before_scaling(con, power, scale
     assert np.isfinite(summaries).all() and np.isfinite(hats).all()
     np.testing.assert_allclose(summaries[1],summaries[0],rtol=1e-8)
     np.testing.assert_allclose(hats[1],hats[0],rtol=1e-8)
+
+
+@pytest.mark.parametrize('family,power', [('gamma', 2.0), ('tweedie', 1.5)])
+@pytest.mark.parametrize('robust', ['none', 'hc0', 'hc2', 'hc3'])
+def test_inference_retains_underflowed_log_link_means(con, family, power, robust):
+    from scipy.stats import t
+
+    x = np.arange(4.)
+    y = np.array([1e-320, 2e-320, 3e-320, 4e-320])
+    design = np.column_stack([np.ones(4), x])
+    eta = -750.
+    load(con, 'underflow_data', pd.DataFrame({'x': x, 'y': y}))
+    con.execute("CREATE TABLE underflow_model AS SELECT '(Intercept)' feature,-750.::DOUBLE coefficient UNION ALL SELECT 'x',0.")
+    ratio = np.exp(np.log(y) - eta)
+    root_info = np.exp((1-power/2)*eta)
+    pearson = (ratio-1)*root_info
+    phi = pearson @ pearson / 2
+    fisher_inv = np.linalg.inv(design.T @ design)
+    observed = 1 + (power-1)*(ratio-1)
+    bread_inv = np.linalg.inv(design.T @ (observed[:, None]*design))
+    hat = observed*np.einsum('ij,jk,ik->i', design, bread_inv, design)
+    if robust == 'none':
+        covariance = (phi/root_info/root_info)*fisher_inv
+    else:
+        meat = (ratio-1)**2
+        if robust == 'hc2': meat /= 1-hat
+        if robust == 'hc3': meat /= (1-hat)**2
+        covariance = bread_inv @ (design.T @ (meat[:, None]*design)) @ bread_inv
+    args = "'underflow_model','underflow_data','y'"
+    actual = con.execute(f"SELECT std_error FROM {family}_summary({args},robust:='{robust}')").fetchnumpy()['std_error']
+    np.testing.assert_allclose(actual, np.sqrt(np.diag(covariance)), rtol=1e-10)
+    diag = con.execute(f"SELECT hat,pearson_resid,std_resid,cooks_distance FROM {family}_influence({args})").fetchall()
+    standardized = pearson/np.sqrt(phi*(1-hat))
+    cooks = (pearson**2/phi)*hat/(2*(1-hat)**2)
+    np.testing.assert_allclose(diag, np.column_stack([hat, pearson, standardized, cooks]), rtol=1e-10, atol=0)
+    # Score at a representable mean so NULL or incorrect training covariance
+    # cannot hide behind endpoints that both round to zero.
+    if robust == 'none':
+        con.execute('ALTER TABLE underflow_data ADD COLUMN expo DOUBLE DEFAULT 0')
+        con.execute('CREATE TABLE underflow_new AS SELECT 0.::DOUBLE x,750.::DOUBLE expo')
+        low, high = con.execute(f"SELECT conf_low,conf_high FROM {family}_predict_ci({args},offset_col:='expo',newdata:='underflow_new')").fetchone()
+        radius = t.ppf(.975, 2)*np.sqrt(covariance[0,0])
+        # The large residuals make this interval extend beyond DOUBLE; the
+        # lower endpoint must still be zero rather than missing.
+        assert low == np.exp(-radius)
+        assert np.isinf(high)
+
+
+def test_fitted_gamma_inference_with_underflowed_offset_mean(con):
+    con.execute("""CREATE TABLE underflow_fit AS SELECT * FROM (VALUES
+        (0.,1e-320,-750.,1e-20),(1.,exp(-350.),-350.,1.),
+        (2.,exp(50.),50.,1.),(3.,exp(50.),50.,1.)) t(x,y,expo,w)""")
+    con.execute("CREATE TABLE fitted_underflow AS SELECT * FROM gamma_fit('underflow_fit','y',offset_col:='expo',weights_col:='w',max_iter:=2000)")
+    data = con.sql('FROM underflow_fit').df()
+    beta = con.sql('SELECT coefficient FROM fitted_underflow').fetchnumpy()['coefficient']
+    design = np.column_stack([np.ones(4), data.x])
+    eta = design @ beta + data.expo.to_numpy()
+    ratio = np.exp(np.log(data.y.to_numpy())-eta)
+    pearson = np.sqrt(data.w.to_numpy())*(ratio-1)
+    phi = pearson @ pearson/2
+    inv = np.linalg.inv(design.T @ (data.w.to_numpy()[:,None]*design))
+    args = "'fitted_underflow','underflow_fit','y',offset_col:='expo',weights_col:='w'"
+    actual = con.execute(f'SELECT std_error FROM gamma_summary({args})').fetchnumpy()['std_error']
+    np.testing.assert_allclose(actual, np.sqrt(phi*np.diag(inv)), rtol=1e-9)
+    actual_pearson = con.execute(f'SELECT pearson_resid FROM gamma_influence({args})').fetchnumpy()['pearson_resid']
+    np.testing.assert_allclose(actual_pearson, pearson, rtol=1e-9, atol=1e-13)
+    from scipy.stats import t
+    intervals = con.execute(f'SELECT conf_low,conf_high FROM gamma_predict_ci({args})').fetchall()
+    radius = t.ppf(.975, 2)*np.sqrt(phi*np.einsum('ij,jk,ik->i', design, inv, design))
+    np.testing.assert_allclose(intervals, np.column_stack([np.exp(eta-radius), np.exp(eta+radius)]), rtol=1e-10, atol=0)
