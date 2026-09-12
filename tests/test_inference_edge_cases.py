@@ -600,6 +600,21 @@ def test_student_t_quantiles_reach_large_finite_values(con,df,probability):
     assert con.execute('SELECT t_cdf(?,?)',[actual,df]).fetchone()[0]==pytest.approx(probability,rel=1e-12)
 
 
+@pytest.mark.parametrize('df', [.1,.5])
+@pytest.mark.parametrize('magnitude', [1e308,1.6e308])
+def test_student_t_quantiles_keep_finite_brackets_near_double_limit(con,df,magnitude):
+    import math
+    log_constant=math.lgamma((df+1)/2)-math.lgamma(df/2)-.5*math.log(math.pi)+(df/2-1)*math.log(df)
+    probability=math.exp(log_constant-df*math.log(magnitude))
+    actual=con.execute('SELECT t_ppf(?,?)',[probability,df]).fetchone()[0]
+    assert np.isfinite(actual)
+    assert actual/magnitude==pytest.approx(-1.,rel=1e-11)
+
+
+def test_student_t_quantiles_beyond_double_range_remain_infinite(con):
+    assert con.execute('SELECT t_ppf(1e-200,.5)').fetchone()[0] == -float('inf')
+
+
 @pytest.mark.parametrize('df', [.1,1.,30.,1000.,1e8,1e12,1e15])
 @pytest.mark.parametrize('difference', [-1e-6,-1e-9,1e-9,1e-6])
 def test_student_t_quantiles_preserve_probabilities_near_median(con,df,difference):

@@ -2210,20 +2210,31 @@ __reg_cv_errorunits AS (
   SELECT *, coalesce(nullif(max(__reg_center_scale(yt,eta))
                            OVER (PARTITION BY g),0.0),1.0) AS eunit
   FROM __reg_cv_score
+),
+__reg_cv_losses AS (
+  SELECT *, CASE family
+    WHEN 'logistic' THEN y*greatest(-eta,0.0) + (1-y)*greatest(eta,0.0) + __reg_log1p(exp(-abs(eta)))
+    WHEN 'poisson' THEN __reg_tw_halfdev(y,z,1.0)
+    WHEN 'gamma' THEN __reg_tw_halfdev(y,z,2.0)
+    WHEN 'tweedie' THEN __reg_tw_halfdev(y,z,pw)
+    WHEN 'nbinom' THEN __reg_nb_halfdev(y,z,al)
+  END AS halfdev
+  FROM __reg_cv_errorunits
+),
+__reg_cv_lossunits AS (
+  -- Normalize before aggregation: a finite mean need not have a finite sum.
+  SELECT *, coalesce(nullif(max(halfdev) OVER (PARTITION BY g),0.0),1.0) AS dunit
+  FROM __reg_cv_losses
 )
 SELECT grid[g] AS param,
        CASE WHEN family = 'linear'
             THEN CASE WHEN sum(pow(__reg_centered(yt,eta,eunit),2)) = 0 THEN 0.0
                  ELSE pow(__reg_mul_div(max(eunit),max(sd_y),
                       1.0/sqrt(sum(pow(__reg_centered(yt,eta,eunit),2))/(SELECT n FROM __reg_cv_n))),2) END
-            ELSE sum(CASE family
-             WHEN 'logistic' THEN 2.0 * (y*greatest(-eta,0.0) + (1-y)*greatest(eta,0.0) + __reg_log1p(exp(-abs(eta))))
-             WHEN 'poisson'  THEN 2.0 * __reg_tw_halfdev(y,z,1.0)
-             WHEN 'gamma'    THEN 2.0 * __reg_tw_halfdev(y,z,2.0)
-             WHEN 'tweedie'  THEN 2.0 * __reg_tw_halfdev(y,z,pw)
-             WHEN 'nbinom'   THEN 2.0 * __reg_nb_halfdev(y,z,al)
-           END) / (SELECT n FROM __reg_cv_n) END AS cv_deviance
-FROM __reg_cv_errorunits
+            ELSE CASE WHEN isinf(max(dunit)) THEN 'Infinity'::DOUBLE
+                 ELSE __reg_mul_div(max(dunit),sum(halfdev/dunit),
+                                    (SELECT n FROM __reg_cv_n)/2.0) END END AS cv_deviance
+FROM __reg_cv_lossunits
 GROUP BY g, grid[g]
 ORDER BY g;
 CREATE OR REPLACE MACRO cv_l1(tbl, outcome, family, l1_grid, k := 5, max_iter := 20000, learning_rate := NULL, tol := 1e-8) AS TABLE
@@ -2693,9 +2704,12 @@ CREATE OR REPLACE MACRO __reg_t_ppf(p, df) AS (
                 list_transform([
                   -- Double until the positive quantile is bracketed. Keeping
                   -- the survival probability avoids subtraction near p = 1.
+                  -- Cap at the largest finite DOUBLE so bisection can still
+                  -- reach representable quantiles above the last power of two.
                   list_reduce(list_transform(range(1024), lambda i: struct_pack(hi := 0.0::DOUBLE, sf := 0.0::DOUBLE)),
                     lambda bound, unused: CASE WHEN bound.sf > q
-                      THEN struct_pack(hi := bound.hi*2.0, sf := __reg_t_sf(bound.hi*2.0, dd))
+                      THEN struct_pack(hi := least(bound.hi*2.0,1.7976931348623157e308),
+                        sf := __reg_t_sf(least(bound.hi*2.0,1.7976931348623157e308), dd))
                       ELSE bound END,
                     struct_pack(hi := 1.0::DOUBLE, sf := __reg_t_sf(1.0, dd))).hi
                 ], lambda upper:
@@ -2706,7 +2720,8 @@ CREATE OR REPLACE MACRO __reg_t_ppf(p, df) AS (
                         ELSE struct_pack(lo := bounds.lo, hi := bounds.lo/2.0 + bounds.hi/2.0) END,
                       struct_pack(lo := 0.0::DOUBLE, hi := upper))
                   ], lambda bounds: (CASE WHEN p < 0.5 THEN -1.0 ELSE 1.0 END)
-                      * (bounds.lo/2.0 + bounds.hi/2.0))[1]
+                      * CASE WHEN __reg_t_sf(upper,dd) > q THEN 'Infinity'::DOUBLE
+                             ELSE bounds.lo/2.0 + bounds.hi/2.0 END)[1]
                 )[1]
               )[1]
             )[1]

@@ -39,6 +39,18 @@ def test_linear_cv_scales_before_squaring_individual_residuals(con):
     assert actual/1e155/1e155 == pytest.approx(baseline, rel=1e-10)
 
 
+@pytest.mark.parametrize('macro', ['cv_l2', 'cv_l1', 'cv_l2_refine', 'cv_l1_refine'])
+def test_poisson_cv_preserves_finite_mean_when_total_deviance_overflows(con, macro):
+    con.execute('CREATE TABLE large_counts AS SELECT 1.0 x,(1+i%2)*1e307::DOUBLE y FROM range(200)t(i)')
+    extra = ',n_refine:=3' if macro.endswith('_refine') else ''
+    scores = con.execute(f"SELECT cv_deviance FROM {macro}('large_counts','y','poisson',[0.,1.],k:=5{extra})").fetchnumpy()['cv_deviance']
+    # Every training fold has equal counts of both outcomes, so all models
+    # predict 1.5e307. Compute the independent unit-scale Poisson deviance.
+    expected = np.mean(2*(np.array([1.,2.])*np.log(np.array([1.,2.])/1.5)-np.array([1.,2.])+1.5))
+    assert np.isfinite(scores).all()
+    np.testing.assert_allclose(scores/1e307, expected, rtol=1e-10)
+
+
 @pytest.mark.parametrize('sweep', ['l1', 'l2'])
 @pytest.mark.parametrize('scale', [1e153, 1e308])
 def test_linear_cv_does_not_reconstruct_overflowing_centered_predictions(con, sweep, scale):
