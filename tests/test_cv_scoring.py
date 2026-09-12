@@ -255,3 +255,10 @@ def test_dispersion_validates_outcomes_before_logarithms(con, threads, macro):
     con.execute('CREATE TABLE bad_domain AS SELECT i::DOUBLE x,-1.0 y FROM range(12)t(i)')
     with pytest.raises(duckdb.Error,match='nbinom_dispersion: outcome must'):
         con.execute(f"SELECT * FROM {macro}('bad_domain','y',[.5,1.])").fetchall()
+
+
+def test_gamma_cv_fits_positive_means_below_exp_minus_700(con):
+    con.execute('''CREATE TABLE gamma_tail_cv AS SELECT (i%2)::DOUBLE x,
+        CASE WHEN i%2=0 THEN 1e-310 ELSE 1.0 END y FROM range(12)t(i)''')
+    deviance = con.execute("SELECT cv_deviance FROM cv_l2('gamma_tail_cv','y','gamma',[0.],k:=3,max_iter:=2000)").fetchone()[0]
+    assert deviance == pytest.approx(0.,abs=1e-12)

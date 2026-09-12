@@ -158,6 +158,9 @@ def test_bounded_gamma_irls_converges_and_still_rejects_iteration_limit(con):
         """).fetchall())
         assert coefficients['(Intercept)'] == pytest.approx(8.0, abs=1e-7)
         assert coefficients['x'] == pytest.approx(0.0, abs=1e-7)
+    # Centering a constant offset now solves the constant response at
+    # initialization. Retain the iteration-limit contract on a real slope.
+    con.execute('UPDATE overshoot SET y=exp(.3*x)')
     with pytest.raises(duckdb.Error, match='iteration limit reached'):
         con.execute("""
             SELECT * FROM gamma_fit('overshoot','y',offset_col:='expo',max_iter:=1,solver:='irls')

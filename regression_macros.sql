@@ -518,15 +518,15 @@ __reg_ystdev AS (
            __reg_mul_div(any_value(scale),sqrt(sum(pow(__reg_weighted_center(v,mu,sw,nullif(scale,0.0)),2))),sqrt(sum(w))) AS sd
     FROM __reg_ycenter
 ),
--- A common linear/Tweedie offset is an unpenalized intercept shift. Center
+-- A common offset is an unpenalized intercept shift in every family. Center
 -- it before scaling, preserving tiny outcomes beside a large constant offset.
 __reg_offsets AS (
-    SELECT CASE WHEN family NOT IN ('linear','tweedie') THEN 0.0 ELSE coalesce(
+    SELECT coalesce(
            CASE WHEN min(v) = max(v) THEN min(v)
                 WHEN isfinite(sum(__reg_weighted_center(v,vbase,sw,1.0)*sw))
                   THEN min(vbase)+sum(__reg_weighted_center(v,vbase,sw,1.0)*sw)/sum(w)
                 ELSE max(vscale)*(sum(__reg_mul_div(sw,v,nullif(vscale,0.0))*sw)/sum(w)) END,0.0)
-           END AS center
+           AS center
     FROM __reg_moments WHERE col = offset_col
 ),
 __reg_ystats AS (
@@ -547,7 +547,7 @@ __reg_ystats AS (
 -- Each row carries wy (root-weighted transformed response), xs (standardized
 -- features), and o, the
 -- internal offset. An offset is a known per-row term in the linear predictor
--- eta = o + xs.beta; it is not fit and not penalized. For Tweedie its common
+-- eta = o + xs.beta; it is not fit and not penalized. Its common
 -- weighted center is removed and restored in the model intercept; for linear
 -- the outcome is z-scored, so the offset is divided by
 -- sd_y to live on the same scale. o = 0 when no offset column is given.
@@ -731,7 +731,7 @@ __reg_irls(it, betas, move) AS (
                                               WHEN 'tweedie'  THEN pow(e.mu, 2.0 - power)
                                               WHEN 'nbinom'   THEN __reg_nb_fit_info(ln(e.mu),log_alpha_int,l1=0 AND l2=0) END) * e.linpred
                                          + __reg_weighted_fit_score(e.wy,e.w,
-                                             CASE WHEN family IN ('linear','logistic') THEN e.eta ELSE ln(e.mu) END,
+                                             CASE WHEN family IN ('linear','logistic','gamma') THEN e.eta ELSE ln(e.mu) END,
                                              family,power,log_alpha_int,l1=0 AND l2=0)
                                    )) AS res
                         FROM (
@@ -1216,7 +1216,7 @@ CREATE OR REPLACE MACRO __reg_weighted_fit_score(wy, sw, eta, family, power, log
       WHEN 'linear' THEN wy-sw*eta
       WHEN 'logistic' THEN wy-sw*__reg_sigmoid(eta)
       WHEN 'poisson' THEN wy-sw*exp(least(eta,700.0))
-      WHEN 'gamma' THEN __reg_mul_div(wy,1.0,mu)-sw
+      WHEN 'gamma' THEN __reg_exp_scale(wy,-eta)-sw
       WHEN 'tweedie' THEN __reg_mul_div(wy-sw*mu,pow(mu,2.0-power),mu)
       WHEN 'nbinom' THEN CASE WHEN eta >= 0
          THEN (wy/exp(least(eta,700.0))-sw)*__reg_nb_fit_info(least(eta,700.0),logalpha,unpenalized)
@@ -1227,7 +1227,7 @@ CREATE OR REPLACE MACRO __reg_weighted_fit_observed(wy, sw, eta, family, power, 
   list_transform([exp(greatest(least(eta,700.0),-700.0))], lambda mu:
     CASE family
       WHEN 'poisson' THEN sw*exp(least(eta,700.0))
-      WHEN 'gamma' THEN __reg_mul_div(wy,1.0,mu)
+      WHEN 'gamma' THEN __reg_exp_scale(wy,-eta)
       WHEN 'tweedie' THEN sw*pow(mu,2.0-power)
                             +(power-1.0)*__reg_mul_div(wy-sw*mu,pow(mu,2.0-power),mu)
       WHEN 'nbinom' THEN exp(__reg_nb_fit_shift(logalpha,unpenalized)+least(eta,700.0)+ln(sw)
@@ -2123,7 +2123,7 @@ __reg_cv_irls(it, B, move) AS (
                           WHEN 'nbinom'   THEN __reg_nb_fit_info(greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                         END) * l
                      + (CASE family
-                          WHEN 'gamma'    THEN e.yt / exp(greatest(least(l,700.0),-700.0)) - 1.0
+                          WHEN 'gamma'    THEN __reg_exp_scale(e.yt,-l) - 1.0
                           WHEN 'tweedie'  THEN __reg_tw_score(e.yt,exp(greatest(least(l,700.0),-700.0)),mpow[m])
                           WHEN 'nbinom'   THEN __reg_nb_fit_score(e.yt,greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                           WHEN 'logistic' THEN e.yt - 1.0/(1.0+exp(-greatest(least(l,700.0),-700.0)))
@@ -2210,7 +2210,7 @@ __reg_cv_gd AS (
                      CASE WHEN mfold[m] = rw.fold THEN 0.0 ELSE
                      (CASE WHEN family='logistic' THEN rw.yt - __reg_sigmoid(list_dot_product(rw.xs,bm))
                            WHEN family='poisson'  THEN rw.yt - exp(least(list_dot_product(rw.xs,bm),700.0))
-                           WHEN family='gamma'    THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)) - 1.0
+                           WHEN family='gamma'    THEN __reg_exp_scale(rw.yt,-list_dot_product(rw.xs,bm)) - 1.0
                            WHEN family='tweedie'  THEN __reg_tw_score(rw.yt,exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),mpow[m])
                            WHEN family='nbinom'   THEN __reg_nb_fit_score(rw.yt,least(list_dot_product(rw.xs,bm),700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                            ELSE rw.yt - list_dot_product(rw.xs,bm) END) END),
@@ -2222,7 +2222,7 @@ __reg_cv_gd AS (
                          list_transform(look, lambda bm, m:
                      CASE WHEN mfold[m] = rw.fold THEN 0.0 ELSE
                      (CASE WHEN family='poisson' THEN exp(least(list_dot_product(rw.xs,bm),700.0))
-                           WHEN family='gamma'   THEN rw.yt / exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0))
+                           WHEN family='gamma'   THEN __reg_exp_scale(rw.yt,-list_dot_product(rw.xs,bm))
                            WHEN family='tweedie' THEN __reg_tw_observed(rw.yt,exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),mpow[m])
                            WHEN family='nbinom'  THEN __reg_nb_fit_observed(rw.yt,least(list_dot_product(rw.xs,bm),700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                            ELSE 0.0 END) END) END)) AS res

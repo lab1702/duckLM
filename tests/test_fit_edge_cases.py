@@ -268,3 +268,26 @@ def test_fit_rejects_nonfinite_sample_weights(con, family, weight):
     """)
     with pytest.raises(duckdb.Error, match='weights must be finite'):
         con.execute(f"SELECT * FROM {family}_fit('invalid_weights', 'y', weights_col:='w', max_iter:=3)").fetchall()
+
+
+@pytest.mark.parametrize('solver', ['auto','irls','gd'])
+def test_gamma_fit_preserves_representable_means_below_exp_minus_700(con, solver):
+    con.execute('''CREATE OR REPLACE TABLE gamma_tail AS SELECT (i%2)::DOUBLE x,
+        CASE WHEN i%2=0 THEN 1e-310 ELSE 1.0 END y FROM range(4)t(i)''')
+    con.execute(f"CREATE OR REPLACE TABLE gamma_tail_model AS SELECT * FROM gamma_fit('gamma_tail','y',solver:='{solver}',max_iter:=2000)")
+    beta = con.execute('SELECT coefficient FROM gamma_tail_model').fetchnumpy()['coefficient']
+    np.testing.assert_allclose(beta,[np.log(1e-310),-np.log(1e-310)],rtol=1e-9)
+    predictions = con.execute("SELECT prediction FROM gamma_predict('gamma_tail_model','gamma_tail')").fetchnumpy()['prediction']
+    np.testing.assert_allclose(predictions,[1e-310,1.,1e-310,1.],rtol=1e-7,atol=0)
+
+
+@pytest.mark.parametrize('family', ['poisson','gamma','nbinom'])
+@pytest.mark.parametrize('offset', [-1e20,1e20])
+@pytest.mark.parametrize('solver', ['auto','irls','gd'])
+def test_log_link_fit_centers_large_common_offsets(con, family, offset, solver):
+    con.execute('CREATE OR REPLACE TABLE common_offset AS SELECT i::DOUBLE x,exp(.3*i) y,?::DOUBLE o FROM range(6)t(i)',[offset])
+    con.execute(f"CREATE OR REPLACE TABLE common_model AS SELECT * FROM {family}_fit('common_offset','y',offset_col:='o',solver:='{solver}',max_iter:=2000)")
+    beta = con.execute('SELECT coefficient FROM common_model').fetchnumpy()['coefficient']
+    np.testing.assert_allclose(beta,[-offset,.3],rtol=1e-7)
+    prediction = con.execute(f"SELECT prediction FROM {family}_predict('common_model','common_offset',offset_col:='o')").fetchnumpy()['prediction']
+    np.testing.assert_allclose(prediction,np.exp(.3*np.arange(6)),rtol=1e-7)
