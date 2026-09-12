@@ -302,3 +302,15 @@ def test_gamma_fit_initialization_survives_varying_extreme_offsets(con, solver, 
     np.testing.assert_allclose(beta,[0.,-offset_scale],rtol=1e-9,atol=1e-6)
     prediction = con.execute("SELECT prediction FROM gamma_predict('varying_model','varying_offset',offset_col:='o')").fetchnumpy()['prediction']
     np.testing.assert_allclose(prediction,np.ones(3),rtol=1e-6)
+
+
+@pytest.mark.parametrize('solver', ['auto','irls','gd'])
+@pytest.mark.parametrize('power', [1.5,2.,3.])
+def test_tweedie_fit_retains_extreme_offset_scores(con, solver, power):
+    con.execute('CREATE OR REPLACE TABLE tweedie_tail AS SELECT x,o,exp(o) y FROM (VALUES(-1.),(1.))a(x),(VALUES(-720.),(0.))b(o)')
+    con.execute(f"CREATE OR REPLACE TABLE tweedie_tail_model AS SELECT * FROM tweedie_fit('tweedie_tail','y',power:={power},offset_col:='o',solver:='{solver}',max_iter:=2000)")
+    beta = con.execute('SELECT coefficient FROM tweedie_tail_model').fetchnumpy()['coefficient']
+    np.testing.assert_allclose(beta,[0.,0.],atol=1e-6)
+    rows = con.execute("SELECT y,prediction FROM tweedie_predict('tweedie_tail_model','tweedie_tail',offset_col:='o')").fetchall()
+    for actual, prediction in rows:
+        assert prediction == pytest.approx(actual,rel=1e-6,abs=0)

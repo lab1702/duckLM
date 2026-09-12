@@ -262,3 +262,10 @@ def test_gamma_cv_fits_positive_means_below_exp_minus_700(con):
         CASE WHEN i%2=0 THEN 1e-310 ELSE 1.0 END y FROM range(12)t(i)''')
     deviance = con.execute("SELECT cv_deviance FROM cv_l2('gamma_tail_cv','y','gamma',[0.],k:=3,max_iter:=2000)").fetchone()[0]
     assert deviance == pytest.approx(0.,abs=1e-12)
+
+
+def test_tweedie_power_two_cv_matches_gamma_in_subnormal_tail(con):
+    con.execute('''CREATE TABLE tweedie_tail_cv AS SELECT (i%2)::DOUBLE x,
+        CASE WHEN i%2=0 THEN 1e-310 ELSE 1.0 END y FROM range(12)t(i)''')
+    deviance = con.execute("SELECT cv_deviance FROM cv_power('tweedie_tail_cv','y',[2.],k:=3,max_iter:=2000)").fetchone()[0]
+    assert deviance == pytest.approx(0.,abs=1e-12)

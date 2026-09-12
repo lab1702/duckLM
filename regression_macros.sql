@@ -529,9 +529,20 @@ __reg_offsets AS (
            AS center
     FROM __reg_moments WHERE col = offset_col
 ),
+-- For unpenalized higher-power Tweedie fits, a geometric response unit can
+-- keep both ends of the information range finite when the arithmetic mean
+-- lies near one end. A common objective scale leaves the unpenalized fit intact.
+__reg_ylogunits AS (
+    SELECT min(ln(nullif(abs(v),0.0))) AS lo, max(ln(nullif(abs(v),0.0))) AS hi
+    FROM __reg_moments WHERE col=outcome
+),
 __reg_ystats AS (
     SELECT CASE WHEN family = 'linear' THEN mu ELSE 0.0 END AS mu_y,
            CASE WHEN family = 'logistic' THEN 1.0
+                WHEN family='tweedie' AND power>2 AND l1=0 AND l2=0
+                     AND (power-2)*greatest(abs(lo-ln(nullif(mu,0.0))),abs(hi-ln(nullif(mu,0.0))))>600
+                     AND greatest(1.0,power-2)*(hi/2.0-lo/2.0)<600
+                  THEN exp(lo/2.0+hi/2.0)
                 WHEN family IN ('poisson', 'gamma', 'tweedie', 'nbinom')
                   THEN (CASE WHEN mu = 0.0 THEN 1.0 ELSE mu END)
                 ELSE greatest(CASE WHEN coalesce(sd,0.0) = 0.0 THEN 1.0 ELSE sd END,
@@ -539,7 +550,7 @@ __reg_ystats AS (
                                FROM __reg_moments CROSS JOIN __reg_offsets os WHERE col=offset_col),0.0))
            END AS sd_y,
            CASE WHEN coalesce(sd,0.0) = 0.0 THEN 1.0 ELSE sd END AS native_yunit
-    FROM __reg_ystdev
+    FROM __reg_ystdev CROSS JOIN __reg_ylogunits
 ),
 -- The whole training set packed into one row: a list of training-row structs where
 -- xs = [1.0 (intercept), standardized features in name order]. __reg_clong is
@@ -662,17 +673,17 @@ __reg_cfg AS (
     FROM __reg_feats f, __reg_packed p, __reg_ycheck y, __reg_namecheck nc
     WHERE y.ok AND nc.ok
 ),
--- Gamma's initial weighted y/mean can overflow before any damping is
+-- Gamma's (also Tweedie power=2) initial weighted y/mean can overflow before damping is
 -- possible. In that case start above every log response/offset ratio, making
 -- all response/mean ratios at most one. Ordinary starts remain unchanged.
 __reg_seed AS (
     SELECT list_transform(range(f.d+1),lambda i:
-      CASE WHEN family='gamma' AND i=0 AND max_logscore>700.0
+      CASE WHEN (family='gamma' OR (family='tweedie' AND power=2.0)) AND i=0 AND max_logscore>700.0
            THEN intercept ELSE 0.0::DOUBLE END) AS betas
     FROM __reg_feats f CROSS JOIN (
       SELECT max(ln(nullif(abs(r.wy),0.0))-r.o) AS max_logscore,
              max(ln(nullif(abs(r.wy),0.0))-ln(nullif(r.sw,0.0))-r.o) AS intercept
-      FROM __reg_packed, unnest(rows) t(r) WHERE family='gamma'
+      FROM __reg_packed, unnest(rows) t(r) WHERE family='gamma' OR (family='tweedie' AND power=2.0)
     )
 ),
 -- IRLS / Fisher scoring (solver := 'irls'): each iteration solves the weighted
@@ -734,17 +745,17 @@ __reg_irls(it, betas, move) AS (
                                               WHEN 'linear'   THEN 1.0
                                               WHEN 'poisson'  THEN e.mu
                                               WHEN 'gamma'    THEN 1.0
-                                              WHEN 'tweedie'  THEN pow(e.mu, 2.0 - power)
+                                              WHEN 'tweedie'  THEN exp((2.0-power)*e.eta)
                                               WHEN 'nbinom'   THEN __reg_nb_fit_info(ln(e.mu),log_alpha_int,l1=0 AND l2=0) END),
                                    wr := (CASE family
                                               WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
                                               WHEN 'linear'   THEN 1.0
                                               WHEN 'poisson'  THEN e.mu
                                               WHEN 'gamma'    THEN 1.0
-                                              WHEN 'tweedie'  THEN pow(e.mu, 2.0 - power)
+                                              WHEN 'tweedie'  THEN exp((2.0-power)*e.eta)
                                               WHEN 'nbinom'   THEN __reg_nb_fit_info(ln(e.mu),log_alpha_int,l1=0 AND l2=0) END) * e.linpred
                                          + __reg_weighted_fit_score(e.wy,e.w,
-                                             CASE WHEN family IN ('linear','logistic','gamma') THEN e.eta ELSE ln(e.mu) END,
+                                             CASE WHEN family IN ('linear','logistic','gamma','tweedie') THEN e.eta ELSE ln(e.mu) END,
                                              family,power,log_alpha_int,l1=0 AND l2=0)
                                    )) AS res
                         FROM (
@@ -1221,6 +1232,20 @@ CREATE OR REPLACE MACRO __reg_nb_fit_observed(y, eta, logalpha, unpenalized) AS 
       - 2.0*__reg_softplus(logalpha+eta))
 );
 
+-- Tweedie fitting scores retain the actual predictor, including means
+-- outside the direct exponential range. Combine weights before scaling.
+CREATE OR REPLACE MACRO __reg_weighted_tw_score(wy, sw, eta, power) AS (
+  list_transform([__reg_exp_scale(sw,eta)], lambda weighted_mu:
+    CASE WHEN weighted_mu>0 AND isfinite(weighted_mu)
+           THEN __reg_exp_scale(wy-weighted_mu,(1.0-power)*eta)
+         WHEN eta>=0 THEN __reg_exp_scale(__reg_exp_scale(wy,-eta)-sw,(2.0-power)*eta)
+         WHEN wy=0 THEN -__reg_exp_scale(sw,(2.0-power)*eta)
+         ELSE __reg_exp_scale(1.0-exp(ln(sw)+eta-ln(wy)),ln(wy)+(1.0-power)*eta) END)[1]
+);
+CREATE OR REPLACE MACRO __reg_weighted_tw_observed(wy, sw, eta, power) AS (
+  __reg_exp_scale(sw*(2.0-power),(2.0-power)*eta)
+  +__reg_exp_scale(wy*(power-1.0),(1.0-power)*eta)
+);
 -- Root-weighted fitting scores keep a large mean-scaled response finite even
 -- when its unweighted ratio exceeds DOUBLE range. mu stays in response units.
 CREATE OR REPLACE MACRO __reg_weighted_fit_score(wy, sw, eta, family, power, logalpha, unpenalized) AS (
@@ -1230,7 +1255,7 @@ CREATE OR REPLACE MACRO __reg_weighted_fit_score(wy, sw, eta, family, power, log
       WHEN 'logistic' THEN wy-sw*__reg_sigmoid(eta)
       WHEN 'poisson' THEN wy-sw*exp(least(eta,700.0))
       WHEN 'gamma' THEN __reg_exp_scale(wy,-eta)-sw
-      WHEN 'tweedie' THEN __reg_mul_div(wy-sw*mu,pow(mu,2.0-power),mu)
+      WHEN 'tweedie' THEN __reg_weighted_tw_score(wy,sw,eta,power)
       WHEN 'nbinom' THEN CASE WHEN eta >= 0
          THEN (wy/exp(least(eta,700.0))-sw)*__reg_nb_fit_info(least(eta,700.0),logalpha,unpenalized)
          ELSE (wy-sw*exp(eta))*exp(__reg_nb_fit_shift(logalpha,unpenalized)-__reg_softplus(logalpha+eta)) END
@@ -1241,8 +1266,7 @@ CREATE OR REPLACE MACRO __reg_weighted_fit_observed(wy, sw, eta, family, power, 
     CASE family
       WHEN 'poisson' THEN sw*exp(least(eta,700.0))
       WHEN 'gamma' THEN __reg_exp_scale(wy,-eta)
-      WHEN 'tweedie' THEN sw*pow(mu,2.0-power)
-                            +(power-1.0)*__reg_mul_div(wy-sw*mu,pow(mu,2.0-power),mu)
+      WHEN 'tweedie' THEN __reg_weighted_tw_observed(wy,sw,eta,power)
       WHEN 'nbinom' THEN exp(__reg_nb_fit_shift(logalpha,unpenalized)+least(eta,700.0)+ln(sw)
                              +CASE WHEN wy=0 THEN 0.0 ELSE __reg_softplus(logalpha+ln(wy)-ln(sw)) END
                              -2.0*__reg_softplus(logalpha+least(eta,700.0)))
@@ -2121,7 +2145,7 @@ __reg_cv_irls(it, B, move) AS (
                           WHEN 'linear'   THEN 1.0
                           WHEN 'poisson'  THEN exp(greatest(least(l,700.0),-700.0))
                           WHEN 'gamma'    THEN 1.0
-                          WHEN 'tweedie'  THEN pow(exp(greatest(least(l,700.0),-700.0)), 2.0-mpow[m])
+                          WHEN 'tweedie'  THEN exp((2.0-mpow[m])*l)
                           WHEN 'nbinom'   THEN __reg_nb_fit_info(greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                         END) END),
                    wr := list_transform(e.lp, lambda l, m:
@@ -2132,12 +2156,12 @@ __reg_cv_irls(it, B, move) AS (
                           WHEN 'linear'   THEN 1.0
                           WHEN 'poisson'  THEN exp(greatest(least(l,700.0),-700.0))
                           WHEN 'gamma'    THEN 1.0
-                          WHEN 'tweedie'  THEN pow(exp(greatest(least(l,700.0),-700.0)), 2.0-mpow[m])
+                          WHEN 'tweedie'  THEN exp((2.0-mpow[m])*l)
                           WHEN 'nbinom'   THEN __reg_nb_fit_info(greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                         END) * l
                      + (CASE family
                           WHEN 'gamma'    THEN __reg_exp_scale(e.yt,-l) - 1.0
-                          WHEN 'tweedie'  THEN __reg_tw_score(e.yt,exp(greatest(least(l,700.0),-700.0)),mpow[m])
+                          WHEN 'tweedie'  THEN __reg_weighted_tw_score(e.yt,1.0,l,mpow[m])
                           WHEN 'nbinom'   THEN __reg_nb_fit_score(e.yt,greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                           WHEN 'logistic' THEN e.yt - 1.0/(1.0+exp(-greatest(least(l,700.0),-700.0)))
                           WHEN 'linear'   THEN e.yt - l
@@ -2224,7 +2248,7 @@ __reg_cv_gd AS (
                      (CASE WHEN family='logistic' THEN rw.yt - __reg_sigmoid(list_dot_product(rw.xs,bm))
                            WHEN family='poisson'  THEN rw.yt - exp(least(list_dot_product(rw.xs,bm),700.0))
                            WHEN family='gamma'    THEN __reg_exp_scale(rw.yt,-list_dot_product(rw.xs,bm)) - 1.0
-                           WHEN family='tweedie'  THEN __reg_tw_score(rw.yt,exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),mpow[m])
+                           WHEN family='tweedie'  THEN __reg_weighted_tw_score(rw.yt,1.0,list_dot_product(rw.xs,bm),mpow[m])
                            WHEN family='nbinom'   THEN __reg_nb_fit_score(rw.yt,least(list_dot_product(rw.xs,bm),700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                            ELSE rw.yt - list_dot_product(rw.xs,bm) END) END),
                    -- hw damps the step for the unbounded-curvature log-link families
@@ -2236,7 +2260,7 @@ __reg_cv_gd AS (
                      CASE WHEN mfold[m] = rw.fold THEN 0.0 ELSE
                      (CASE WHEN family='poisson' THEN exp(least(list_dot_product(rw.xs,bm),700.0))
                            WHEN family='gamma'   THEN __reg_exp_scale(rw.yt,-list_dot_product(rw.xs,bm))
-                           WHEN family='tweedie' THEN __reg_tw_observed(rw.yt,exp(greatest(least(list_dot_product(rw.xs,bm),700.0),-700.0)),mpow[m])
+                           WHEN family='tweedie' THEN __reg_weighted_tw_observed(rw.yt,1.0,list_dot_product(rw.xs,bm),mpow[m])
                            WHEN family='nbinom'  THEN __reg_nb_fit_observed(rw.yt,least(list_dot_product(rw.xs,bm),700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
                            ELSE 0.0 END) END) END)) AS res
           FROM (
