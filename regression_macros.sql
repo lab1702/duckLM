@@ -1371,16 +1371,20 @@ __reg_errorunits AS (
                                    THEN __reg_center_scale(y,yhat) ELSE 0.0 END),0.0),
                     nullif(max(abs(y)),0.0),1.0) AS eunit,
            coalesce(nullif(max(abs(y)),0.0),1.0) AS yunit,
+           arg_min(y,struct_pack(magnitude := abs(y),value := y)) AS ybase,
            coalesce(nullif(max(abs(pres)),0.0),1.0) AS punit,
            coalesce(nullif(max(__reg_softplus(CASE WHEN y=1 THEN -z ELSE z END)),0.0),1.0) AS lossunit
     FROM __reg_pearson_rows
 ),
 __reg_agg AS (
     SELECT count(*)::DOUBLE AS n,
+           -- Preserve small spreads around a large common outcome value.
            CASE WHEN min(y) = max(y) THEN min(y)
-                WHEN isfinite(avg(y)) THEN avg(y)
+                WHEN isfinite(sum(y-ybase)) THEN any_value(ybase)+sum(y-ybase)/count(*)
                 ELSE any_value(yunit)*avg(y/yunit) END AS ybar,
            any_value(eunit) AS eunit,
+           any_value(ybase) AS ybase, any_value(yunit) AS yunit,
+           avg(__reg_centered(y,ybase,yunit)) AS ydelta,
            any_value(punit) AS punit,
            sum(pow(pres/punit,2)) AS pearson_scaled,
            sum(pow(__reg_centered(y,yhat,eunit),2)) AS sse,
@@ -1461,7 +1465,10 @@ __reg_null_rows AS (
     FROM __reg_rows r, __reg_agg a
 ),
 __reg_null AS (
-    SELECT sum(pow(__reg_centered(y,a.ybar,a.eunit),2)) AS sst,
+    -- Keep the centered mean separate: adding it to ybase can round away
+    -- a fractional-ULP mean even when all individual outcomes are exact.
+    SELECT sum(pow(__reg_mul_div(__reg_centered(y,a.ybase,a.yunit)-a.ydelta,
+                                a.yunit,a.eunit),2)) AS sst,
            -- lim(p -> 0+) p*ln(p) = 0, including one-class holdouts.
            sum(CASE WHEN a.ybar IN (0, 1) THEN 0.0
                     ELSE -y*greatest(-r.z0,0.0) - (1-y)*greatest(r.z0,0.0)

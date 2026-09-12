@@ -752,3 +752,29 @@ def test_mean_log_loss_preserves_finite_extreme_losses_when_rows_repeat(con, fam
     loss = con.execute(f"SELECT log_loss FROM {family}_evaluate('model','observations','y')").fetchone()[0]
     assert np.isfinite(loss)
     assert loss/1e308 == pytest.approx(1. if all_errors else 1/n,rel=1e-12)
+
+
+@pytest.mark.parametrize('baseline', [1e16, -1e16, 1e100, -1e100])
+@pytest.mark.parametrize('reverse', [False, True])
+@pytest.mark.parametrize('pattern', [[0,1,2], [0,1,1]])
+def test_linear_r2_centers_large_outcome_means(con, baseline, reverse, pattern):
+    step = abs(np.spacing(baseline))
+    values = [baseline+step*pattern[i % 3] for i in range(6)]
+    if reverse:
+        values.reverse()
+    con.execute('CREATE TABLE mean_rows(x DOUBLE,y DOUBLE)')
+    con.executemany('INSERT INTO mean_rows VALUES (0,?)', [(y,) for y in values])
+    con.execute("CREATE TABLE mean_model AS SELECT * FROM linreg_fit('mean_rows','y')")
+    prediction = con.execute("SELECT coefficient FROM mean_model WHERE feature='(Intercept)'").fetchone()[0]
+    # Decimal computes the exact mean of the input doubles independently of
+    # both DuckDB's AVG and the centering strategy used by the implementation.
+    with localcontext() as context:
+        context.prec = 150
+        exact = [Decimal.from_float(y) for y in values]
+        mean = sum(exact)/len(exact)
+        sse = sum((y-Decimal.from_float(prediction))**2 for y in exact)
+        sst = sum((y-mean)**2 for y in exact)
+        expected = float(1-sse/sst)
+    metrics = _metrics(con, "linreg_evaluate('mean_model','mean_rows','y')")
+    assert metrics['r2'] == pytest.approx(expected, abs=1e-14)
+    assert metrics['adj_r2'] == pytest.approx(1-(1-expected)*5/4, abs=1e-14)
