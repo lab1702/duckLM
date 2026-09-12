@@ -2819,6 +2819,27 @@ CREATE OR REPLACE MACRO __reg_observed_ratio(y, eta, family, power, alpha) AS (
                               -__reg_softplus(ln(alpha)+eta))
        ELSE 1.0 END
 );
+-- Observed information must be combined with root weights and coordinates
+-- before exponentiation; an unweighted response/mean ratio can overflow.
+CREATE OR REPLACE MACRO __reg_observed_sign(y, eta, family, power) AS (
+  CASE WHEN family='gamma' THEN sign(y)
+       WHEN family='tweedie' THEN
+         list_transform([coalesce(ln(nullif(y,0.0))-eta,'-Infinity'::DOUBLE)], lambda lr:
+           sign((2.0-power)*exp(-greatest(lr,0.0))+(power-1.0)*exp(least(lr,0.0))))[1]
+       ELSE 1.0 END
+);
+CREATE OR REPLACE MACRO __reg_log_observed(y, eta, family, power, alpha) AS (
+  CASE WHEN family='gamma' THEN coalesce(ln(nullif(abs(y),0.0))-eta,'-Infinity'::DOUBLE)
+       WHEN family='tweedie' THEN
+         list_transform([coalesce(ln(nullif(y,0.0))-eta,'-Infinity'::DOUBLE)], lambda lr:
+           (2.0-power)*eta+greatest(lr,0.0)
+           +coalesce(ln(nullif(abs((2.0-power)*exp(-greatest(lr,0.0))
+                           +(power-1.0)*exp(least(lr,0.0))),0.0)),'-Infinity'::DOUBLE))[1]
+       WHEN family='nbinom' THEN eta
+           +CASE WHEN y=0 THEN 0.0 ELSE __reg_softplus(ln(alpha)+ln(y)) END
+           -2.0*__reg_softplus(ln(alpha)+eta)
+       ELSE __reg_log_info(eta,family,power,alpha) END
+);
 -- Score coordinates remain finite for a confidently wrong Bernoulli row
 -- even if its leverage rounds to zero and its Pearson square overflows.
 CREATE OR REPLACE MACRO __reg_logit_score_coord(v, sw, y, eta, logunit, log_root_scale := 0.0) AS (
@@ -3057,13 +3078,26 @@ __reg_disp AS (
 -- the score-outer-product, including squared analytic weights (var_weights).
 -- A uniform rescaling of analytic weights therefore leaves robust SEs unchanged.
 -- Dispersion-free -> z inference. e_i = the GD residual.
+__reg_rounits AS (
+  SELECT list(logunit ORDER BY i) AS units
+  FROM (SELECT ix.i, coalesce(nullif(max(ln(nullif(abs(raw.xs[ix.i]),0.0))+ln(nullif(r.sw,0.0))
+                   +0.5*__reg_log_observed(r.y,r.eta,family,power,alpha))
+                   FILTER (WHERE r.sw>0 AND raw.xs[ix.i]!=0),'-Infinity'::DOUBLE),0.0) AS logunit
+        FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
+        LEFT JOIN (__reg_rww r JOIN __reg_rows0 raw USING (__reg_rid__)) ON true GROUP BY ix.i)
+),
 __reg_robraw AS (
-  SELECT __reg_rww.__reg_rid__, __reg_rww.xs, __reg_rww.wt, cl.cl AS cl,
-         CASE WHEN __reg_rww.sw=0 THEN 0.0
-              ELSE __reg_observed_ratio(__reg_rww.y,__reg_rww.eta,family,power,alpha) END AS hwt,
-         CASE WHEN family='logistic' THEN __reg_rww.logit_scores
-              ELSE list_transform(__reg_rww.xs,lambda v: __reg_rww.pres*v) END AS sg
-  FROM __reg_rww LEFT JOIN __reg_clv cl ON cl.__reg_rid__ = __reg_rww.__reg_rid__
+  SELECT r.__reg_rid__, list_transform(raw.xs,lambda v,j:
+           __reg_exp_scale(v,ln(nullif(r.sw,0.0))+0.5*__reg_log_observed(r.y,r.eta,family,power,alpha)-u.units[j])) AS xs,
+         r.wt, cl.cl AS cl,
+         CASE WHEN r.sw=0 THEN 0.0 ELSE __reg_observed_sign(r.y,r.eta,family,power) END AS hwt,
+         CASE WHEN family='logistic' THEN list_transform(raw.xs,lambda v,j:
+                __reg_logit_score_coord(v,r.sw,r.y,r.eta,u.units[j]))
+              ELSE list_transform(raw.xs,lambda v,j: CASE WHEN v=0 OR r.sw=0 THEN 0.0 ELSE
+                sign(v)*__reg_exp_scale(r.pres,ln(abs(v))+ln(r.sw)
+                   +0.5*__reg_log_info(r.eta,family,power,alpha)-u.units[j]) END) END AS sg
+  FROM __reg_rww r JOIN __reg_rows0 raw USING (__reg_rid__)
+  LEFT JOIN __reg_clv cl ON cl.__reg_rid__ = r.__reg_rid__ CROSS JOIN __reg_rounits u
 ),
 -- A common information scale cancels between sandwich bread and scores.
 -- Remove it before inversion, which could otherwise overflow for tiny means.
@@ -3134,7 +3168,7 @@ __reg_robchk AS (
               ELSE true END AS ok
 ),
 __reg_final AS (
-  SELECT b.names AS names, b.bvec AS bvec, c.Rinv AS Rinv, s.dsc AS dsc, rv.rv AS rv, u.units AS units, ws.wscale AS wscale,
+  SELECT b.names AS names, b.bvec AS bvec, c.Rinv AS Rinv, s.dsc AS dsc, rv.rv AS rv, CASE WHEN robust!='none' OR cluster_col IS NOT NULL THEN ou.units ELSE u.units END AS units, ws.wscale AS wscale,
          dp.phi AS phi, dp.est AS est, dp.df AS df,
          (robust != 'none' OR cluster_col IS NOT NULL) AS robactive,
          (dp.est AND dp.df > 0.0 AND robust = 'none' AND cluster_col IS NULL) AS uset,
@@ -3142,7 +3176,7 @@ __reg_final AS (
                 THEN -t_ppf((1.0-conf_level)/2.0, dp.df)
               ELSE -norm_ppf((1.0-conf_level)/2.0) END AS crit
   FROM __reg_beta b CROSS JOIN __reg_covinv c CROSS JOIN __reg_scal s CROSS JOIN __reg_disp dp CROSS JOIN __reg_robvar rv
-       CROSS JOIN __reg_robchk rc CROSS JOIN __reg_xunits u CROSS JOIN __reg_weightscale ws WHERE rc.ok
+       CROSS JOIN __reg_robchk rc CROSS JOIN __reg_xunits u CROSS JOIN __reg_weightscale ws CROSS JOIN __reg_rounits ou WHERE rc.ok
 ),
 -- per-coefficient SE with guards: NULL when covariance is singular / non-finite / negative.
 -- An exact fit can have valid zero variance, giving a collapsed interval.
@@ -3576,17 +3610,17 @@ __reg_resunits AS (
 __reg_xunits AS (
   SELECT list(logunit ORDER BY i) AS units
   FROM (SELECT ix.i, coalesce(nullif(max(ln(nullif(abs(r.xs[ix.i]),0.0))+ln(nullif(r.sw,0.0))
-                   +0.5*__reg_log_info(__reg_dot(r.xs || [r.off],r.bvec || [1.0])-tu.shift,family,power,alpha))
+                   +0.5*__reg_log_observed(__reg_response_scale(r.y,tu.shift),__reg_dot(r.xs || [r.off],r.bvec || [1.0])-tu.shift,family,power,alpha))
                    FILTER (WHERE r.sw>0 AND r.xs[ix.i]!=0),'-Infinity'::DOUBLE),0.0) AS logunit
         FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
         LEFT JOIN __reg_rows0 r ON true CROSS JOIN __reg_responseunits tu GROUP BY ix.i)
 ),
 -- per row: mu, observed weight hw, variance V, residual, unit deviance
 __reg_pr AS (
-  SELECT __reg_rid__, list_transform(xs, lambda v,j: __reg_exp_scale(v,ln(nullif(sw,0.0))+0.5*__reg_log_info(eta,family,power,alpha)-u.units[j])) AS xs, wt, sw, y, mu, eta,
+  SELECT __reg_rid__, list_transform(xs, lambda v,j: __reg_exp_scale(v,ln(nullif(sw,0.0))+0.5*__reg_log_observed(y,eta,family,power,alpha)-u.units[j])) AS xs, wt, sw, y, mu, eta,
          CASE WHEN family='logistic' THEN list_transform(r.xs,lambda v,j:
               __reg_logit_score_coord(v,sw,y,eta,u.units[j],0.5*ln(ws.wscale))) END AS logit_scores,
-         CASE WHEN sw=0 THEN 0.0 ELSE __reg_observed_ratio(y,eta,family,power,alpha) END AS hwt,
+         CASE WHEN sw=0 THEN 0.0 ELSE __reg_observed_sign(y,eta,family,power) END AS hwt,
          CASE WHEN family = 'logistic' THEN __reg_logit_resid(y,eta)
               WHEN family = 'linear' THEN __reg_weighted_center(y,mu,sw,ru.runit) ELSE y-mu END AS resid,
          (CASE family WHEN 'logistic' THEN __reg_logit_var(eta) WHEN 'linear' THEN 1.0 WHEN 'poisson' THEN mu
@@ -3627,12 +3661,17 @@ __reg_lev AS (
          list_sum(list_transform(p.logit_scores,lambda v,j: v*list_dot_product(bi.Ainv[j],p.logit_scores)))/bs.hunit AS score_xax
   FROM __reg_pr p CROSS JOIN __reg_breadinv bi CROSS JOIN __reg_breadscale bs
 ),
+__reg_punits AS (
+  SELECT CASE WHEN family IN ('gamma','tweedie')
+              THEN coalesce(nullif(max(abs(__reg_tw_pearson(y,eta,CASE WHEN family='gamma' THEN 2.0 ELSE power END,sw))),0.0),1.0)
+              ELSE 1.0 END AS unit FROM __reg_pr
+),
 __reg_disp AS (
   SELECT CASE WHEN family IN ('linear','gamma','tweedie')
               THEN (SELECT sum(CASE family
                      WHEN 'linear' THEN resid*resid
-                     WHEN 'gamma' THEN pow(__reg_tw_pearson(y,eta,2.0,sw),2)
-                     WHEN 'tweedie' THEN pow(__reg_tw_pearson(y,eta,power,sw),2)
+                     WHEN 'gamma' THEN pow(__reg_tw_pearson(y,eta,2.0,sw)/(SELECT unit FROM __reg_punits),2)
+                     WHEN 'tweedie' THEN pow(__reg_tw_pearson(y,eta,power,sw)/(SELECT unit FROM __reg_punits),2)
                      ELSE pow(__reg_mul_div(sw,resid,sqrt(Vmu)),2) END) FROM __reg_pr) / nullif((SELECT n-d FROM __reg_dims), 0) ELSE 1.0 END AS phi,
          (SELECT d FROM __reg_dims) AS d
 ),
@@ -3655,7 +3694,7 @@ __reg_diag AS (
                 THEN -__reg_exp_scale(p.sw,0.5*ln(2.0)+CASE WHEN p.eta+ln(alpha)<-30.0 THEN p.eta/2.0
                      ELSE (ln(__reg_softplus(p.eta+ln(alpha)))-ln(alpha))/2.0 END)
               ELSE sign(p.resid) * p.sw * sqrt(2.0) * sqrt(greatest(p.halfdev, 0.0)) END AS deviance_resid,
-         CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN pearson_resid / sqrt(dp.phi*(1.0-l.h)) END AS std_resid,
+         CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN pearson_resid/(SELECT unit FROM __reg_punits) / sqrt(dp.phi*(1.0-l.h)) END AS std_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN
               CASE WHEN family = 'logistic'
                    THEN l.score_xax/(dp.d*(1.0-l.h)*(1.0-l.h))
@@ -3663,7 +3702,7 @@ __reg_diag AS (
                    -- squaring; the normalized Pearson square can overflow.
                    WHEN family IN ('poisson','nbinom') THEN pow(__reg_mul_div(pearson_resid,
                      sqrt(l.h),sqrt(dp.d)*(1.0-l.h)),2)
-                   ELSE (pearson_resid*pearson_resid/dp.phi) * l.h / (dp.d*(1.0-l.h)*(1.0-l.h)) END END AS cooks_distance
+                   ELSE (pow(pearson_resid/(SELECT unit FROM __reg_punits),2)/dp.phi) * l.h / (dp.d*(1.0-l.h)*(1.0-l.h)) END END AS cooks_distance
   FROM __reg_pr p JOIN __reg_lev l ON l.__reg_rid__ = p.__reg_rid__ CROSS JOIN __reg_disp dp
        CROSS JOIN __reg_weightscale ws
 )

@@ -52,13 +52,10 @@ def test_count_diagnostics_preserve_representable_residual_roots(con,family,eta,
     for hat,pearson,deviance,standardized in rows:
         np.testing.assert_allclose([pearson,deviance],
             [expected_pearson,expected_deviance],rtol=1e-10,atol=5e-324)
-        if family=='nbinom' and eta==1000.:
-            # Observed information for all-zero NB outcomes underflows here;
-            # raw residuals remain defined independently of that covariance.
-            assert hat is None and standardized is None
-        else:
-            assert hat==pytest.approx(1/3,rel=1e-12)
-            assert standardized==pytest.approx(expected_pearson/np.sqrt(2/3),rel=1e-10,abs=5e-324)
+        # Identical intercept-only rows each have leverage 1/n, including
+        # NB observed information below the unscaled DOUBLE range.
+        assert hat==pytest.approx(1/3,rel=1e-12)
+        assert standardized==pytest.approx(expected_pearson/np.sqrt(2/3),rel=1e-10,abs=5e-324)
     if family=='nbinom':
         dispersion=con.execute("SELECT dispersion FROM nbinom_evaluate('root_model','root_data','y')").fetchone()[0]
         assert dispersion==pytest.approx(1.5*expected_pearson**2,rel=1e-10,abs=5e-324)
@@ -1331,3 +1328,32 @@ def test_gamma_covariance_restores_residual_scale_after_square_root(con):
     np.testing.assert_allclose(actual,[expected_se,expected_se],rtol=1e-10)
     intervals = con.execute(f'SELECT conf_low,conf_high FROM gamma_predict_ci({args})').fetchall()
     assert intervals == [(0.,float('inf'))]*3
+
+
+@pytest.mark.parametrize('robust', ['hc0', 'hc1'])
+def test_gamma_observed_information_combines_tiny_weights_before_ratios(con, robust):
+    from decimal import Decimal, localcontext
+    con.execute("""CREATE TABLE observed_rows AS SELECT * FROM (VALUES
+        (-1.,1e-300,1.),(1.,1e-300,1.),(0.,1e300,1e-320))t(x,y,w)""")
+    con.execute("CREATE TABLE observed_model AS SELECT * FROM gamma_fit('observed_rows','y',weights_col:='w')")
+    intercept = con.execute("SELECT coefficient FROM observed_model WHERE feature='(Intercept)'").fetchone()[0]
+    with localcontext() as context:
+        context.prec = 100
+        mu = Decimal.from_float(intercept).exp()
+        ratios = [Decimal.from_float(y)/mu for y in [1e-300,1e-300,1e300]]
+        weights = [Decimal(1),Decimal(1),Decimal.from_float(1e-320)]
+        information = [w*r for w,r in zip(weights,ratios)]
+        scores = [w*(r-1) for w,r in zip(weights,ratios)]
+        a0 = sum(information); a1 = sum(information[:2])
+        b0 = sum(s*s for s in scores); b1 = sum(s*s for s in scores[:2])
+        correction = Decimal(3) if robust=='hc1' else Decimal(1)
+        expected_se = [float((correction*b0).sqrt()/a0),float((correction*b1).sqrt()/a1)]
+        hats = [float(v*(1/a0+(1/a1 if i<2 else 0))) for i,v in enumerate(information)]
+        phi = sum(w*(r-1)**2 for w,r in zip(weights,ratios))
+        expected_std = float((ratios[0]-1)/(phi*Decimal('.5')).sqrt())
+    args = "'observed_model','observed_rows','y',weights_col:='w'"
+    actual = con.execute(f"SELECT std_error FROM gamma_summary({args},robust:='{robust}')").fetchnumpy()['std_error']
+    np.testing.assert_allclose(actual,expected_se,rtol=1e-10)
+    influence = con.execute(f'SELECT hat,std_resid FROM gamma_influence({args})').fetchall()
+    np.testing.assert_allclose([row[0] for row in influence],hats,rtol=1e-12)
+    np.testing.assert_allclose([row[1] for row in influence[:2]],[expected_std]*2,rtol=1e-10,atol=0)
