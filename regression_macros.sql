@@ -1157,7 +1157,7 @@ CREATE OR REPLACE MACRO __reg_nb_observed(y, eta, alpha) AS (
        ELSE exp(eta + CASE WHEN y = 0 THEN 0.0 ELSE __reg_softplus(ln(alpha)+ln(y)) END
                 - 2.0*__reg_softplus(ln(alpha)+eta)) END
 );
-CREATE OR REPLACE MACRO __reg_nb_pearson(y, eta, alpha, root_weight := 1.0) AS (
+CREATE OR REPLACE MACRO __reg_nb_pearson(y, eta, alpha, root_weight := 1.0, log_scale := 0.0) AS (
   -- alpha=0 gives the Poisson residual. Keep the variance scale in logs
   -- until after multiplying the response, including unrepresentable means.
   list_transform([CASE WHEN alpha=0 THEN 0.0
@@ -1166,10 +1166,10 @@ CREATE OR REPLACE MACRO __reg_nb_pearson(y, eta, alpha, root_weight := 1.0) AS (
          WHEN eta >= 0 THEN
            list_transform([CASE WHEN isfinite(exp(eta)) THEN y/exp(eta)
                                 ELSE __reg_exp_scale(y,-eta) END], lambda ratio:
-             CASE WHEN alpha=0 THEN __reg_exp_scale(ratio-1.0,eta/2.0+ln(root_weight))
-                  ELSE __reg_mul_div(root_weight,ratio-1.0,sqrt(exp(-eta)+alpha)) END)[1]
-         WHEN exp(eta)>0 THEN __reg_exp_scale(y-exp(eta),-eta/2.0-logden/2.0+ln(root_weight))
-         ELSE __reg_exp_scale(y,-eta/2.0-logden/2.0+ln(root_weight))-exp(eta/2.0-logden/2.0+ln(root_weight)) END)[1]
+             CASE WHEN alpha=0 THEN __reg_exp_scale(ratio-1.0,eta/2.0+ln(root_weight)+log_scale)
+                  ELSE __reg_exp_scale(ratio-1.0,ln(root_weight)+log_scale-0.5*ln(exp(-eta)+alpha)) END)[1]
+         WHEN exp(eta)>0 THEN __reg_exp_scale(y-exp(eta),-eta/2.0-logden/2.0+ln(root_weight)+log_scale)
+         ELSE __reg_exp_scale(y,-eta/2.0-logden/2.0+ln(root_weight)+log_scale)-exp(eta/2.0-logden/2.0+ln(root_weight)+log_scale) END)[1]
 );
 CREATE OR REPLACE MACRO __reg_nb_score(y, eta, alpha) AS (
   CASE WHEN eta >= 0 THEN (y/exp(eta)-1.0)/(exp(-eta)+alpha)
@@ -1179,14 +1179,14 @@ CREATE OR REPLACE MACRO __reg_nb_score(y, eta, alpha) AS (
 -- Pearson residual for variance mu^power, restoring its log scale only after
 -- taking the response difference. This includes Gamma (power=2). Incorporate
 -- root weights before exponentiation so finite weighted residuals survive.
-CREATE OR REPLACE MACRO __reg_tw_pearson(y, eta, power, root_weight := 1.0) AS (
+CREATE OR REPLACE MACRO __reg_tw_pearson(y, eta, power, root_weight := 1.0, log_scale := 0.0) AS (
   CASE WHEN root_weight=0 THEN 0.0
        WHEN eta >= 0 THEN
          __reg_exp_scale((CASE WHEN isfinite(exp(eta)) THEN y/exp(eta)
-                              ELSE __reg_exp_scale(y,-eta) END)-1.0,(1.0-power/2.0)*eta+ln(root_weight))
-       WHEN exp(eta)>0 THEN __reg_exp_scale(y-exp(eta),-(power/2.0)*eta+ln(root_weight))
-       WHEN y=0 THEN -exp((1.0-power/2.0)*eta+ln(root_weight))
-       ELSE __reg_exp_scale(1.0-exp(eta-ln(y)),ln(y)-(power/2.0)*eta+ln(root_weight)) END
+                              ELSE __reg_exp_scale(y,-eta) END)-1.0,(1.0-power/2.0)*eta+ln(root_weight)+log_scale)
+       WHEN exp(eta)>0 THEN __reg_exp_scale(y-exp(eta),-(power/2.0)*eta+ln(root_weight)+log_scale)
+       WHEN y=0 THEN -exp((1.0-power/2.0)*eta+ln(root_weight)+log_scale)
+       ELSE __reg_exp_scale(1.0-exp(eta-ln(y)),ln(y)-(power/2.0)*eta+ln(root_weight)+log_scale) END
 );
 
 -- Fitting retains log(alpha*mean(y)), even when the product is outside DOUBLE.
@@ -3094,8 +3094,13 @@ __reg_robraw AS (
          CASE WHEN family='logistic' THEN list_transform(raw.xs,lambda v,j:
                 __reg_logit_score_coord(v,r.sw,r.y,r.eta,u.units[j]))
               ELSE list_transform(raw.xs,lambda v,j: CASE WHEN v=0 OR r.sw=0 THEN 0.0 ELSE
-                sign(v)*__reg_exp_scale(r.pres,ln(abs(v))+ln(r.sw)
-                   +0.5*__reg_log_info(r.eta,family,power,alpha)-u.units[j]) END) END AS sg
+                sign(v)*CASE WHEN family IN ('poisson','nbinom') THEN
+                  __reg_nb_pearson(r.y,r.eta,CASE WHEN family='poisson' THEN 0.0 ELSE alpha END,
+                    log_scale:=ln(abs(v))+2.0*ln(r.sw)+0.5*__reg_log_info(r.eta,family,power,alpha)-u.units[j])
+                WHEN family IN ('gamma','tweedie') THEN
+                  __reg_tw_pearson(r.y,r.eta,CASE WHEN family='gamma' THEN 2.0 ELSE power END,
+                    log_scale:=ln(abs(v))+2.0*ln(r.sw)+0.5*__reg_log_info(r.eta,family,power,alpha)-u.units[j])
+                ELSE __reg_exp_scale(r.pres,ln(abs(v))+ln(r.sw)-u.units[j]) END END) END AS sg
   FROM __reg_rww r JOIN __reg_rows0 raw USING (__reg_rid__)
   LEFT JOIN __reg_clv cl ON cl.__reg_rid__ = r.__reg_rid__ CROSS JOIN __reg_rounits u
 ),
@@ -3618,8 +3623,15 @@ __reg_xunits AS (
 -- per row: mu, observed weight hw, variance V, residual, unit deviance
 __reg_pr AS (
   SELECT __reg_rid__, list_transform(xs, lambda v,j: __reg_exp_scale(v,ln(nullif(sw,0.0))+0.5*__reg_log_observed(y,eta,family,power,alpha)-u.units[j])) AS xs, wt, sw, y, mu, eta,
+         -- Keep Pearson, observed information and absolute weights in one
+         -- coordinate; separate roots can be Infinity and zero simultaneously.
          CASE WHEN family='logistic' THEN list_transform(r.xs,lambda v,j:
-              __reg_logit_score_coord(v,sw,y,eta,u.units[j],0.5*ln(ws.wscale))) END AS logit_scores,
+              __reg_logit_score_coord(v,sw,y,eta,u.units[j],0.5*ln(ws.wscale)))
+              WHEN family IN ('poisson','nbinom') THEN list_transform(r.xs,lambda v,j:
+                CASE WHEN v=0 OR sw=0 THEN 0.0 ELSE sign(v)*
+                  __reg_nb_pearson(y,eta,CASE WHEN family='poisson' THEN 0.0 ELSE alpha END,
+                    log_scale:=ln(abs(v))+2.0*ln(sw)+0.5*__reg_log_observed(y,eta,family,power,alpha)
+                               -u.units[j]+0.5*ln(ws.wscale)) END) END AS diagnostic_scores,
          CASE WHEN sw=0 THEN 0.0 ELSE __reg_observed_sign(y,eta,family,power) END AS hwt,
          CASE WHEN family = 'logistic' THEN __reg_logit_resid(y,eta)
               WHEN family = 'linear' THEN __reg_weighted_center(y,mu,sw,ru.runit) ELSE y-mu END AS resid,
@@ -3658,7 +3670,7 @@ __reg_lev AS (
   SELECT p.__reg_rid__,
          list_sum(list_transform(p.xs, lambda xa, a: xa * list_dot_product(bi.Ainv[a], p.xs))) AS xax,
          (p.hwt/bs.hunit) * xax AS h, bs.hunit AS hunit,
-         list_sum(list_transform(p.logit_scores,lambda v,j: v*list_dot_product(bi.Ainv[j],p.logit_scores)))/bs.hunit AS score_xax
+         list_sum(list_transform(p.diagnostic_scores,lambda v,j: v*list_dot_product(bi.Ainv[j],p.diagnostic_scores)))/bs.hunit AS score_xax
   FROM __reg_pr p CROSS JOIN __reg_breadinv bi CROSS JOIN __reg_breadscale bs
 ),
 __reg_punits AS (
@@ -3696,12 +3708,8 @@ __reg_diag AS (
               ELSE sign(p.resid) * p.sw * sqrt(2.0) * sqrt(greatest(p.halfdev, 0.0)) END AS deviance_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN pearson_resid/(SELECT unit FROM __reg_punits) / sqrt(dp.phi*(1.0-l.h)) END AS std_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN
-              CASE WHEN family = 'logistic'
+              CASE WHEN family IN ('logistic','poisson','nbinom')
                    THEN l.score_xax/(dp.d*(1.0-l.h)*(1.0-l.h))
-                   -- Restore fixed-dispersion weights in root units before
-                   -- squaring; the normalized Pearson square can overflow.
-                   WHEN family IN ('poisson','nbinom') THEN pow(__reg_mul_div(pearson_resid,
-                     sqrt(l.h),sqrt(dp.d)*(1.0-l.h)),2)
                    ELSE (pow(pearson_resid/(SELECT unit FROM __reg_punits),2)/dp.phi) * l.h / (dp.d*(1.0-l.h)*(1.0-l.h)) END END AS cooks_distance
   FROM __reg_pr p JOIN __reg_lev l ON l.__reg_rid__ = p.__reg_rid__ CROSS JOIN __reg_disp dp
        CROSS JOIN __reg_weightscale ws

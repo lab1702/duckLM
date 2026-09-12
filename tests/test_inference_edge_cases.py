@@ -1357,3 +1357,34 @@ def test_gamma_observed_information_combines_tiny_weights_before_ratios(con, rob
     influence = con.execute(f'SELECT hat,std_resid FROM gamma_influence({args})').fetchall()
     np.testing.assert_allclose([row[0] for row in influence],hats,rtol=1e-12)
     np.testing.assert_allclose([row[1] for row in influence[:2]],[expected_std]*2,rtol=1e-10,atol=0)
+
+
+@pytest.mark.parametrize('family,alpha', [('poisson',0.), ('nbinom',1.)])
+@pytest.mark.parametrize('robust', ['hc0','hc1','hc2','hc3'])
+def test_count_scores_survive_underflowed_mean_in_robust_inference(con, family, alpha, robust):
+    con.execute("""CREATE TABLE score_rows AS SELECT * FROM (VALUES
+        (-1.,1.,0.),(-1.,2.,0.),(1.,1.,0.),(1.,2.,0.),(0.,1.,-1500.))t(x,y,o)""")
+    con.execute(f"CREATE TABLE score_model AS SELECT * FROM {family}_fit('score_rows','y',offset_col:='o')")
+    data = con.sql('FROM score_rows').df()
+    beta = con.sql('SELECT coefficient FROM score_model').fetchnumpy()['coefficient']
+    design = np.column_stack([np.ones(5),data.x])
+    mu = np.exp(design @ beta + data.o.to_numpy())
+    y = data.y.to_numpy()
+    score = (y-mu)/(1+alpha*mu)
+    information = mu*(1+alpha*y)/(1+alpha*mu)**2
+    bread_inv = np.linalg.inv(design.T @ (information[:,None]*design))
+    xax = np.einsum('ij,jk,ik->i',design,bread_inv,design)
+    hat = information*xax
+    meat = score**2
+    if robust=='hc2': meat /= 1-hat
+    if robust=='hc3': meat /= (1-hat)**2
+    covariance = bread_inv @ (design.T @ (meat[:,None]*design)) @ bread_inv
+    if robust=='hc1': covariance *= 5/3
+    args = "'score_model','score_rows','y',offset_col:='o'"
+    actual = con.execute(f"SELECT std_error FROM {family}_summary({args},robust:='{robust}')").fetchnumpy()['std_error']
+    np.testing.assert_allclose(actual,np.sqrt(np.diag(covariance)),rtol=1e-10)
+    # Cancel mu analytically in V and observed information, retaining the
+    # surprising final row even though its mean and leverage round to zero.
+    expected_cooks = (y-mu)**2*(1+alpha*y)/(1+alpha*mu)**3*xax/(2*(1-hat)**2)
+    cooks = con.execute(f'SELECT cooks_distance FROM {family}_influence({args})').fetchnumpy()['cooks_distance']
+    np.testing.assert_allclose(cooks,expected_cooks,rtol=1e-10)
