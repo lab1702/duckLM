@@ -64,6 +64,22 @@ def test_count_diagnostics_preserve_representable_residual_roots(con,family,eta,
         assert dispersion==pytest.approx(1.5*expected_pearson**2,rel=1e-10,abs=5e-324)
 
 
+@pytest.mark.parametrize('family', ['poisson','nbinom'])
+@pytest.mark.parametrize('eta,y,weight', [(0.,1e160,1e-100),(-710.,1.,1e-100),(-750.,1.,1e-300)])
+def test_count_cooks_distance_restores_weight_before_squaring(con,family,eta,y,weight):
+    con.execute("CREATE TABLE cook_model AS SELECT '(Intercept)' feature,0.0::DOUBLE coefficient")
+    con.execute('CREATE TABLE cook_data AS SELECT ?::DOUBLE y,?::DOUBLE expo,?::DOUBLE w FROM range(3)',[y,eta,weight])
+    rows=con.execute(f"SELECT hat,pearson_resid,cooks_distance FROM {family}_influence('cook_model','cook_data','y',offset_col:='expo',weights_col:='w')").fetchall()
+    # The identical intercept-only rows have leverage 1/3. Compute the
+    # weighted Pearson square independently in log space to avoid overflow.
+    log_variance=eta+(np.logaddexp(0.,eta) if family=='nbinom' else 0.)
+    expected=.75*np.exp(np.log(weight)+2*np.log(y-np.exp(eta))-log_variance)
+    for hat,pearson,cook in rows:
+        assert hat==pytest.approx(1/3,rel=1e-12)
+        assert np.isfinite(pearson) and np.isfinite(cook)
+        assert cook==pytest.approx(expected,rel=1e-10)
+
+
 def model(con, feature="x", name="edge_model", multinomial=False):
     data = pd.DataFrame({"feature": ["(Intercept)", feature], "coefficient": [0.3, 0.2]})
     if multinomial:

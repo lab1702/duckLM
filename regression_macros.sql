@@ -3638,8 +3638,13 @@ __reg_diag AS (
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN
               CASE WHEN family = 'logistic'
                    THEN l.score_xax/(dp.d*(1.0-l.h)*(1.0-l.h))
+                   -- Restore fixed-dispersion weights in root units before
+                   -- squaring; the normalized Pearson square can overflow.
+                   WHEN family IN ('poisson','nbinom') THEN pow(__reg_mul_div(pearson_resid,
+                     sqrt(l.h)*sqrt(ws.wscale),sqrt(dp.d)*(1.0-l.h)),2)
                    ELSE (pearson_resid*pearson_resid/dp.phi) * l.h / (dp.d*(1.0-l.h)*(1.0-l.h)) END END AS cooks_distance
   FROM __reg_pr p JOIN __reg_lev l ON l.__reg_rid__ = p.__reg_rid__ CROSS JOIN __reg_disp dp
+       CROSS JOIN __reg_weightscale ws
 )
 SELECT n.* EXCLUDE (__reg_rid__), d.hat,
        __reg_mul_div(d.pearson_resid*sqrt(ws.wscale),
@@ -3649,7 +3654,7 @@ SELECT n.* EXCLUDE (__reg_rid__), d.hat,
          (SELECT CASE WHEN family='tweedie' THEN exp((1.0-power/2.0)*shift) ELSE runit END
           FROM __reg_resunits CROSS JOIN __reg_responseunits),1.0) AS deviance_resid,
        d.std_resid*(CASE WHEN family IN ('linear','gamma','tweedie') THEN 1.0 ELSE sqrt(ws.wscale) END) AS std_resid,
-       d.cooks_distance*(CASE WHEN family IN ('linear','gamma','tweedie') THEN 1.0 ELSE ws.wscale END) AS cooks_distance
+       d.cooks_distance*(CASE WHEN family='logistic' THEN ws.wscale ELSE 1.0 END) AS cooks_distance
 FROM __reg_num n JOIN __reg_diag d ON d.__reg_rid__ = n.__reg_rid__
 CROSS JOIN __reg_inputcheck CROSS JOIN __reg_weightscale ws WHERE __reg_inputcheck.ok ORDER BY n.__reg_rid__;
 
