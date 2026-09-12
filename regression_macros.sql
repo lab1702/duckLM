@@ -145,7 +145,7 @@ CREATE OR REPLACE MACRO __reg_matinv(A) AS (
       [ struct_pack(k := 0, M := list_transform(A, lambda row, i:
             row || list_transform(row, lambda v, j: CASE WHEN i = j THEN 1.0 ELSE 0.0 END))) ]
       || list_transform(range(1, len(A)+1), lambda i: struct_pack(k := i, M := [[0.0]]::DOUBLE[][])),
-      (acc, e) -> struct_pack(k := e.k, M :=
+      lambda acc, e: struct_pack(k := e.k, M :=
         CASE WHEN acc.M IS NULL OR NOT isfinite(acc.M[e.k][e.k])
                     OR acc.M[e.k][e.k] <= 1e-12 * abs(A[e.k][e.k])
                THEN NULL::DOUBLE[][]
@@ -195,11 +195,11 @@ CREATE OR REPLACE MACRO __reg_cd_coord(A, bvec, b, j, g) AS (
 CREATE OR REPLACE MACRO __reg_cd(A, bvec, b0, g, d1, sweeps) AS (
   list_reduce(
     [b0] || list_transform(range(1, sweeps + 1), lambda zs: []::DOUBLE[]),
-    (zbeta, zsw) ->
+    lambda zbeta, zsw:
       list_reduce(
         [ struct_pack(b := zbeta, j := 0) ]
           || list_transform(range(1, d1 + 1), lambda zjj: struct_pack(b := []::DOUBLE[], j := zjj)),
-        (zacc, zel) -> struct_pack(b := __reg_cd_coord(A, bvec, zacc.b, zel.j, g), j := zel.j)
+        lambda zacc, zel: struct_pack(b := __reg_cd_coord(A, bvec, zacc.b, zel.j, g), j := zel.j)
       ).b
   )
 );
@@ -248,7 +248,7 @@ CREATE OR REPLACE MACRO __reg_balanced_sum(vs) AS (
     list_transform([list_reduce(
       [struct_pack(pi := 1, ni := 1, s := 0.0::DOUBLE, c := 0.0::DOUBLE)]
       || list_transform(range(len(vs)),lambda i: struct_pack(pi := 1, ni := 1, s := 0.0::DOUBLE, c := 0.0::DOUBLE)),
-      (acc,unused) -> list_transform([acc.ni <= len(parts.neg) AND (acc.s >= 0 OR acc.pi > len(parts.pos))], lambda take_neg:
+      lambda acc, unused: list_transform([acc.ni <= len(parts.neg) AND (acc.s >= 0 OR acc.pi > len(parts.pos))], lambda take_neg:
         list_transform([CASE WHEN take_neg THEN parts.neg[acc.ni] ELSE parts.pos[acc.pi] END], lambda term:
           list_transform([acc.s+term], lambda total:
             struct_pack(pi := acc.pi+CASE WHEN take_neg THEN 0 ELSE 1 END,
@@ -576,9 +576,9 @@ __reg_packed AS MATERIALIZED (
         -- a struct list lexicographically by field, hence j first.
         SELECT x.rid,
                __reg_weighted_center(any_value(yv.v),any_value(ys.mu_y),any_value(wt.sw),any_value(ys.sd_y)) AS wy,
-               [any_value(wt.sw)] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_weighted_center(x.v,s.mu,wt.sw,s.sigma)))), zp -> zp.v) AS wxs,
+               [any_value(wt.sw)] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_weighted_center(x.v,s.mu,wt.sw,s.sigma)))), lambda zp: zp.v) AS wxs,
                CASE WHEN family = 'linear' THEN wxs
-                    ELSE [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), zp -> zp.v) END AS xs,
+                    ELSE [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), lambda zp: zp.v) END AS xs,
                CASE WHEN family = 'linear'
                     THEN __reg_weighted_center(coalesce(any_value(ov.v),0.0),any_value(os.center),any_value(wt.sw),any_value(ys.sd_y))
                     ELSE coalesce(any_value(ov.v),0.0)-any_value(os.center) END AS o,
@@ -1591,12 +1591,12 @@ __reg_mcols AS (
 __reg_mnum AS MATERIALIZED (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
 __reg_mfraw AS MATERIALIZED (
   SELECT __reg_rid__ AS rid, name AS col, value AS v
-  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != outcome AND c != '__reg_rid__') AS DOUBLE) FROM __reg_mnum)
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(lambda c: c != outcome AND c != '__reg_rid__') AS DOUBLE) FROM __reg_mnum)
         ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
 ),
 __reg_myall AS MATERIALIZED (
   SELECT __reg_rid__ AS rid, val AS lab
-  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != '__reg_rid__') AS VARCHAR) FROM __reg_mnum)
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(lambda c: c != '__reg_rid__') AS VARCHAR) FROM __reg_mnum)
         ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE val) WHERE name = outcome
 ),
 -- Drop incomplete observations before computing standardization, counts,
@@ -1671,7 +1671,7 @@ __reg_mpacked AS MATERIALIZED (
          any_value(len(yv)) AS K1, any_value(len(xs)) AS D1
   FROM (
     SELECT x.rid,
-           [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), zp -> zp.v) AS xs,
+           [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), lambda zp: zp.v) AS xs,
            list_transform(any_value(nr.nrf),
              lambda cl: CASE WHEN any_value(yl.lab) = cl THEN 1.0 ELSE 0.0 END) AS yv
     FROM __reg_mflong x
@@ -1805,7 +1805,7 @@ __reg_minput AS MATERIALIZED (SELECT row_number() OVER () AS __reg_rid__, * FROM
 __reg_mncheck AS (SELECT * FROM __reg_mscore_check(model,tbl,'multinom_evaluate')),
 __reg_mtrue AS (
   SELECT __reg_rid__ AS rid, val AS lab
-  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != '__reg_rid__') AS VARCHAR) FROM __reg_minput)
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(lambda c: c != '__reg_rid__') AS VARCHAR) FROM __reg_minput)
         ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE val)
   WHERE name = outcome
 ),
@@ -1863,12 +1863,12 @@ __reg_cv_cols AS (
 __reg_cv_num AS MATERIALIZED (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
 __reg_cv_fraw AS MATERIALIZED (
   SELECT __reg_rid__ AS rid, name AS col, value AS v
-  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != outcome AND c != '__reg_rid__') AS DOUBLE) FROM __reg_cv_num)
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(lambda c: c != outcome AND c != '__reg_rid__') AS DOUBLE) FROM __reg_cv_num)
         ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
 ),
 __reg_cv_yall AS MATERIALIZED (
   SELECT __reg_rid__ AS rid, val AS y
-  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != '__reg_rid__') AS DOUBLE) FROM __reg_cv_num)
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(lambda c: c != '__reg_rid__') AS DOUBLE) FROM __reg_cv_num)
         ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE val) WHERE name = outcome
 ),
 -- Drop incomplete observations before computing standardization, counts,
@@ -1974,7 +1974,7 @@ __reg_cv_marr AS (
 __reg_cv_rows AS MATERIALIZED (
   SELECT x.rid, any_value(yr.fold) AS fold, any_value(yr.y) AS y,
          __reg_centered(any_value(yr.y),any_value(ys.mu_y),any_value(ys.sd_y)) AS yt,
-         [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), zp -> zp.v) AS xs
+         [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), lambda zp: zp.v) AS xs
   FROM __reg_cv_flong x JOIN __reg_cv_stats s ON s.col=x.col JOIN __reg_cv_yraw yr ON yr.rid=x.rid
   CROSS JOIN __reg_cv_ys ys GROUP BY x.rid
 ),
@@ -2259,12 +2259,12 @@ __reg_nbd_cols AS (
 __reg_nbd_num AS MATERIALIZED (SELECT row_number() OVER () AS __reg_rid__, * FROM query_table(tbl)),
 __reg_nbd_fraw AS MATERIALIZED (
   SELECT __reg_rid__ AS rid, name AS col, value AS v
-  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != outcome AND c != '__reg_rid__') AS DOUBLE) FROM __reg_nbd_num)
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(lambda c: c != outcome AND c != '__reg_rid__') AS DOUBLE) FROM __reg_nbd_num)
         ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE value)
 ),
 __reg_nbd_yall AS MATERIALIZED (
   SELECT __reg_rid__ AS rid, val AS y
-  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(c -> c != '__reg_rid__') AS DOUBLE) FROM __reg_nbd_num)
+  FROM (UNPIVOT (SELECT __reg_rid__, CAST(COLUMNS(lambda c: c != '__reg_rid__') AS DOUBLE) FROM __reg_nbd_num)
         ON COLUMNS(* EXCLUDE (__reg_rid__)) INTO NAME name VALUE val) WHERE name = outcome
 ),
 -- Drop incomplete observations before computing standardization, counts,
@@ -2348,7 +2348,7 @@ __reg_nbd_marr AS (
 ),
 __reg_nbd_rows AS MATERIALIZED (
   SELECT x.rid, any_value(yr.y) AS y, any_value(yr.y) / any_value(ys.sd_y) AS yt,
-         [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), zp -> zp.v) AS xs
+         [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := s.j, v := __reg_centered(x.v,s.mu,s.sigma)))), lambda zp: zp.v) AS xs
   FROM __reg_nbd_flong x JOIN __reg_nbd_stats s ON s.col=x.col JOIN __reg_nbd_yraw yr ON yr.rid=x.rid
   CROSS JOIN __reg_nbd_ys ys GROUP BY x.rid
 ),
@@ -2512,7 +2512,7 @@ FROM nbinom_dispersion(tbl, outcome,
 -- Reciprocal Mills ratio in the tail, via Laplace's continued fraction.
 CREATE OR REPLACE MACRO __reg_norm_tail_d(a) AS (
   list_reduce([a::DOUBLE] || list_transform(range(24,0,-1), lambda j: j::DOUBLE),
-              (den, n) -> a+n/den)
+              lambda den, n: a+n/den)
 );
 CREATE OR REPLACE MACRO __reg_norm_q(a) AS (          -- upper tail P(Z>a), a>=0
   CASE
@@ -2603,7 +2603,7 @@ CREATE OR REPLACE MACRO __reg_betacf(a, b, x) AS (
     || list_transform(range(1, 401),
          lambda i: struct_pack(c := 0.0::DOUBLE, d := 0.0::DOUBLE, h := 0.0::DOUBLE,
                                aa := __reg_bcf_aa(a,b,x,i)::DOUBLE)),
-    (acc, e) -> struct_pack(
+    lambda acc, e: struct_pack(
        c  := __reg_fpmin(1.0 + e.aa / acc.c),
        d  := 1.0 / __reg_fpmin(1.0 + e.aa * acc.d),
        h  := acc.h * (1.0 / __reg_fpmin(1.0 + e.aa * acc.d))
@@ -2825,7 +2825,7 @@ __reg_clv AS (
   WHERE name = cluster_col
 ),
 __reg_feat AS (
-  SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
+  SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), lambda zp: zp.v) AS xs, count(*)::INT AS nf
   FROM __reg_alllong l JOIN __reg_mdlj m ON m.feature = l.col
   GROUP BY l.__reg_rid__
   UNION ALL
@@ -3180,7 +3180,7 @@ __reg_yv AS (SELECT __reg_rid__, v AS y  FROM __reg_alllong WHERE col = outcome)
 __reg_ov AS (SELECT __reg_rid__, v AS o  FROM __reg_alllong WHERE col = offset_col),
 __reg_wv AS (SELECT __reg_rid__, v AS wt FROM __reg_alllong WHERE col = weights_col),
 __reg_feat AS (
-  SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
+  SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), lambda zp: zp.v) AS xs, count(*)::INT AS nf
   FROM __reg_alllong l JOIN __reg_mdlj m ON m.feature = l.col
   GROUP BY l.__reg_rid__
   UNION ALL
@@ -3318,7 +3318,7 @@ __reg_salllong AS (
 ),
 __reg_soff AS (SELECT __reg_srid__, v AS o FROM __reg_salllong WHERE col = offset_col),
 __reg_sfeat AS (
-  SELECT l.__reg_srid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
+  SELECT l.__reg_srid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), lambda zp: zp.v) AS xs, count(*)::INT AS nf
   FROM __reg_salllong l JOIN __reg_mdlj m ON m.feature = l.col
   GROUP BY l.__reg_srid__
   UNION ALL
@@ -3439,7 +3439,7 @@ __reg_yv AS (SELECT __reg_rid__, v AS y  FROM __reg_alllong WHERE col = outcome)
 __reg_ov AS (SELECT __reg_rid__, v AS o  FROM __reg_alllong WHERE col = offset_col),
 __reg_wv AS (SELECT __reg_rid__, v AS wt FROM __reg_alllong WHERE col = weights_col),
 __reg_feat AS (
-  SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
+  SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), lambda zp: zp.v) AS xs, count(*)::INT AS nf
   FROM __reg_alllong l JOIN __reg_mdlj m ON m.feature = l.col GROUP BY l.__reg_rid__
   UNION ALL
   SELECT __reg_rid__, [1.0::DOUBLE], 0::INT FROM __reg_num
@@ -3666,7 +3666,7 @@ __reg_mdlj AS (
   FROM (SELECT DISTINCT feature FROM __reg_mdl WHERE feature != '(Intercept)')
 ),
 __reg_feat AS (
-  SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), zp -> zp.v) AS xs, count(*)::INT AS nf
+  SELECT l.__reg_rid__, [1.0::DOUBLE] || list_transform(list_sort(list(struct_pack(j := m.j, v := l.v))), lambda zp: zp.v) AS xs, count(*)::INT AS nf
   FROM __reg_alllong l JOIN __reg_mdlj m ON m.feature = l.col
   GROUP BY l.__reg_rid__
   UNION ALL

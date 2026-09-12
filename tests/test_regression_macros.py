@@ -584,7 +584,7 @@ class TestL1:
         l1 = 0.02
         coefs = fit(con, "logit_fit", self._cols(X).assign(y=yb), l1=l1)
         got = np.array([coefs[c] for c in names]) * sd
-        ref = LogisticRegression(penalty="l1", solver="saga", C=1 / (len(X) * l1),
+        ref = LogisticRegression(l1_ratio=1, solver="saga", C=1 / (len(X) * l1),
                                  max_iter=500000, tol=1e-10).fit(Xs, yb)
         assert got == pytest.approx(ref.coef_[0], abs=5e-3)
 
@@ -1260,7 +1260,7 @@ class TestCrossValidation:
                         m = Lasso(alpha=l1 if l1 > 0 else 1e-12, max_iter=200000, tol=1e-12).fit(Xs[tr], ((y - my) / sy)[tr])
                         pr = m.predict(Xs[te]) * sy + my; tot += ((y[te] - pr) ** 2).sum()
                     else:
-                        m = LogisticRegression(penalty="l1", solver="saga",
+                        m = LogisticRegression(l1_ratio=1, solver="saga",
                                                C=1 / (ntr * l1) if l1 > 0 else 1e12, max_iter=500000, tol=1e-9).fit(Xs[tr], y[tr])
                         p = np.clip(m.predict_proba(Xs[te])[:, 1], 1e-15, 1 - 1e-15)
                         tot += (-2 * (y[te] * np.log(p) + (1 - y[te]) * np.log(1 - p))).sum()
