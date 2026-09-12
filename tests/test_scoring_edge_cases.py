@@ -138,6 +138,18 @@ def test_tweedie_deviance_combines_large_response_scale_with_small_residual(con,
         assert actual == pytest.approx(expected,rel=2e-8)
 
 
+@pytest.mark.parametrize('power', [1e155,1e308])
+def test_tweedie_exact_deviance_remains_zero_at_large_finite_powers(con,power):
+    con.execute("CREATE TABLE model AS SELECT '(Intercept)' feature,0.0::DOUBLE coefficient")
+    con.execute('CREATE TABLE observations AS SELECT 1.0::DOUBLE y FROM range(4)')
+    metrics=_metrics(con,f"tweedie_evaluate('model','observations','y',power:={power})")
+    assert metrics['deviance']==0.0
+    assert metrics['null_deviance']==0.0
+    assert metrics['pseudo_r2'] is None
+    residuals=con.execute(f"SELECT deviance_resid FROM tweedie_influence('model','observations','y',power:={power})").fetchall()
+    assert residuals==[(0.0,)]*4
+
+
 @pytest.mark.parametrize("outcome", [0, 1])
 def test_logit_evaluation_on_single_class_holdout(con, outcome):
     con.execute(
