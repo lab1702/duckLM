@@ -662,6 +662,19 @@ __reg_cfg AS (
     FROM __reg_feats f, __reg_packed p, __reg_ycheck y, __reg_namecheck nc
     WHERE y.ok AND nc.ok
 ),
+-- Gamma's initial weighted y/mean can overflow before any damping is
+-- possible. In that case start above every log response/offset ratio, making
+-- all response/mean ratios at most one. Ordinary starts remain unchanged.
+__reg_seed AS (
+    SELECT list_transform(range(f.d+1),lambda i:
+      CASE WHEN family='gamma' AND i=0 AND max_logscore>700.0
+           THEN intercept ELSE 0.0::DOUBLE END) AS betas
+    FROM __reg_feats f CROSS JOIN (
+      SELECT max(ln(nullif(abs(r.wy),0.0))-r.o) AS max_logscore,
+             max(ln(nullif(abs(r.wy),0.0))-ln(nullif(r.sw,0.0))-r.o) AS intercept
+      FROM __reg_packed, unnest(rows) t(r) WHERE family='gamma'
+    )
+),
 -- IRLS / Fisher scoring (solver := 'irls'): each iteration solves the weighted
 -- least squares beta <- (X'WX + sumw*l2*D)^-1 X'W z on the standardized data,
 -- where W is the expected-information working weight and z the working response.
@@ -673,8 +686,8 @@ __reg_irls(it, betas, move) AS (
     -- cross-join __reg_cfg and touch c.step so ALL input validation (which lives
     -- in the step CASE: l2/l1 sign, bad solver, l1-with-irls, missing offset/
     -- weights) fires for the irls path too, not just gradient descent
-    SELECT 0, list_transform(range(f.d + 1), lambda i: 0.0::DOUBLE), 1e308::DOUBLE
-    FROM __reg_feats f, __reg_cfg c
+    SELECT 0, seed.betas, 1e308::DOUBLE
+    FROM __reg_seed seed, __reg_cfg c
     WHERE c.step IS NOT NULL
       -- irls is the solver under solver := 'irls' and under the 'auto' default.
       -- L1 is handled inside the iteration by coordinate descent, so it no longer
@@ -787,10 +800,10 @@ __reg_irls_ok AS (
 -- unused solver costs nothing.
 __reg_gd AS (
     SELECT 0 AS it,
-           list_transform(range(f.d + 1), lambda i: 0.0::DOUBLE) AS betas,
-           list_transform(range(f.d + 1), lambda i: 0.0::DOUBLE) AS prev,
+           seed.betas AS betas,
+           seed.betas AS prev,
            1e308::DOUBLE AS move
-    FROM __reg_feats f
+    FROM __reg_seed seed
     WHERE solver = 'gd' OR (solver = 'auto' AND NOT (SELECT ok FROM __reg_irls_ok))
     UNION ALL
     SELECT it + 1,

@@ -291,3 +291,14 @@ def test_log_link_fit_centers_large_common_offsets(con, family, offset, solver):
     np.testing.assert_allclose(beta,[-offset,.3],rtol=1e-7)
     prediction = con.execute(f"SELECT prediction FROM {family}_predict('common_model','common_offset',offset_col:='o')").fetchnumpy()['prediction']
     np.testing.assert_allclose(prediction,np.exp(.3*np.arange(6)),rtol=1e-7)
+
+
+@pytest.mark.parametrize('solver', ['auto','irls','gd'])
+@pytest.mark.parametrize('offset_scale', [-1000.,1000.])
+def test_gamma_fit_initialization_survives_varying_extreme_offsets(con, solver, offset_scale):
+    con.execute('CREATE OR REPLACE TABLE varying_offset AS SELECT i::DOUBLE x,1.0 y,i*?::DOUBLE o FROM range(-1,2)t(i)',[offset_scale])
+    con.execute(f"CREATE OR REPLACE TABLE varying_model AS SELECT * FROM gamma_fit('varying_offset','y',offset_col:='o',solver:='{solver}',max_iter:=5000)")
+    beta = con.execute('SELECT coefficient FROM varying_model').fetchnumpy()['coefficient']
+    np.testing.assert_allclose(beta,[0.,-offset_scale],rtol=1e-9,atol=1e-6)
+    prediction = con.execute("SELECT prediction FROM gamma_predict('varying_model','varying_offset',offset_col:='o')").fetchnumpy()['prediction']
+    np.testing.assert_allclose(prediction,np.ones(3),rtol=1e-6)
