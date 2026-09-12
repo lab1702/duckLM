@@ -1143,6 +1143,12 @@ CREATE OR REPLACE MACRO __reg_nb_ll(y, eta, alpha) AS (
 );
 
 -- NB2 information and residuals without forming mu^2 or alpha*y products.
+CREATE OR REPLACE MACRO __reg_exp_scale(value, logscale) AS (
+  CASE WHEN value=0 THEN 0.0 WHEN logscale=0 THEN value
+       WHEN exp(logscale)>0 AND isfinite(exp(logscale))
+            AND value*exp(logscale)!=0 AND isfinite(value*exp(logscale)) THEN value*exp(logscale)
+       ELSE sign(value)*exp(ln(abs(value))+logscale) END
+);
 CREATE OR REPLACE MACRO __reg_nb_info(eta, alpha) AS (
   exp(eta-__reg_softplus(ln(alpha)+eta))
 );
@@ -1167,6 +1173,17 @@ CREATE OR REPLACE MACRO __reg_nb_pearson(y, eta, alpha) AS (
 CREATE OR REPLACE MACRO __reg_nb_score(y, eta, alpha) AS (
   CASE WHEN eta >= 0 THEN (y/exp(eta)-1.0)/(exp(-eta)+alpha)
        ELSE (y-exp(eta))/(1.0+alpha*exp(eta)) END
+);
+
+-- Pearson residual for variance mu^power, restoring its log scale only after
+-- taking the response difference. This includes Gamma (power=2).
+CREATE OR REPLACE MACRO __reg_tw_pearson(y, eta, power) AS (
+  CASE WHEN eta >= 0 THEN
+         __reg_exp_scale((CASE WHEN isfinite(exp(eta)) THEN y/exp(eta)
+                              ELSE __reg_exp_scale(y,-eta) END)-1.0,(1.0-power/2.0)*eta)
+       WHEN exp(eta)>0 THEN __reg_exp_scale(y-exp(eta),-(power/2.0)*eta)
+       WHEN y=0 THEN -exp((1.0-power/2.0)*eta)
+       ELSE __reg_exp_scale(1.0-exp(eta-ln(y)),ln(y)-(power/2.0)*eta) END
 );
 
 -- Fitting retains log(alpha*mean(y)), even when the product is outside DOUBLE.
@@ -1341,13 +1358,20 @@ __reg_auc AS (
 -- Accumulate residual squares in finite units. The same units for SSE and
 -- SST cancel in R-squared; RMSE and Gaussian log-likelihood restore the scale
 -- after the square root or in log space, so representable metrics stay finite.
+__reg_pearson_rows AS (
+    SELECT *, CASE family WHEN 'gamma' THEN __reg_tw_pearson(y,z,2.0)
+                         WHEN 'tweedie' THEN __reg_tw_pearson(y,z,power)
+                         WHEN 'nbinom' THEN __reg_nb_pearson(y,z,alpha) END AS pres
+    FROM __reg_rows
+),
 __reg_errorunits AS (
     SELECT coalesce(nullif(max(CASE WHEN isfinite(y) AND isfinite(yhat)
                                    THEN __reg_center_scale(y,yhat) ELSE 0.0 END),0.0),
                     nullif(max(abs(y)),0.0),1.0) AS eunit,
            coalesce(nullif(max(abs(y)),0.0),1.0) AS yunit,
+           coalesce(nullif(max(abs(pres)),0.0),1.0) AS punit,
            coalesce(nullif(max(__reg_softplus(CASE WHEN y=1 THEN -z ELSE z END)),0.0),1.0) AS lossunit
-    FROM __reg_rows
+    FROM __reg_pearson_rows
 ),
 __reg_agg AS (
     SELECT count(*)::DOUBLE AS n,
@@ -1355,6 +1379,8 @@ __reg_agg AS (
                 WHEN isfinite(avg(y)) THEN avg(y)
                 ELSE any_value(yunit)*avg(y/yunit) END AS ybar,
            any_value(eunit) AS eunit,
+           any_value(punit) AS punit,
+           sum(pow(pres/punit,2)) AS pearson_scaled,
            sum(pow(__reg_centered(y,yhat,eunit),2)) AS sse,
            sum(abs(__reg_centered(y,yhat,eunit))) AS sae,
            -sum(__reg_softplus(CASE WHEN y=1 THEN -z ELSE z END)) AS ll_bin,
@@ -1367,16 +1393,13 @@ __reg_agg AS (
                          -__reg_tw_halfdev(y,z,1.0) END) AS ll_pois,
            sum(__reg_tw_halfdev(y,z,1.0)) AS dev_pois_half,
            sum(__reg_tw_halfdev(y,z,2.0)) AS dev_gam_half,
-           sum(((y - yhat) / yhat) * ((y - yhat) / yhat)) AS pearson_gam,
-           -- Tweedie unit half-deviance and Pearson chi-square (power = p).
+           -- Tweedie unit half-deviance (power = p).
            sum(__reg_tw_halfdev(y,z,power)) AS dev_tw_half,
-           sum(pow((y-yhat)/yhat * pow(yhat,1.0-power/2.0),2)) AS pearson_tw,
            -- Negative binomial (NB2, r = 1/alpha): log-likelihood, half-deviance,
            -- and Pearson chi-square (variance = mu + alpha*mu^2).
            sum(__reg_nb_ll(y,z,alpha)) AS ll_nb,
-           sum(__reg_nb_halfdev(y,z,alpha)) AS dev_nb_half,
-           sum(pow(__reg_nb_pearson(y,z,alpha),2)) AS pearson_nb
-    FROM __reg_rows CROSS JOIN __reg_errorunits
+           sum(__reg_nb_halfdev(y,z,alpha)) AS dev_nb_half
+    FROM __reg_pearson_rows CROSS JOIN __reg_errorunits
 ),
 -- Fit the intercept-only null on the evaluated rows, retaining their offsets.
 -- The score changes sign at the unique intercept-only optimum.
@@ -1479,10 +1502,9 @@ SELECT
                 WHEN 'gamma'    THEN 1.0 - a.dev_gam_half / nullif(greatest(0.0, nu.null_dev_gam_half), 0.0)
                 WHEN 'tweedie'  THEN 1.0 - a.dev_tw_half / nullif(greatest(0.0, nu.null_dev_tw_half), 0.0)
                 WHEN 'nbinom'   THEN 1.0 - a.dev_nb_half / nullif(greatest(0.0, nu.null_dev_nb_half), 0.0) END AS pseudo_r2,
-    CASE WHEN a.n > m.kparams THEN CASE
-         WHEN family = 'gamma'   THEN a.pearson_gam / (a.n - m.kparams)
-         WHEN family = 'tweedie' THEN a.pearson_tw / (a.n - m.kparams)
-         WHEN family = 'nbinom'  THEN a.pearson_nb / (a.n - m.kparams) END END AS dispersion,
+    CASE WHEN a.n > m.kparams AND family IN ('gamma','tweedie','nbinom')
+         THEN CASE WHEN isinf(a.punit) THEN 'Infinity'::DOUBLE
+              ELSE pow(__reg_mul_div(a.punit,sqrt(a.pearson_scaled),sqrt(a.n-m.kparams)),2) END END AS dispersion,
     CASE family WHEN 'linear'   THEN -2.0 * loglik + 2.0 * m.kparams
                 WHEN 'logistic' THEN -2.0 * a.ll_bin  + 2.0 * m.kparams
                 WHEN 'poisson'  THEN -2.0 * a.ll_pois + 2.0 * m.kparams
@@ -2778,12 +2800,6 @@ CREATE OR REPLACE MACRO __reg_log_info(eta, family, power, alpha) AS (
        WHEN 'poisson' THEN eta WHEN 'tweedie' THEN (2.0-power)*eta
        WHEN 'nbinom' THEN CASE WHEN eta>=0 THEN -ln(alpha+exp(-eta))
                               ELSE eta-__reg_softplus(ln(alpha)+eta) END END
-);
-CREATE OR REPLACE MACRO __reg_exp_scale(value, logscale) AS (
-  CASE WHEN value=0 THEN 0.0 WHEN logscale=0 THEN value
-       WHEN exp(logscale)>0 AND isfinite(exp(logscale))
-            AND value*exp(logscale)!=0 AND isfinite(value*exp(logscale)) THEN value*exp(logscale)
-       ELSE sign(value)*exp(ln(abs(value))+logscale) END
 );
 CREATE OR REPLACE MACRO __reg_observed_ratio(y, eta, family, power, alpha) AS (
   CASE family WHEN 'gamma' THEN y/exp(eta)

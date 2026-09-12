@@ -150,6 +150,34 @@ def test_tweedie_exact_deviance_remains_zero_at_large_finite_powers(con,power):
     assert residuals==[(0.0,)]*4
 
 
+@pytest.mark.parametrize('family', ['gamma','tweedie','nbinom'])
+@pytest.mark.parametrize('sparse', [False,True])
+def test_dispersion_scales_before_pearson_squares_and_sums(con,family,sparse):
+    con.execute("CREATE TABLE model AS SELECT '(Intercept)' feature,0.0::DOUBLE coefficient")
+    if sparse:
+        con.execute('CREATE TABLE observations AS SELECT CASE WHEN i=0 THEN 1e155 ELSE 1.0 END y FROM range(1000)t(i)')
+        count=1000; large_y=Decimal.from_float(1e155); copies=1
+    else:
+        con.execute('CREATE TABLE observations AS SELECT 1e154::DOUBLE y FROM range(4)')
+        count=4; large_y=Decimal.from_float(1e154); copies=4
+    with localcontext() as context:
+        context.prec=80
+        expected=float(copies*(large_y-1)**2/(2 if family=='nbinom' else 1)/(count-1))
+    actual=_metrics(con,f"{family}_evaluate('model','observations','y')")['dispersion']
+    assert np.isfinite(actual)
+    assert actual==pytest.approx(expected,rel=1e-12)
+
+
+def test_tweedie_dispersion_preserves_tiny_mean_residual_scale(con):
+    eta=float(np.log(1e-320))
+    con.execute("CREATE TABLE model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient",[eta])
+    con.execute('CREATE TABLE observations AS SELECT 1e-10::DOUBLE y FROM range(4)')
+    expected=4/3*np.exp(2*np.log(1e-10)-eta)
+    actual=_metrics(con,"tweedie_evaluate('model','observations','y',power:=1)")['dispersion']
+    assert np.isfinite(actual)
+    assert actual==pytest.approx(expected,rel=1e-10)
+
+
 @pytest.mark.parametrize("outcome", [0, 1])
 def test_logit_evaluation_on_single_class_holdout(con, outcome):
     con.execute(
