@@ -1152,8 +1152,17 @@ CREATE OR REPLACE MACRO __reg_nb_observed(y, eta, alpha) AS (
                 - 2.0*__reg_softplus(ln(alpha)+eta)) END
 );
 CREATE OR REPLACE MACRO __reg_nb_pearson(y, eta, alpha) AS (
-  CASE WHEN eta >= 0 THEN (y/exp(eta)-1.0)/sqrt(exp(-eta)+alpha)
-       ELSE (y-exp(eta))*exp(-eta/2.0)/sqrt(1.0+alpha*exp(eta)) END
+  -- alpha=0 gives the Poisson residual. Keep the variance scale in logs
+  -- until after multiplying the response, including unrepresentable means.
+  list_transform([CASE WHEN alpha=0 THEN 0.0
+                      ELSE __reg_softplus(ln(alpha)+eta) END], lambda logden:
+    CASE WHEN eta >= 0 THEN
+           list_transform([CASE WHEN isfinite(exp(eta)) THEN y/exp(eta)
+                                ELSE __reg_exp_scale(y,-eta) END], lambda ratio:
+             CASE WHEN alpha=0 THEN __reg_exp_scale(ratio-1.0,eta/2.0)
+                  ELSE (ratio-1.0)/sqrt(exp(-eta)+alpha) END)[1]
+         WHEN exp(eta)>0 THEN __reg_exp_scale(y-exp(eta),-eta/2.0-logden/2.0)
+         ELSE __reg_exp_scale(y,-eta/2.0-logden/2.0)-exp(eta/2.0-logden/2.0) END)[1]
 );
 CREATE OR REPLACE MACRO __reg_nb_score(y, eta, alpha) AS (
   CASE WHEN eta >= 0 THEN (y/exp(eta)-1.0)/(exp(-eta)+alpha)
@@ -1221,20 +1230,26 @@ CREATE OR REPLACE MACRO __reg_exp_diff_quotient(s, a, x) AS (
 -- Tweedie half-deviance written as a difference of exponential quotients.
 -- Unlike the three power terms, neither quotient diverges at p=1 or p=2.
 -- A local series also avoids cancellation when the observation equals its mean.
-CREATE OR REPLACE MACRO __reg_tw_halfdev(y, eta, power) AS (
-  CASE WHEN y = 0 THEN exp((2.0-power)*eta)/(2.0-power)
+-- root_result computes the square root before restoring units, preserving
+-- diagnostic residuals even when the deviance itself is outside DOUBLE range.
+CREATE OR REPLACE MACRO __reg_tw_halfdev(y, eta, power, root_result := false) AS (
+  CASE WHEN y = 0 THEN CASE WHEN root_result THEN exp(((2.0-power)*eta-ln(2.0-power))/2.0)
+                           ELSE exp((2.0-power)*eta)/(2.0-power) END
        ELSE list_transform([struct_pack(q := 2.0-power, r := 1.0-power,
                                          t := ln(y)-eta, s := (2.0-power)*ln(y))], lambda z:
          CASE WHEN abs(z.t)*greatest(abs(z.q),abs(z.r)) < 1e-3
-              THEN __reg_exp_scale(z.t*z.t*(0.5-z.t*(
+              THEN list_transform([0.5-z.t*(
                    (z.q+z.r)/6.0-z.t*((z.q*z.q+z.q*z.r+z.r*z.r)/24.0
-                   -z.t*(z.q+z.r)*(z.q*z.q+z.r*z.r)/120.0))),z.s)
+                   -z.t*(z.q+z.r)*(z.q*z.q+z.r*z.r)/120.0))], lambda series:
+                     CASE WHEN root_result THEN __reg_exp_scale(abs(z.t)*sqrt(series),z.s/2.0)
+                          ELSE __reg_exp_scale(z.t*z.t*series,z.s) END)[1]
               -- Factor out the largest exponent before subtracting the two
               -- quotients; restore response units after their cancellation.
               ELSE list_transform([greatest(0.0,-z.q*z.t,-z.r*z.t)], lambda shift:
-                     __reg_exp_scale(__reg_exp_diff_quotient(-shift,z.q,-z.t)
-                                     -__reg_exp_diff_quotient(-shift,z.r,-z.t),
-                                     z.s+shift))[1] END)[1]
+                     list_transform([__reg_exp_diff_quotient(-shift,z.q,-z.t)
+                                     -__reg_exp_diff_quotient(-shift,z.r,-z.t)], lambda dev:
+                       CASE WHEN root_result THEN __reg_exp_scale(sqrt(greatest(dev,0.0)),(z.s+shift)/2.0)
+                            ELSE __reg_exp_scale(dev,z.s+shift) END)[1])[1] END)[1]
   END
 );
 
@@ -2921,7 +2936,7 @@ __reg_rww AS (
          (CASE family
              WHEN 'linear' THEN __reg_weighted_center(r.y,mu,r.sw,ru.runit)
              WHEN 'logistic' THEN r.sw*__reg_logit_pearson(r.y,r.eta)
-             WHEN 'poisson' THEN __reg_mul_div(r.sw,r.y-mu,sqrt(mu))
+             WHEN 'poisson' THEN r.sw*__reg_nb_pearson(r.y,r.eta,0.0)
              WHEN 'gamma' THEN __reg_mul_div(r.sw,r.y-mu,mu)
              WHEN 'tweedie' THEN r.sw*((r.y-mu)/mu*pow(mu,1.0-power/2.0))
              WHEN 'nbinom' THEN r.sw*__reg_nb_pearson(r.y,r.eta,alpha) END) AS pres,
@@ -3274,7 +3289,7 @@ __reg_rww AS (
          (CASE family
              WHEN 'linear' THEN __reg_weighted_center(r.y,mu,r.sw,ru.runit)
              WHEN 'logistic' THEN r.sw*__reg_logit_pearson(r.y,r.eta)
-             WHEN 'poisson' THEN __reg_mul_div(r.sw,r.y-mu,sqrt(mu))
+             WHEN 'poisson' THEN r.sw*__reg_nb_pearson(r.y,r.eta,0.0)
              WHEN 'gamma' THEN __reg_mul_div(r.sw,r.y-mu,mu)
              WHEN 'tweedie' THEN r.sw*((r.y-mu)/mu*pow(mu,1.0-power/2.0))
              WHEN 'nbinom' THEN r.sw*__reg_nb_pearson(r.y,r.eta,alpha) END) AS pres,
@@ -3585,6 +3600,7 @@ __reg_diag AS (
   SELECT p.__reg_rid__,
          CASE WHEN isfinite(l.h) THEN l.h ELSE NULL END AS hat,  -- NULL (not NaN) on singular bread
          CASE WHEN family = 'logistic' THEN p.sw*__reg_logit_pearson(p.y,p.eta)
+              WHEN family = 'poisson' THEN p.sw*__reg_nb_pearson(p.y,p.eta,0.0)
               WHEN family = 'nbinom' THEN p.sw*__reg_nb_pearson(p.y,p.eta,alpha)
               WHEN family = 'gamma' THEN p.sw*(p.resid/p.mu)
               WHEN family = 'tweedie' THEN p.sw*(p.resid/p.mu)*pow(p.mu,1.0-power/2.0)
@@ -3592,6 +3608,12 @@ __reg_diag AS (
               ELSE __reg_mul_div(p.sw,p.resid,sqrt(p.Vmu)) END AS pearson_resid,
          CASE WHEN family = 'logistic' THEN p.sw*__reg_logit_devres(p.y,p.eta)
               WHEN family = 'linear' THEN p.resid
+              WHEN family IN ('poisson','gamma','tweedie')
+                THEN (CASE WHEN p.y=0 THEN -1.0 ELSE sign(ln(p.y)-p.eta) END)*p.sw*sqrt(2.0)
+                     *__reg_tw_halfdev(p.y,p.eta,CASE family WHEN 'poisson' THEN 1.0 WHEN 'gamma' THEN 2.0 ELSE power END,root_result:=true)
+              WHEN family = 'nbinom' AND p.y=0
+                THEN -__reg_exp_scale(p.sw,0.5*ln(2.0)+CASE WHEN p.eta+ln(alpha)<-30.0 THEN p.eta/2.0
+                     ELSE (ln(__reg_softplus(p.eta+ln(alpha)))-ln(alpha))/2.0 END)
               ELSE sign(p.resid) * p.sw * sqrt(2.0) * sqrt(greatest(p.halfdev, 0.0)) END AS deviance_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN pearson_resid / sqrt(dp.phi*(1.0-l.h)) END AS std_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN

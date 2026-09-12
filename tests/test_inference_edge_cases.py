@@ -32,6 +32,38 @@ def test_exact_linear_fit_preserves_zero_coefficient_uncertainty(con, robust):
     assert rows == [(3.,0.,3.,3.),(0.,0.,0.,0.)]
 
 
+@pytest.mark.parametrize('family', ['poisson','nbinom'])
+@pytest.mark.parametrize('eta,y', [(-1500.,1e-300),(-1000.,0.),(1000.,0.),(710.,1e308)])
+def test_count_diagnostics_preserve_representable_residual_roots(con,family,eta,y):
+    from decimal import Decimal, localcontext
+    con.execute("CREATE TABLE root_model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient",[eta])
+    con.execute('CREATE TABLE root_data AS SELECT ?::DOUBLE y FROM range(3)',[y])
+    with localcontext() as context:
+        context.prec=800
+        yy=Decimal.from_float(y); mu=Decimal.from_float(eta).exp()
+        variance=mu if family=='poisson' else mu+mu*mu
+        expected_pearson=float((yy-mu)/variance.sqrt())
+        if family=='poisson':
+            halfdev=(yy*(yy/mu).ln() if yy else 0)-yy+mu
+        else:
+            halfdev=(yy*(yy/mu).ln() if yy else 0)-(yy+1)*((yy+1)/(mu+1)).ln()
+        expected_deviance=float((2*halfdev).sqrt())*(1 if yy>mu else -1)
+    rows=con.execute(f"SELECT hat,pearson_resid,deviance_resid,std_resid FROM {family}_influence('root_model','root_data','y')").fetchall()
+    for hat,pearson,deviance,standardized in rows:
+        np.testing.assert_allclose([pearson,deviance],
+            [expected_pearson,expected_deviance],rtol=1e-10,atol=5e-324)
+        if family=='nbinom' and eta==1000.:
+            # Observed information for all-zero NB outcomes underflows here;
+            # raw residuals remain defined independently of that covariance.
+            assert hat is None and standardized is None
+        else:
+            assert hat==pytest.approx(1/3,rel=1e-12)
+            assert standardized==pytest.approx(expected_pearson/np.sqrt(2/3),rel=1e-10,abs=5e-324)
+    if family=='nbinom':
+        dispersion=con.execute("SELECT dispersion FROM nbinom_evaluate('root_model','root_data','y')").fetchone()[0]
+        assert dispersion==pytest.approx(1.5*expected_pearson**2,rel=1e-10,abs=5e-324)
+
+
 def model(con, feature="x", name="edge_model", multinomial=False):
     data = pd.DataFrame({"feature": ["(Intercept)", feature], "coefficient": [0.3, 0.2]})
     if multinomial:
