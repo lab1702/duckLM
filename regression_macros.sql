@@ -3442,8 +3442,9 @@ __reg_sfeat AS (
 ),
 __reg_scoords AS (
   -- Combine response and feature units before forming large extrapolation
-  -- coordinates; the interval standard error then already has response units.
-  SELECT sf.*, list_transform(sf.xs, lambda v,a: __reg_exp_scale(v,ln(ru.runit)+ln(pu.unit)-cp.units[a])/cp.dsc[a]) AS zs
+  -- coordinates, including absolute information weights; the interval standard
+  -- error then already has response units without a compensating late division.
+  SELECT sf.*, list_transform(sf.xs, lambda v,a: __reg_exp_scale(v,ln(ru.runit)+ln(pu.unit)-ln(cp.se_weight_scale)-cp.units[a])/cp.dsc[a]) AS zs
   FROM __reg_sfeat sf CROSS JOIN __reg_cparams cp CROSS JOIN __reg_resunits ru CROSS JOIN __reg_punits pu
 ),
 __reg_sdesign AS (
@@ -3470,8 +3471,7 @@ __reg_scored AS (
 ),
 __reg_serrors AS (
   SELECT *, CASE WHEN unit_variance >= 0 AND isfinite(unit_variance) AND phi >= 0
-                 THEN __reg_mul_div(sqrt(phi)*sqrt(unit_variance),zunit,
-                                    CASE WHEN family = 'linear' THEN 1.0 ELSE se_weight_scale END) END AS unit_se
+                 THEN __reg_mul_div(sqrt(phi)*sqrt(unit_variance),zunit,1.0) END AS unit_se
   FROM __reg_scored
 )
 SELECT sn.* EXCLUDE (__reg_srid__),

@@ -1388,3 +1388,25 @@ def test_count_scores_survive_underflowed_mean_in_robust_inference(con, family, 
     expected_cooks = (y-mu)**2*(1+alpha*y)/(1+alpha*mu)**3*xax/(2*(1-hat)**2)
     cooks = con.execute(f'SELECT cooks_distance FROM {family}_influence({args})').fetchnumpy()['cooks_distance']
     np.testing.assert_allclose(cooks,expected_cooks,rtol=1e-10)
+
+
+def test_poisson_intervals_combine_extrapolation_and_absolute_weight_scales(con):
+    con.execute('''CREATE TABLE interval_weights AS SELECT x,y,w
+        FROM (VALUES(-1.0),(1.0))t(x),(VALUES(0.,1e308),(1.,1e4))v(y,w)''')
+    con.execute("CREATE TABLE interval_model AS SELECT * FROM poisson_fit('interval_weights','y',weights_col:='w')")
+    con.execute('CREATE TABLE interval_new AS SELECT 1e200::DOUBLE x')
+    # Each feature coordinate has Fisher information 2*10000: the weighted
+    # total count. Its finite link uncertainty should produce defined bounds.
+    errors = con.execute("SELECT std_error FROM poisson_summary('interval_model','interval_weights','y',weights_col:='w')").fetchnumpy()['std_error']
+    np.testing.assert_allclose(errors,[1/np.sqrt(20000)]*2,rtol=1e-10)
+    prediction,low,high = con.execute("SELECT prediction,conf_low,conf_high FROM poisson_predict_ci('interval_model','interval_weights','y',newdata:='interval_new',weights_col:='w')").fetchone()
+    assert prediction == pytest.approx(1e-304,rel=1e-10,abs=0)
+    assert low == 0. and high == float('inf')
+
+
+def test_logistic_intervals_combine_extrapolation_and_absolute_weight_scales(con):
+    con.execute("CREATE TABLE interval_logit_model AS SELECT '(Intercept)' feature,-700.::DOUBLE coefficient UNION ALL SELECT 'x',0.")
+    con.execute('CREATE TABLE interval_logit_rows AS SELECT CASE WHEN i%2=0 THEN -1. ELSE 1. END x,0. y,1e308::DOUBLE w FROM range(4)t(i)')
+    con.execute('CREATE TABLE interval_logit_new AS SELECT 1e200::DOUBLE x')
+    low,high = con.execute("SELECT conf_low,conf_high FROM logit_predict_ci('interval_logit_model','interval_logit_rows','y',newdata:='interval_logit_new',weights_col:='w')").fetchone()
+    assert (low,high) == (0.,1.)
