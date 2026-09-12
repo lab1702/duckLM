@@ -1226,11 +1226,15 @@ CREATE OR REPLACE MACRO __reg_tw_halfdev(y, eta, power) AS (
        ELSE list_transform([struct_pack(q := 2.0-power, r := 1.0-power,
                                          t := ln(y)-eta, s := (2.0-power)*ln(y))], lambda z:
          CASE WHEN abs(z.t)*greatest(abs(z.q),abs(z.r)) < 1e-3
-              THEN exp(z.s)*z.t*z.t*(0.5-z.t*(
+              THEN __reg_exp_scale(z.t*z.t*(0.5-z.t*(
                    (z.q+z.r)/6.0-z.t*((z.q*z.q+z.q*z.r+z.r*z.r)/24.0
-                   -z.t*(z.q+z.r)*(z.q*z.q+z.r*z.r)/120.0)))
-              ELSE __reg_exp_diff_quotient(z.s,z.q,-z.t)
-                   -__reg_exp_diff_quotient(z.s,z.r,-z.t) END)[1]
+                   -z.t*(z.q+z.r)*(z.q*z.q+z.r*z.r)/120.0))),z.s)
+              -- Factor out the largest exponent before subtracting the two
+              -- quotients; restore response units after their cancellation.
+              ELSE list_transform([greatest(0.0,-z.q*z.t,-z.r*z.t)], lambda shift:
+                     __reg_exp_scale(__reg_exp_diff_quotient(-shift,z.q,-z.t)
+                                     -__reg_exp_diff_quotient(-shift,z.r,-z.t),
+                                     z.s+shift))[1] END)[1]
   END
 );
 

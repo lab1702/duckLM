@@ -123,6 +123,21 @@ def test_tweedie_deviance_handles_extreme_and_nearly_exact_means(con, power, out
     assert metrics["deviance"] == pytest.approx(expected, rel=1e-10, abs=0)
 
 
+@pytest.mark.parametrize('power,y', [(4.,1e-155),(6.,2e-78)])
+@pytest.mark.parametrize('delta', [-.01,-.001,-1e-4,0.,1e-4,.001,.01])
+def test_tweedie_deviance_combines_large_response_scale_with_small_residual(con,power,y,delta):
+    eta = con.execute('SELECT ln(?)+?', [y,delta]).fetchone()[0]
+    con.execute("CREATE TABLE model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient",[eta])
+    con.execute('CREATE TABLE observations AS SELECT ?::DOUBLE y FROM range(3)',[y])
+    actual = _metrics(con,f"tweedie_evaluate('model','observations','y',power:={power})")['deviance']
+    if delta == 0:
+        assert actual == 0.0
+    else:
+        expected = 3*_decimal_tweedie_deviance(y,np.exp(eta),power)
+        assert np.isfinite(actual)
+        assert actual == pytest.approx(expected,rel=2e-8)
+
+
 @pytest.mark.parametrize("outcome", [0, 1])
 def test_logit_evaluation_on_single_class_holdout(con, outcome):
     con.execute(
