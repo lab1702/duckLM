@@ -1294,3 +1294,40 @@ def test_fitted_gamma_inference_with_underflowed_offset_mean(con):
     intervals = con.execute(f'SELECT conf_low,conf_high FROM gamma_predict_ci({args})').fetchall()
     radius = t.ppf(.975, 2)*np.sqrt(phi*np.einsum('ij,jk,ik->i', design, inv, design))
     np.testing.assert_allclose(intervals, np.column_stack([np.exp(eta-radius), np.exp(eta+radius)]), rtol=1e-10, atol=0)
+
+
+@pytest.mark.parametrize('family', ['logit', 'poisson', 'nbinom'])
+@pytest.mark.parametrize('weight,n', [(1e-320, 3), (1e-307, 1000)])
+def test_influence_applies_absolute_weights_before_residual_overflow(con, family, weight, n):
+    eta = -1420.
+    con.execute("CREATE TABLE absolute_model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient", [eta])
+    con.execute('CREATE TABLE absolute_rows AS SELECT 1.0 y,?::DOUBLE w FROM range(?)', [weight,n])
+    rows = con.execute(f"SELECT hat,pearson_resid,std_resid,cooks_distance FROM {family}_influence('absolute_model','absolute_rows','y',weights_col:='w')").fetchall()
+    root = np.exp(-eta/2+np.log(weight)/2)
+    h = 1/n
+    # Combine leverage in log space before the residual square overflows.
+    cook = np.exp(-eta+np.log(weight)+np.log(h)-2*np.log1p(-h))
+    expected = [h,root,root/np.sqrt(1-h),cook]
+    np.testing.assert_allclose(rows, np.tile(expected,(n,1)),rtol=1e-10)
+
+
+def test_gamma_covariance_restores_residual_scale_after_square_root(con):
+    con.execute("""CREATE TABLE root_variance_rows AS SELECT * FROM (VALUES
+        (-1.,1e-300,1.),(1.,1e-300,1.),(0.,1e300,1e-320))t(x,y,w)""")
+    con.execute("CREATE TABLE root_variance_model AS SELECT * FROM gamma_fit('root_variance_rows','y',weights_col:='w')")
+    beta = con.execute('SELECT coefficient FROM root_variance_model').fetchnumpy()['coefficient']
+    design = np.array([[1.,-1.],[1.,1.],[1.,0.]])
+    y = np.array([1e-300,1e-300,1e300]); weights = np.array([1.,1.,1e-320])
+    eta = design @ beta
+    # An independent high-precision reference avoids squaring in DOUBLE.
+    from decimal import Decimal, localcontext
+    with localcontext() as context:
+        context.prec = 100
+        phi = sum(Decimal.from_float(float(w))*(Decimal.from_float(float(yy))/Decimal.from_float(float(z)).exp()-1)**2
+                  for w,yy,z in zip(weights,y,eta))
+        expected_se = float((phi/2).sqrt())
+    args = "'root_variance_model','root_variance_rows','y',weights_col:='w'"
+    actual = con.execute(f'SELECT std_error FROM gamma_summary({args})').fetchnumpy()['std_error']
+    np.testing.assert_allclose(actual,[expected_se,expected_se],rtol=1e-10)
+    intervals = con.execute(f'SELECT conf_low,conf_high FROM gamma_predict_ci({args})').fetchall()
+    assert intervals == [(0.,float('inf'))]*3
