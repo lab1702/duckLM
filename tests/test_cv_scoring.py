@@ -163,6 +163,16 @@ def test_duplicate_dispersion_candidates_preserve_likelihood(con):
     np.testing.assert_allclose(np.asarray(repeated,dtype=float),np.asarray(unique,dtype=float),rtol=1e-12)
 
 
+def test_duplicate_dispersion_candidates_preserve_extreme_likelihood_ranking(con):
+    con.execute('CREATE TABLE extreme_counts(x,y) AS VALUES (1.,0.::DOUBLE),(1.,1e308::DOUBLE)')
+    unique = con.execute("SELECT * FROM nbinom_dispersion('extreme_counts','y',[1e-310,1e-308]) ORDER BY loglik DESC").fetchall()
+    repeated = con.execute("SELECT * FROM nbinom_dispersion('extreme_counts','y',[1e-310,1e-308,1e-308,1e-308,1e-308]) ORDER BY loglik DESC").fetchall()
+    assert len(repeated) == len(unique) == 2
+    assert unique[0][0] == repeated[0][0] == 1e-308
+    assert np.isfinite(np.asarray(repeated)).all()
+    np.testing.assert_allclose(np.asarray(repeated), np.asarray(unique), rtol=1e-12, atol=0)
+
+
 def test_single_point_refinement_keeps_best_candidate(con):
     coarse=con.execute("SELECT * FROM cv_l2('balanced','y','linear',[0.,1.]) ORDER BY cv_deviance,l2 LIMIT 1").fetchone()
     refined=con.execute("SELECT * FROM cv_l2_refine('balanced','y','linear',[0.,1.],n_refine:=1)").fetchall()

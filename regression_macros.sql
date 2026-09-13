@@ -2498,14 +2498,15 @@ __reg_nbd_gd AS (
 ),
 __reg_nbd_sol AS (SELECT B FROM __reg_nbd_gd ORDER BY it DESC LIMIT 1),
 -- Profile NB2 log-likelihood per grid alpha (r = 1/alpha), mu = mean(y)*exp(eta).
--- Average duplicate candidate copies so repeated grid entries do not alter scores.
+-- Score one copy of each candidate so duplicates cannot overflow the likelihood sum.
 __reg_nbd_ll AS (
   SELECT gg.g AS g, r.y AS y, alpha_grid[gg.g] AS alpha,
          ln(ys.sd_y) + list_dot_product(r.xs, s.B[gg.g]) AS eta
   FROM __reg_nbd_sol s, __reg_nbd_rows r, __reg_nbd_ys ys, range(1,len(alpha_grid)+1) gg(g)
+  WHERE gg.g = list_position(alpha_grid, alpha_grid[gg.g])
 )
 SELECT alpha,
-       sum(__reg_nb_ll(y,eta,alpha)) / count(DISTINCT g) AS loglik
+       sum(__reg_nb_ll(y,eta,alpha)) AS loglik
 FROM __reg_nbd_ll
 GROUP BY alpha
 ORDER BY alpha;
