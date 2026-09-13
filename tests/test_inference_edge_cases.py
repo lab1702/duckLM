@@ -1458,3 +1458,80 @@ def test_weighted_deviance_roots_apply_weights_before_exponentiation(con, family
     actual = con.execute(f"SELECT deviance_resid FROM {family}_influence('weighted_root_model','weighted_root_data','y',offset_col:='o',weights_col:='w'{extra}) WHERE o>0").fetchone()[0]
     expected = -np.exp((np.log(2.)+np.log(1e-300)+1500-np.log(2-power))/2)
     assert actual == pytest.approx(expected, rel=1e-12)
+
+
+@pytest.mark.parametrize('shift', [1e7, -1e9])
+@pytest.mark.parametrize('robust', ['none', 'hc0', 'hc1', 'hc2', 'hc3', 'cluster'])
+def test_translated_linear_uncertainty_matches_centered_reference(con, shift, robust):
+    x = np.arange(20, dtype=float)
+    y = 2 + 3*x + .1*(x % 2)
+    weights = 1 + (x % 3)
+    groups = np.arange(20) % 4
+    design = np.column_stack([np.ones(20), x-x.mean()])
+    beta = np.linalg.solve(design.T @ (weights[:, None]*design), design.T @ (weights*y))
+    residual = y-design@beta
+    bread = np.linalg.inv(design.T @ (weights[:, None]*design))
+    hats = weights*np.einsum('ij,jk,ik->i', design, bread, design)
+    if robust == 'none':
+        cov = bread*np.dot(weights, residual**2)/18
+    else:
+        scores = design*(weights*residual)[:, None]
+        factor = 1.
+        if robust in ('hc2', 'hc3'):
+            scores /= (1-hats)[:, None]**(.5 if robust == 'hc2' else 1.)
+        if robust == 'hc1':
+            factor = 20/18
+        if robust == 'cluster':
+            scores = np.array([scores[groups == g].sum(axis=0) for g in range(4)])
+            factor = 4/3*19/18
+        cov = factor*bread @ (scores.T@scores) @ bread
+    transform = np.array([[1., -(shift+x.mean())], [0., 1.]])
+    expected = np.sqrt(np.diag(transform@cov@transform.T))
+    load(con, 'translated', pd.DataFrame({'x': x+shift, 'y': y, 'w': weights}))
+    con.execute("CREATE TABLE translated_model AS SELECT * FROM linreg_fit('translated','y',weights_col:='w')")
+    con.execute('ALTER TABLE translated ADD COLUMN cl INTEGER')
+    con.execute('UPDATE translated SET cl=(x-?)::INTEGER%4', [shift])
+    option = "cluster_col:='cl'" if robust == 'cluster' else f"robust:='{robust}'"
+    actual = con.execute(f"SELECT std_error FROM linreg_summary('translated_model','translated','y',weights_col:='w',{option})").fetchnumpy()['std_error']
+    np.testing.assert_allclose(actual, expected, rtol=2e-5)
+
+
+@pytest.mark.parametrize('family', ['linreg', 'logit', 'poisson', 'gamma', 'tweedie', 'nbinom'])
+def test_translated_inference_preserves_intervals_and_diagnostics(con, family):
+    # Exact binary fractions keep the supplied equivalent model predictors equal.
+    con.execute('CREATE TABLE base AS SELECT i::DOUBLE x,1.0+(i%3) w, '
+                + ('(i%2)::DOUBLE' if family == 'logit' else '2.0+(i%5)')
+                + ' y FROM range(20)t(i)')
+    con.execute('CREATE TABLE translated AS SELECT * REPLACE(x+1e9 AS x) FROM base')
+    con.execute("CREATE TABLE base_model AS SELECT * FROM (VALUES ('(Intercept)',.25),('x',.125))t(feature,coefficient)")
+    con.execute("CREATE TABLE translated_model AS SELECT feature,CASE WHEN feature='(Intercept)' THEN coefficient-1e9*.125 ELSE coefficient END coefficient FROM base_model")
+    for robust in ['none', 'hc3']:
+        errors = [con.execute(f"SELECT std_error FROM {family}_summary('{table}_model','{table}','y',weights_col:='w',robust:='{robust}') WHERE feature='x'").fetchone()[0] for table in ['base', 'translated']]
+        assert errors[1] == pytest.approx(errors[0], rel=1e-9)
+    for macro, cols in [('predict_ci', 'prediction,conf_low,conf_high'),
+                        ('influence', 'hat,pearson_resid,deviance_resid,std_resid,cooks_distance')]:
+        outputs = [con.execute(f"SELECT {cols} FROM {family}_{macro}('{table}_model','{table}','y',weights_col:='w') ORDER BY x").fetchall() for table in ['base', 'translated']]
+        np.testing.assert_allclose(np.array(outputs[1], dtype=float), np.array(outputs[0], dtype=float), rtol=1e-8, atol=1e-10)
+
+
+def test_translated_multinomial_summary_matches_centered_information(con):
+    x = np.arange(20, dtype=float)
+    design = np.column_stack([np.ones(20), x-x.mean()])
+    coefficients = np.array([[.25, .125], [-.5, -.0625]])
+    raw_design = np.column_stack([np.ones(20), x])
+    eta = np.column_stack([raw_design@coefficients.T, np.zeros(20)])
+    probabilities = np.exp(eta)/np.exp(eta).sum(axis=1, keepdims=True)
+    info = np.block([[design.T @ ((probabilities[:, a]*((a == b)-probabilities[:, b]))[:, None]*design)
+                      for b in range(2)] for a in range(2)])
+    cov = np.linalg.inv(info)
+    shift = 1e9
+    transform = np.kron(np.eye(2), [[1., -(shift+x.mean())], [0., 1.]])
+    expected = np.sqrt(np.diag(transform@cov@transform.T))
+    con.execute('CREATE TABLE translated AS SELECT i::DOUBLE+1e9 x,(i%3)::VARCHAR y FROM range(20)t(i)')
+    con.execute("CREATE TABLE translated_model(class VARCHAR, feature VARCHAR, coefficient DOUBLE)")
+    con.executemany('INSERT INTO translated_model VALUES (?,?,?)',
+                    [(str((k+1)%3), feature, value) for k in range(3)
+                     for feature, value in [('(Intercept)', coefficients[k, 0]-shift*coefficients[k, 1] if k < 2 else 0.),
+                                            ('x', coefficients[k, 1] if k < 2 else 0.)]])
+    actual = con.execute("SELECT std_error FROM multinom_summary('translated_model','translated','y') ORDER BY class,feature").fetchnumpy()['std_error']
+    np.testing.assert_allclose(actual, expected, rtol=1e-9)

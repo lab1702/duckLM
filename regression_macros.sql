@@ -3017,6 +3017,35 @@ CREATE OR REPLACE MACRO __reg_logit_score_coord(v, sw, y, eta, logunit, log_root
 );
 
 -- ---- Shared coefficient-inference core -------------------------------------
+-- Center columns dominated by a common offset before accumulating information.
+-- Leave wide or opposite-sign ranges alone, preserving their existing extreme-unit
+-- safeguards. The midpoint is safe because the finite endpoints have the same sign.
+CREATE OR REPLACE MACRO __reg_inference_center(lo, hi) AS (
+  CASE WHEN isfinite(lo) AND isfinite(hi) AND sign(lo)=sign(hi)
+                 AND abs(hi-lo) < greatest(abs(lo),abs(hi))*0.01
+       THEN lo/2.0+hi/2.0 ELSE 0.0 END
+);
+-- New scoring rows can be far outside the training range. Apply their units
+-- before subtracting when finite opposite-sign coordinates overflow a difference.
+CREATE OR REPLACE MACRO __reg_inference_coordinate(value, center, logscale) AS (
+  CASE WHEN isfinite(value-center) THEN __reg_exp_scale(value-center,logscale)
+       ELSE __reg_exp_scale(value,logscale)-__reg_exp_scale(center,logscale) END
+);
+-- Contrast for an original coefficient in the centered, scaled basis. Only
+-- intercepts change; multinomial coefficients use one such block per class.
+CREATE OR REPLACE MACRO __reg_inference_contrast(units, scales, centers, idx, width) AS (
+  list_transform(units, lambda ic_unit,ic_col:
+    CASE WHEN ic_col=idx THEN 1.0
+         WHEN (idx-1)%width=0 AND (ic_col-1)//width=(idx-1)//width
+         THEN -__reg_exp_scale(centers[(ic_col-1)%width+1],
+                               units[idx]-ic_unit+ln(scales[idx])-ln(scales[ic_col]))
+         ELSE 0.0 END)
+);
+CREATE OR REPLACE MACRO __reg_quadratic(matrix, contrast) AS (
+  list_sum(list_transform(contrast, lambda iq_value,iq_col:
+    iq_value*list_dot_product(matrix[iq_col],contrast)))
+);
+
 CREATE OR REPLACE MACRO __reg_summary(model, tbl, outcome, family, caller,
                                       conf_level, offset_col, weights_col, power, alpha,
                                       robust, cluster_col) AS TABLE
@@ -3121,9 +3150,22 @@ __reg_rows0 AS (
 -- Compute the predictor once after zero-weight rows have been made harmless.
 -- Reusing this column avoids expanding the numerically guarded dot product in
 -- response/residual units, every information coordinate, and the weighted rows.
-__reg_scored AS MATERIALIZED (
+__reg_scored_raw AS MATERIALIZED (
   SELECT __reg_rid__, xs, y, wt, sw,
          __reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0
+),
+__reg_centers AS (
+  SELECT list(center ORDER BY i) AS centers FROM (
+    SELECT ix.i, CASE WHEN ix.i=1 THEN 0.0 ELSE
+           __reg_inference_center(min(r.xs[ix.i]) FILTER (WHERE r.sw>0),
+                                  max(r.xs[ix.i]) FILTER (WHERE r.sw>0)) END AS center
+    FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
+    LEFT JOIN __reg_scored_raw r ON true GROUP BY ix.i)
+),
+__reg_scored AS MATERIALIZED (
+  SELECT r.* REPLACE (list_transform(xs,lambda v,j:
+           CASE WHEN sw=0 THEN 0.0 ELSE v-c.centers[j] END) AS xs)
+  FROM __reg_scored_raw r CROSS JOIN __reg_centers c
 ),
 -- A common Tweedie response unit cancels from coefficient uncertainty and
 -- standardized diagnostics. Remove extreme units before information powers
@@ -3255,7 +3297,7 @@ __reg_rounits AS (
                    +0.5*__reg_log_observed(r.y,r.eta,family,power,alpha))
                    FILTER (WHERE r.sw>0 AND raw.xs[ix.i]!=0),'-Infinity'::DOUBLE),0.0) AS logunit
         FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
-        LEFT JOIN (__reg_rww r JOIN __reg_rows0 raw USING (__reg_rid__)) ON true GROUP BY ix.i)
+        LEFT JOIN (__reg_rww r JOIN __reg_scored raw USING (__reg_rid__)) ON true GROUP BY ix.i)
 ),
 __reg_robraw AS (
   SELECT r.__reg_rid__, list_transform(raw.xs,lambda v,j:
@@ -3272,7 +3314,7 @@ __reg_robraw AS (
                   __reg_tw_pearson(r.y,r.eta,CASE WHEN family='gamma' THEN 2.0 ELSE power END,
                     log_scale:=ln(abs(v))+2.0*ln(r.sw)+0.5*__reg_log_info(r.eta,family,power,alpha)-u.units[j])
                 ELSE __reg_exp_scale(r.pres,ln(abs(v))+ln(r.sw)-u.units[j]) END END) END AS sg
-  FROM __reg_rww r JOIN __reg_rows0 raw USING (__reg_rid__)
+  FROM __reg_rww r JOIN __reg_scored raw USING (__reg_rid__)
   LEFT JOIN __reg_clv cl ON cl.__reg_rid__ = r.__reg_rid__ CROSS JOIN __reg_rounits u
   -- Model-based errors do not use the sandwich covariance inputs.
   WHERE robust != 'none' OR cluster_col IS NOT NULL
@@ -3333,10 +3375,13 @@ __reg_robvar AS (
       (CASE WHEN cluster_col IS NOT NULL
             THEN (rd.G::DOUBLE/(rd.G-1)) * ((dm.n-1.0)/(dm.n-dm.d))
             WHEN robust = 'hc1' THEN dm.n::DOUBLE/(dm.n-dm.d) ELSE 1.0 END)
-      * list_sum(list_transform(bi.Ainv[j], lambda va, a: va * list_dot_product(bm.B[a], bi.Ainv[j])))) AS rv
+      * __reg_quadratic(bm.B, list_transform(bi.Ainv, lambda row,a:
+          list_dot_product(row,__reg_inference_contrast(ou.units,
+            list_transform(ou.units,lambda v: 1.0),ct.centers,j,dm.d))))) AS rv
   FROM __reg_breadinv bi
        CROSS JOIN (SELECT CASE WHEN cluster_col IS NOT NULL THEN (SELECT B FROM __reg_meat_cl) ELSE (SELECT B FROM __reg_meat_hc) END AS B) bm
        CROSS JOIN __reg_dims dm CROSS JOIN __reg_rdims rd
+       CROSS JOIN __reg_rounits ou CROSS JOIN __reg_centers ct
 ),
 __reg_robchk AS (
   SELECT CASE WHEN robust NOT IN ('none','hc0','hc1','hc2','hc3')
@@ -3368,10 +3413,13 @@ __reg_percoef AS (
                 CASE WHEN Rinv IS NOT NULL AND df > 0.0 AND isfinite(rv[gs.i]) AND rv[gs.i] >= 0.0 THEN sqrt(rv[gs.i]) ELSE NULL END
               ELSE
                 CASE WHEN Rinv IS NOT NULL AND (NOT est OR df > 0.0)
-                          AND isfinite(phi * Rinv[gs.i][gs.i]) AND phi * Rinv[gs.i][gs.i] >= 0.0
-                     THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] / (CASE WHEN est THEN 1.0 ELSE sqrt(wscale) END) ELSE NULL END
+                          AND isfinite(phi * original_variance) AND phi * original_variance >= 0.0
+                     THEN sqrt(phi * original_variance) / dsc[gs.i] / (CASE WHEN est THEN 1.0 ELSE sqrt(wscale) END) ELSE NULL END
          END AS scaled_std_error
-  FROM __reg_final, unnest(range(1, len(bvec)+1)) AS gs(i)
+  FROM __reg_final CROSS JOIN __reg_centers ct,
+       unnest(range(1, len(bvec)+1)) AS gs(i),
+       LATERAL (SELECT __reg_quadratic(Rinv,
+           __reg_inference_contrast(units,dsc,ct.centers,gs.i,len(bvec))) AS original_variance)
 ),
 -- Bind the standard error before passing it through the tail/interval macros.
 -- Reusing a SELECT-list alias there expands its expression during binding.
@@ -3512,9 +3560,22 @@ __reg_rows0 AS (
 -- Compute training predictors once after making zero-weight rows harmless.
 -- Reuse the guarded dot product across response/residual units, information
 -- coordinates, and weighted rows; keep only columns needed by those consumers.
-__reg_training_scored AS MATERIALIZED (
+__reg_training_scored_raw AS MATERIALIZED (
   SELECT __reg_rid__, xs, y, wt, sw,
          __reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0
+),
+__reg_centers AS (
+  SELECT list(center ORDER BY i) AS centers FROM (
+    SELECT ix.i, CASE WHEN ix.i=1 THEN 0.0 ELSE
+           __reg_inference_center(min(r.xs[ix.i]) FILTER (WHERE r.sw>0),
+                                  max(r.xs[ix.i]) FILTER (WHERE r.sw>0)) END AS center
+    FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
+    LEFT JOIN __reg_training_scored_raw r ON true GROUP BY ix.i)
+),
+__reg_training_scored AS MATERIALIZED (
+  SELECT r.* REPLACE (list_transform(xs,lambda v,j:
+           CASE WHEN sw=0 THEN 0.0 ELSE v-c.centers[j] END) AS xs)
+  FROM __reg_training_scored_raw r CROSS JOIN __reg_centers c
 ),
 -- A common Tweedie response unit cancels from coefficient uncertainty and
 -- standardized diagnostics. Remove extreme units before information powers
@@ -3630,8 +3691,8 @@ __reg_scoords AS (
   -- Combine response and feature units before forming large extrapolation
   -- coordinates, including absolute information weights; the interval standard
   -- error then already has response units without a compensating late division.
-  SELECT sf.*, list_transform(sf.xs, lambda v,a: __reg_exp_scale(v,ln(ru.runit)+ln(pu.unit)-ln(cp.se_weight_scale)-cp.units[a]-ln(cp.dsc[a]))) AS zs
-  FROM __reg_sfeat sf CROSS JOIN __reg_cparams cp CROSS JOIN __reg_resunits ru CROSS JOIN __reg_punits pu
+  SELECT sf.*, list_transform(sf.xs, lambda v,a: __reg_inference_coordinate(v,ct.centers[a],ln(ru.runit)+ln(pu.unit)-ln(cp.se_weight_scale)-cp.units[a]-ln(cp.dsc[a]))) AS zs
+  FROM __reg_sfeat sf CROSS JOIN __reg_cparams cp CROSS JOIN __reg_resunits ru CROSS JOIN __reg_punits pu CROSS JOIN __reg_centers ct
 ),
 __reg_sdesign AS (
   SELECT *, coalesce(nullif(list_max(list_transform(zs,lambda v: abs(v))),0.0),1.0) AS zunit
@@ -3781,9 +3842,22 @@ __reg_rows0 AS (
 -- Compute training predictors once after making zero-weight rows harmless.
 -- Reuse the guarded dot product across response/residual units, information
 -- coordinates, and weighted rows; keep only columns needed by those consumers.
-__reg_training_scored AS MATERIALIZED (
+__reg_training_scored_raw AS MATERIALIZED (
   SELECT __reg_rid__, xs, y, wt, sw,
          __reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0
+),
+__reg_centers AS (
+  SELECT list(center ORDER BY i) AS centers FROM (
+    SELECT ix.i, CASE WHEN ix.i=1 THEN 0.0 ELSE
+           __reg_inference_center(min(r.xs[ix.i]) FILTER (WHERE r.sw>0),
+                                  max(r.xs[ix.i]) FILTER (WHERE r.sw>0)) END AS center
+    FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
+    LEFT JOIN __reg_training_scored_raw r ON true GROUP BY ix.i)
+),
+__reg_training_scored AS MATERIALIZED (
+  SELECT r.* REPLACE (list_transform(xs,lambda v,j:
+           CASE WHEN sw=0 THEN 0.0 ELSE v-c.centers[j] END) AS xs)
+  FROM __reg_training_scored_raw r CROSS JOIN __reg_centers c
 ),
 -- A common Tweedie response unit cancels from coefficient uncertainty and
 -- standardized diagnostics. Remove extreme units before information powers
@@ -4006,7 +4080,7 @@ __reg_feat AS (
 ),
 -- Keep both class and complementary probabilities in logs. Information can
 -- be representable after multiplication by features even when p underflows.
-__reg_probsraw AS (
+__reg_probsuncentered AS (
   SELECT __reg_rid__, xs,
          list_transform(eta,lambda v: v-denom) AS lp,
          list_transform(eta,lambda v,j:
@@ -4023,6 +4097,17 @@ __reg_probsraw AS (
       )
     )
   )
+),
+__reg_centers AS (
+  SELECT list(center ORDER BY i) AS centers FROM (
+    SELECT ix.i, CASE WHEN ix.i=1 THEN 0.0 ELSE
+           __reg_inference_center(min(r.xs[ix.i]),max(r.xs[ix.i])) END AS center
+    FROM range(1,(SELECT k FROM __reg_kfeat)+2) ix(i)
+    LEFT JOIN __reg_probsuncentered r ON true GROUP BY ix.i)
+),
+__reg_probsraw AS MATERIALIZED (
+  SELECT r.* REPLACE (list_transform(xs,lambda v,j: v-c.centers[j]) AS xs)
+  FROM __reg_probsuncentered r CROSS JOIN __reg_centers c
 ),
 __reg_dims AS (
   SELECT (SELECT len(B) FROM __reg_bmat) AS km1,
@@ -4104,9 +4189,12 @@ __reg_final AS (
 __reg_percoef AS (
   SELECT gs.a AS a, cls[(gs.a-1)//d + 1] AS class, fn[(gs.a-1)%d + 1] AS feature,
          B[(gs.a-1)//d + 1][(gs.a-1)%d + 1] AS coefficient, crit,
-         CASE WHEN Rinv IS NOT NULL AND isfinite(Rinv[gs.a][gs.a]) AND Rinv[gs.a][gs.a] > 0.0
-              THEN __reg_exp_scale(sqrt(Rinv[gs.a][gs.a])/dsc[gs.a],-units[gs.a]) ELSE NULL END AS std_error
-  FROM __reg_final, unnest(range(1, len(B)*d + 1)) AS gs(a)
+         CASE WHEN Rinv IS NOT NULL AND isfinite(original_variance) AND original_variance > 0.0
+              THEN __reg_exp_scale(sqrt(original_variance)/dsc[gs.a],-units[gs.a]) ELSE NULL END AS std_error
+  FROM __reg_final CROSS JOIN __reg_centers ct,
+       unnest(range(1, len(B)*d + 1)) AS gs(a),
+       LATERAL (SELECT __reg_quadratic(Rinv,
+           __reg_inference_contrast(units,dsc,ct.centers,gs.a,d)) AS original_variance)
 )
 SELECT class, feature, coefficient, std_error,
        coefficient / std_error AS statistic,
