@@ -360,3 +360,17 @@ def test_tweedie_power_one_uses_stable_poisson_offset_fit(con, solver):
     coefficients = dict(con.execute(call).fetchall())
     assert coefficients['(Intercept)'] == pytest.approx(0, abs=1e-7)
     assert coefficients['x'] == pytest.approx(-1000, abs=1e-7)
+
+
+@pytest.mark.parametrize('solver', ['auto', 'irls'])
+@pytest.mark.parametrize('minority_weight', [1e-18, 1e-100])
+@pytest.mark.parametrize('majority_label', [0, 1])
+def test_logistic_fit_keeps_information_after_sigmoid_rounding(con, solver, minority_weight, majority_label):
+    con.execute('CREATE OR REPLACE TABLE imbalanced_fit(x DOUBLE,y DOUBLE,w DOUBLE)')
+    con.executemany('INSERT INTO imbalanced_fit VALUES (?,?,?)',
+                    [(x,majority_label,1.) for x in [0,1]]+
+                    [(x,1-majority_label,minority_weight) for x in [0,1]])
+    coefficients = dict(con.execute(f"SELECT * FROM logit_fit('imbalanced_fit','y',weights_col:='w',solver:='{solver}',max_iter:=1000)").fetchall())
+    expected = (2*majority_label-1)*-np.log(minority_weight)
+    assert coefficients['(Intercept)'] == pytest.approx(expected, abs=1e-8)
+    assert coefficients['x'] == pytest.approx(0, abs=1e-8)

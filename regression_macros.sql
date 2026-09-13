@@ -763,7 +763,7 @@ __reg_irls(it, betas, move, proposed_move) AS (
                                               THEN list_transform(e.xs,lambda v: __reg_exp_scale(v,__reg_fit_loginfo(e.eta,family,log_alpha_int,l1=0 AND l2=0)/2.0))
                                               ELSE e.xs END,
                                    wirls := (CASE family
-                                              WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
+                                              WHEN 'logistic' THEN __reg_logit_var(e.eta)
                                               WHEN 'linear'   THEN 1.0
                                               WHEN 'poisson'  THEN 1.0
                                               WHEN 'gamma'    THEN 1.0
@@ -773,7 +773,7 @@ __reg_irls(it, betas, move, proposed_move) AS (
                                               THEN __reg_exp_scale(e.linpred,__reg_fit_loginfo(e.eta,family,log_alpha_int,l1=0 AND l2=0)/2.0)
                                                  + __reg_exp_scale(__reg_weighted_fit_score(e.wy,e.w,e.eta,family,power,log_alpha_int,l1=0 AND l2=0),-__reg_fit_loginfo(e.eta,family,log_alpha_int,l1=0 AND l2=0)/2.0)
                                               ELSE (CASE family
-                                              WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
+                                              WHEN 'logistic' THEN __reg_logit_var(e.eta)
                                               WHEN 'linear'   THEN 1.0
                                               WHEN 'poisson'  THEN e.mu
                                               WHEN 'gamma'    THEN 1.0
@@ -1303,7 +1303,7 @@ CREATE OR REPLACE MACRO __reg_weighted_fit_score(wy, sw, eta, family, power, log
   list_transform([exp(greatest(least(eta,700.0),-700.0))], lambda mu:
     CASE family
       WHEN 'linear' THEN wy-sw*eta
-      WHEN 'logistic' THEN wy-sw*__reg_sigmoid(eta)
+      WHEN 'logistic' THEN sw*__reg_logit_resid(wy/sw,eta)
       WHEN 'poisson' THEN __reg_weighted_tw_score(wy,sw,eta,1.0)
       WHEN 'gamma' THEN __reg_exp_scale(wy,-eta)-sw
       WHEN 'tweedie' THEN __reg_weighted_tw_score(wy,sw,eta,power)
