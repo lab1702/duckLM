@@ -673,7 +673,7 @@ __reg_cfg AS (
     FROM __reg_feats f, __reg_packed p, __reg_ycheck y, __reg_namecheck nc
     WHERE y.ok AND nc.ok
 ),
--- Extreme Poisson offsets can overflow even a root-weighted initial mean.
+-- Extreme Poisson/NB offsets can overflow even a root-weighted initial mean.
 -- Compute an intercept-only starting point using log-sum-exp in that case.
 __reg_poisson_seed AS (
     SELECT max(log_root_mean) AS max_log_root_mean,
@@ -682,7 +682,7 @@ __reg_poisson_seed AS (
       SELECT r.sw AS sw,r.wy AS wy,ln(r.sw)+r.o AS log_root_mean,
              2.0*ln(r.sw)+r.o AS log_mean,
              max(2.0*ln(r.sw)+r.o) OVER () AS log_mean_max
-      FROM __reg_packed,unnest(rows) t(r) WHERE family='poisson'
+      FROM __reg_packed,unnest(rows) t(r) WHERE family IN ('poisson','nbinom')
     )
 ),
 -- Gamma's (also Tweedie power=2) initial weighted y/mean can overflow before damping is
@@ -690,7 +690,7 @@ __reg_poisson_seed AS (
 -- all response/mean ratios at most one. Ordinary starts remain unchanged.
 __reg_seed AS (
     SELECT list_transform(range(f.d+1),lambda i:
-      CASE WHEN family='poisson' AND i=0 AND ps.max_log_root_mean>700.0
+      CASE WHEN family IN ('poisson','nbinom') AND i=0 AND ps.max_log_root_mean>700.0
            THEN ps.intercept
            WHEN (family='gamma' OR (family='tweedie' AND power=2.0)) AND i=0 AND max_logscore>700.0
            THEN gs.intercept ELSE 0.0::DOUBLE END) AS betas
@@ -755,12 +755,12 @@ __reg_irls(it, betas, move, proposed_move) AS (
                     FROM (
                         -- Features already carry sqrt(w): keep the information factor
                         -- unweighted, and multiply the working RHS by sqrt(w).
-                        -- Poisson absorbs sqrt(mu) into both coordinates and RHS
+                        -- Poisson/NB absorb root information into coordinates and RHS
                         -- before multiplication, retaining finite weighted information.
                         SELECT it, betas, sumw,
                                list_transform(mus, lambda e: struct_pack(
-                                   xs := CASE WHEN family='poisson'
-                                              THEN list_transform(e.xs,lambda v: __reg_exp_scale(v,e.eta/2.0))
+                                   xs := CASE WHEN family IN ('poisson','nbinom')
+                                              THEN list_transform(e.xs,lambda v: __reg_exp_scale(v,__reg_fit_loginfo(e.eta,family,log_alpha_int,l1=0 AND l2=0)/2.0))
                                               ELSE e.xs END,
                                    wirls := (CASE family
                                               WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
@@ -768,10 +768,10 @@ __reg_irls(it, betas, move, proposed_move) AS (
                                               WHEN 'poisson'  THEN 1.0
                                               WHEN 'gamma'    THEN 1.0
                                               WHEN 'tweedie'  THEN exp((2.0-power)*e.eta)
-                                              WHEN 'nbinom'   THEN __reg_nb_fit_info(ln(e.mu),log_alpha_int,l1=0 AND l2=0) END),
-                                   wr := CASE WHEN family='poisson'
-                                              THEN __reg_exp_scale(e.linpred,e.eta/2.0)
-                                                 + __reg_exp_scale(__reg_weighted_tw_score(e.wy,e.w,e.eta,1.0),-e.eta/2.0)
+                                              WHEN 'nbinom'   THEN 1.0 END),
+                                   wr := CASE WHEN family IN ('poisson','nbinom')
+                                              THEN __reg_exp_scale(e.linpred,__reg_fit_loginfo(e.eta,family,log_alpha_int,l1=0 AND l2=0)/2.0)
+                                                 + __reg_exp_scale(__reg_weighted_fit_score(e.wy,e.w,e.eta,family,power,log_alpha_int,l1=0 AND l2=0),-__reg_fit_loginfo(e.eta,family,log_alpha_int,l1=0 AND l2=0)/2.0)
                                               ELSE (CASE family
                                               WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
                                               WHEN 'linear'   THEN 1.0
@@ -1269,6 +1269,10 @@ CREATE OR REPLACE MACRO __reg_nb_fit_shift(logalpha, unpenalized) AS (
 CREATE OR REPLACE MACRO __reg_nb_fit_info(eta, logalpha, unpenalized) AS (
   exp(__reg_nb_fit_shift(logalpha,unpenalized)+eta-__reg_softplus(logalpha+eta))
 );
+CREATE OR REPLACE MACRO __reg_fit_loginfo(eta, family, logalpha, unpenalized) AS (
+  CASE WHEN family='poisson' THEN eta
+       ELSE __reg_nb_fit_shift(logalpha,unpenalized)-logalpha-__reg_softplus(-logalpha-eta) END
+);
 CREATE OR REPLACE MACRO __reg_nb_fit_score(y, eta, logalpha, unpenalized) AS (
   CASE WHEN eta >= 0 THEN (y/exp(eta)-1.0)*__reg_nb_fit_info(eta,logalpha,unpenalized)
        ELSE (y-exp(eta))*exp(__reg_nb_fit_shift(logalpha,unpenalized)-__reg_softplus(logalpha+eta)) END
@@ -1303,9 +1307,12 @@ CREATE OR REPLACE MACRO __reg_weighted_fit_score(wy, sw, eta, family, power, log
       WHEN 'poisson' THEN __reg_weighted_tw_score(wy,sw,eta,1.0)
       WHEN 'gamma' THEN __reg_exp_scale(wy,-eta)-sw
       WHEN 'tweedie' THEN __reg_weighted_tw_score(wy,sw,eta,power)
-      WHEN 'nbinom' THEN CASE WHEN eta >= 0
-         THEN (wy/exp(least(eta,700.0))-sw)*__reg_nb_fit_info(least(eta,700.0),logalpha,unpenalized)
-         ELSE (wy-sw*exp(eta))*exp(__reg_nb_fit_shift(logalpha,unpenalized)-__reg_softplus(logalpha+eta)) END
+      WHEN 'nbinom' THEN list_transform([__reg_exp_scale(sw,eta)],lambda weighted_mu:
+        CASE WHEN weighted_mu>0 AND isfinite(weighted_mu)
+               THEN __reg_exp_scale(wy-weighted_mu,__reg_nb_fit_shift(logalpha,unpenalized)-__reg_softplus(logalpha+eta))
+             WHEN eta>=0 THEN __reg_exp_scale(__reg_exp_scale(wy,-eta)-sw,__reg_fit_loginfo(eta,family,logalpha,unpenalized))
+             ELSE __reg_exp_scale(wy,__reg_nb_fit_shift(logalpha,unpenalized)-__reg_softplus(logalpha+eta))
+                  -__reg_exp_scale(sw,__reg_fit_loginfo(eta,family,logalpha,unpenalized)) END)[1]
     END)[1]
 );
 CREATE OR REPLACE MACRO __reg_weighted_fit_observed(wy, sw, eta, family, power, logalpha, unpenalized) AS (
@@ -1314,9 +1321,9 @@ CREATE OR REPLACE MACRO __reg_weighted_fit_observed(wy, sw, eta, family, power, 
       WHEN 'poisson' THEN __reg_exp_scale(sw,eta)
       WHEN 'gamma' THEN __reg_exp_scale(wy,-eta)
       WHEN 'tweedie' THEN __reg_weighted_tw_observed(wy,sw,eta,power)
-      WHEN 'nbinom' THEN exp(__reg_nb_fit_shift(logalpha,unpenalized)+least(eta,700.0)+ln(sw)
+      WHEN 'nbinom' THEN exp(__reg_nb_fit_shift(logalpha,unpenalized)+eta+ln(sw)
                              +CASE WHEN wy=0 THEN 0.0 ELSE __reg_softplus(logalpha+ln(wy)-ln(sw)) END
-                             -2.0*__reg_softplus(logalpha+least(eta,700.0)))
+                             -2.0*__reg_softplus(logalpha+eta))
       ELSE 0.0
     END)[1]
 );
