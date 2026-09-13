@@ -1444,3 +1444,17 @@ def test_nbinom_weighted_deviance_root_survives_unweighted_overflow(con, weight)
         halfdev = y*(y/mu).ln()-(y+1)*((1+y)/(1+mu)).ln()
         expected = float((2*Decimal(weight)*halfdev).sqrt())
     assert residual == pytest.approx(expected, rel=1e-10)
+
+
+@pytest.mark.parametrize('family,power', [('poisson', 1.), ('tweedie', 1.), ('tweedie', 1.5)])
+@pytest.mark.parametrize('base_weight', [1., 1e-300])
+@pytest.mark.parametrize('outcome', [0., 1.])
+def test_weighted_deviance_roots_apply_weights_before_exponentiation(con, family, power, base_weight, outcome):
+    offset = 1500/(2-power)
+    con.execute("CREATE TABLE weighted_root_model AS SELECT '(Intercept)' feature,0.::DOUBLE coefficient")
+    con.execute('CREATE TABLE weighted_root_data(y DOUBLE,o DOUBLE,w DOUBLE)')
+    con.executemany('INSERT INTO weighted_root_data VALUES (?,?,?)', [(outcome,0,base_weight)]*2+[(outcome,offset,1e-300)])
+    extra = f',power:={power}' if family=='tweedie' else ''
+    actual = con.execute(f"SELECT deviance_resid FROM {family}_influence('weighted_root_model','weighted_root_data','y',offset_col:='o',weights_col:='w'{extra}) WHERE o>0").fetchone()[0]
+    expected = -np.exp((np.log(2.)+np.log(1e-300)+1500-np.log(2-power))/2)
+    assert actual == pytest.approx(expected, rel=1e-12)

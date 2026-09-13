@@ -1343,8 +1343,11 @@ CREATE OR REPLACE MACRO __reg_exp_diff_quotient(s, a, x) AS (
 -- A local series also avoids cancellation when the observation equals its mean.
 -- root_result computes the square root before restoring units, preserving
 -- diagnostic residuals even when the deviance itself is outside DOUBLE range.
-CREATE OR REPLACE MACRO __reg_tw_halfdev(y, eta, power, root_result := false) AS (
-  CASE WHEN y = 0 THEN CASE WHEN root_result THEN exp(((2.0-power)*eta-ln(2.0-power))/2.0)
+-- Combine root_weight before exponentiation so small weights can keep the
+-- residual finite even when the unweighted root itself would overflow.
+CREATE OR REPLACE MACRO __reg_tw_halfdev(y, eta, power, root_result := false, root_weight := 1.0) AS (
+  CASE WHEN root_result AND root_weight=0 THEN 0.0
+       WHEN y = 0 THEN CASE WHEN root_result THEN __reg_exp_scale(root_weight,((2.0-power)*eta-ln(2.0-power))/2.0)
                            ELSE exp((2.0-power)*eta)/(2.0-power) END
        ELSE list_transform([struct_pack(q := 2.0-power, r := 1.0-power,
                                          t := ln(y)-eta, s := (2.0-power)*ln(y))], lambda z:
@@ -1355,14 +1358,14 @@ CREATE OR REPLACE MACRO __reg_tw_halfdev(y, eta, power, root_result := false) AS
                    list_transform([0.5-(local.qt+local.rt)/6.0
                      +(local.qt*local.qt+local.qt*local.rt+local.rt*local.rt)/24.0
                      -(local.qt+local.rt)*(local.qt*local.qt+local.rt*local.rt)/120.0], lambda series:
-                     CASE WHEN root_result THEN __reg_exp_scale(abs(z.t)*sqrt(series),z.s/2.0)
+                     CASE WHEN root_result THEN __reg_exp_scale(abs(z.t)*sqrt(series),z.s/2.0+ln(root_weight))
                           ELSE __reg_exp_scale(z.t*z.t*series,z.s) END)[1])[1]
               -- Factor out the largest exponent before subtracting the two
               -- quotients; restore response units after their cancellation.
               ELSE list_transform([greatest(0.0,-z.q*z.t,-z.r*z.t)], lambda shift:
                      list_transform([__reg_exp_diff_quotient(-shift,z.q,-z.t)
                                      -__reg_exp_diff_quotient(-shift,z.r,-z.t)], lambda dev:
-                       CASE WHEN root_result THEN __reg_exp_scale(sqrt(greatest(dev,0.0)),(z.s+shift)/2.0)
+                       CASE WHEN root_result THEN __reg_exp_scale(sqrt(greatest(dev,0.0)),(z.s+shift)/2.0+ln(root_weight))
                             ELSE __reg_exp_scale(dev,z.s+shift) END)[1])[1] END)[1]
   END
 );
@@ -3803,8 +3806,9 @@ __reg_diag AS (
          CASE WHEN family = 'logistic' THEN p.sw*__reg_logit_devres(p.y,p.eta)
               WHEN family = 'linear' THEN p.resid
               WHEN family IN ('poisson','gamma','tweedie')
-                THEN (CASE WHEN p.y=0 THEN -1.0 ELSE sign(ln(p.y)-p.eta) END)*p.sw*sqrt(2.0)
-                     *__reg_tw_halfdev(p.y,p.eta,CASE family WHEN 'poisson' THEN 1.0 WHEN 'gamma' THEN 2.0 ELSE power END,root_result:=true)
+                THEN (CASE WHEN p.y=0 THEN -1.0 ELSE sign(ln(p.y)-p.eta) END)
+                     *__reg_tw_halfdev(p.y,p.eta,CASE family WHEN 'poisson' THEN 1.0 WHEN 'gamma' THEN 2.0 ELSE power END,
+                                      root_result:=true,root_weight:=p.sw*sqrt(ws.wscale)*sqrt(2.0))
               WHEN family = 'nbinom' AND p.y=0
                 THEN -__reg_exp_scale(p.sw,0.5*ln(2.0)+CASE WHEN p.eta+ln(alpha)<-30.0 THEN p.eta/2.0
                      ELSE (ln(__reg_softplus(p.eta+ln(alpha)))-ln(alpha))/2.0 END)
@@ -3823,7 +3827,7 @@ SELECT n.* EXCLUDE (__reg_rid__), d.hat,
        __reg_mul_div(d.pearson_resid*(CASE WHEN family IN ('logistic','poisson','nbinom') THEN 1.0 ELSE sqrt(ws.wscale) END),
          (SELECT CASE WHEN family='tweedie' THEN exp((1.0-power/2.0)*shift) ELSE runit END
           FROM __reg_resunits CROSS JOIN __reg_responseunits),1.0) AS pearson_resid,
-       __reg_mul_div(d.deviance_resid*sqrt(ws.wscale),
+       __reg_mul_div(d.deviance_resid*(CASE WHEN family IN ('poisson','gamma','tweedie') THEN 1.0 ELSE sqrt(ws.wscale) END),
          (SELECT CASE WHEN family='tweedie' THEN exp((1.0-power/2.0)*shift) ELSE runit END
           FROM __reg_resunits CROSS JOIN __reg_responseunits),1.0) AS deviance_resid,
        d.std_resid AS std_resid,
