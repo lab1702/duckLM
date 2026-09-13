@@ -3458,6 +3458,13 @@ __reg_rows0 AS (
   FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc
        CROSS JOIN __reg_weightscale ws CROSS JOIN __reg_beta beta WHERE wc.ok
 ),
+-- Compute training predictors once after making zero-weight rows harmless.
+-- Reuse the guarded dot product across response/residual units, information
+-- coordinates, and weighted rows; keep only columns needed by those consumers.
+__reg_training_scored AS MATERIALIZED (
+  SELECT __reg_rid__, xs, y, wt, sw,
+         __reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0
+),
 -- A common Tweedie response unit cancels from coefficient uncertainty and
 -- standardized diagnostics. Remove extreme units before information powers
 -- or Pearson squares overflow; restore raw diagnostic residual units at output.
@@ -3465,26 +3472,26 @@ __reg_responseunits AS (
   SELECT CASE WHEN family='tweedie' AND isfinite(anchor) AND abs((2.0-power)*anchor)>600.0
               THEN anchor ELSE 0.0 END AS shift
   FROM (SELECT arg_min(eta,struct_pack(weight := -sw,magnitude := abs(eta),value := eta)) FILTER (WHERE sw>0) AS anchor
-        FROM (SELECT sw,__reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0))
+        FROM __reg_training_scored)
 ),
 -- Linear uncertainty is accumulated in root-weighted residual units and restored only
 -- after square roots. This preserves small/large finite response scales.
 __reg_resunits AS (
   SELECT CASE WHEN family = 'linear'
-              THEN coalesce(nullif(max(sw*__reg_center_scale(y,__reg_dot(xs || [off],bvec || [1.0])))
+              THEN coalesce(nullif(max(sw*__reg_center_scale(y,eta))
                                    FILTER (WHERE sw > 0),0.0),1.0)
               ELSE 1.0 END AS runit
-  FROM __reg_rows0
+  FROM __reg_training_scored
 ),
 -- Joint root-information/feature scales, stored in logs so even a scale
 -- outside DOUBLE range can cancel before coordinates or standard errors form.
 __reg_xunits AS (
   SELECT list(logunit ORDER BY i) AS units
   FROM (SELECT ix.i, coalesce(nullif(max(ln(nullif(abs(r.xs[ix.i]),0.0))+ln(nullif(r.sw,0.0))
-                   +0.5*__reg_log_info(__reg_dot(r.xs || [r.off],r.bvec || [1.0])-tu.shift,family,power,alpha))
+                   +0.5*__reg_log_info(r.eta-tu.shift,family,power,alpha))
                    FILTER (WHERE r.sw>0 AND r.xs[ix.i]!=0),'-Infinity'::DOUBLE),0.0) AS logunit
         FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
-        LEFT JOIN __reg_rows0 r ON true CROSS JOIN __reg_responseunits tu GROUP BY ix.i)
+        LEFT JOIN __reg_training_scored r ON true CROSS JOIN __reg_responseunits tu GROUP BY ix.i)
 ),
 __reg_rww AS (
   SELECT r.__reg_rid__, list_transform(r.xs, lambda v,j: __reg_exp_scale(v,ln(nullif(r.sw,0.0))+0.5*__reg_log_info(r.eta,family,power,alpha)-u.units[j])) AS xs,
@@ -3499,9 +3506,8 @@ __reg_rww AS (
          pow(pres,2) AS pearson
   FROM (SELECT *, CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                              WHEN 'linear' THEN eta ELSE exp(eta) END AS mu
-        FROM (SELECT r.* REPLACE (__reg_response_scale(y,tu.shift) AS y),
-                     __reg_dot(xs || [off],bvec || [1.0])-tu.shift AS eta
-              FROM __reg_rows0 r CROSS JOIN __reg_responseunits tu)) r
+        FROM (SELECT r.* REPLACE (__reg_response_scale(y,tu.shift) AS y, r.eta-tu.shift AS eta)
+              FROM __reg_training_scored r CROSS JOIN __reg_responseunits tu)) r
   CROSS JOIN __reg_xunits u CROSS JOIN __reg_resunits ru
 ),
 -- Retain a root residual unit: its square may overflow while the SE is finite.
@@ -3721,6 +3727,13 @@ __reg_rows0 AS (
   FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc
        CROSS JOIN __reg_weightscale ws CROSS JOIN __reg_beta beta WHERE wc.ok
 ),
+-- Compute training predictors once after making zero-weight rows harmless.
+-- Reuse the guarded dot product across response/residual units, information
+-- coordinates, and weighted rows; keep only columns needed by those consumers.
+__reg_training_scored AS MATERIALIZED (
+  SELECT __reg_rid__, xs, y, wt, sw,
+         __reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0
+),
 -- A common Tweedie response unit cancels from coefficient uncertainty and
 -- standardized diagnostics. Remove extreme units before information powers
 -- or Pearson squares overflow; restore raw diagnostic residual units at output.
@@ -3728,26 +3741,26 @@ __reg_responseunits AS (
   SELECT CASE WHEN family='tweedie' AND isfinite(anchor) AND abs((2.0-power)*anchor)>600.0
               THEN anchor ELSE 0.0 END AS shift
   FROM (SELECT arg_min(eta,struct_pack(weight := -sw,magnitude := abs(eta),value := eta)) FILTER (WHERE sw>0) AS anchor
-        FROM (SELECT sw,__reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0))
+        FROM __reg_training_scored)
 ),
 -- Linear uncertainty is accumulated in root-weighted residual units and restored only
 -- after square roots. This preserves small/large finite response scales.
 __reg_resunits AS (
   SELECT CASE WHEN family = 'linear'
-              THEN coalesce(nullif(max(sw*__reg_center_scale(y,__reg_dot(xs || [off],bvec || [1.0])))
+              THEN coalesce(nullif(max(sw*__reg_center_scale(y,eta))
                                    FILTER (WHERE sw > 0),0.0),1.0)
               ELSE 1.0 END AS runit
-  FROM __reg_rows0
+  FROM __reg_training_scored
 ),
 -- Joint root-information/feature scales, stored in logs so even a scale
 -- outside DOUBLE range can cancel before coordinates or standard errors form.
 __reg_xunits AS (
   SELECT list(logunit ORDER BY i) AS units
   FROM (SELECT ix.i, coalesce(nullif(max(ln(nullif(abs(r.xs[ix.i]),0.0))+ln(nullif(r.sw,0.0))
-                   +0.5*__reg_log_observed(__reg_response_scale(r.y,tu.shift),__reg_dot(r.xs || [r.off],r.bvec || [1.0])-tu.shift,family,power,alpha))
+                   +0.5*__reg_log_observed(__reg_response_scale(r.y,tu.shift),r.eta-tu.shift,family,power,alpha))
                    FILTER (WHERE r.sw>0 AND r.xs[ix.i]!=0),'-Infinity'::DOUBLE),0.0) AS logunit
         FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
-        LEFT JOIN __reg_rows0 r ON true CROSS JOIN __reg_responseunits tu GROUP BY ix.i)
+        LEFT JOIN __reg_training_scored r ON true CROSS JOIN __reg_responseunits tu GROUP BY ix.i)
 ),
 -- per row: mu, observed weight hw, variance V, residual, unit deviance
 __reg_pr AS (
@@ -3775,8 +3788,8 @@ __reg_pr AS (
                CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                            WHEN 'linear' THEN eta ELSE exp(eta) END AS mu
         FROM (SELECT __reg_rid__,xs,wt,sw,__reg_response_scale(y,tu.shift) AS y,
-                     __reg_dot(xs || [off],bvec || [1.0])-tu.shift AS eta
-              FROM __reg_rows0 CROSS JOIN __reg_responseunits tu)) r CROSS JOIN __reg_xunits u CROSS JOIN __reg_resunits ru CROSS JOIN __reg_weightscale ws
+                     eta-tu.shift AS eta
+              FROM __reg_training_scored CROSS JOIN __reg_responseunits tu)) r CROSS JOIN __reg_xunits u CROSS JOIN __reg_resunits ru CROSS JOIN __reg_weightscale ws
 ),
 __reg_dims AS (SELECT count(*)::INT AS n, (SELECT k FROM __reg_beta)+1 AS d FROM __reg_pr),
 __reg_idx AS (SELECT unnest(range(1, (SELECT d FROM __reg_dims)+1)) AS i),

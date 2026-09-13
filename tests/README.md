@@ -61,6 +61,14 @@ binding, optimization, and total latency. Use `--output /tmp/summary.json` to
 retain measurements, including buffer memory and spill; the same timing and
 memory caveats above apply. The script reuses setup from `benchmark_evaluate.py`.
 
+For prediction intervals and influence diagnostics, run
+`.venv/bin/python benchmarks/benchmark_diagnostics.py --baseline /path/to/previous_regression_macros.sql`.
+It compares all six families, linear row/feature scaling, weighted data with
+offsets and incomplete rows, and intervals on separate scoring data. Use
+`--output /tmp/diagnostics.json` to retain detailed planning, latency, memory,
+and spill measurements. It reuses helpers from the evaluation and summary
+benchmarks; the same timing and memory caveats apply.
+
 ## SQL smoke test — `smoke.sql`
 
 No Python required — just the DuckDB CLI. Fits each family on deterministic
