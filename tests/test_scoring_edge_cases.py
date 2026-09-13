@@ -454,6 +454,18 @@ def test_multinomial_loss_preserves_finite_extreme_logits(con, magnitude):
     assert metrics['log_loss'] == pytest.approx(np.logaddexp(0, magnitude), rel=1e-12)
 
 
+@pytest.mark.parametrize('correct_rows', [1, 3, 9])
+def test_multinomial_mean_loss_stays_finite_when_one_logit_difference_overflows(con, correct_rows):
+    con.execute("CREATE TABLE wide_logits AS SELECT * FROM (VALUES "
+                "('a','(Intercept)',0.::DOUBLE),('b','(Intercept)',1e308),"
+                "('c','(Intercept)',-1e308))t(class,feature,coefficient)")
+    con.execute(f"CREATE TABLE wide_labels AS SELECT 'c' y UNION ALL SELECT 'b' FROM range({correct_rows})")
+    metrics = _metrics(con, "multinom_evaluate('wide_logits','wide_labels','y')")
+    assert metrics['n'] == correct_rows+1
+    assert metrics['accuracy'] == pytest.approx(correct_rows/(correct_rows+1))
+    assert metrics['log_loss'] == pytest.approx((2/(correct_rows+1))*1e308, rel=1e-12)
+
+
 def test_multinomial_loss_is_infinite_for_an_unseen_class(con):
     con.execute("CREATE TABLE multiclass_model AS SELECT * FROM "
                 "(VALUES ('a','(Intercept)',0.),('b','(Intercept)',0.))t(class,feature,coefficient)")

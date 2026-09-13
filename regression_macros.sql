@@ -1894,7 +1894,8 @@ SELECT rid, class,
        CASE WHEN nm = (SELECT nf FROM __reg_mnf)
             THEN exp(e - maxe) / sum(exp(e - maxe)) OVER (PARTITION BY rid) END AS p,
        CASE WHEN nm = (SELECT nf FROM __reg_mnf)
-            THEN e - maxe - ln(sum(exp(e - maxe)) OVER (PARTITION BY rid)) END AS log_p
+            THEN e - maxe - ln(sum(exp(e - maxe)) OVER (PARTITION BY rid)) END AS log_p,
+       e, maxe, ln(sum(exp(e-maxe)) OVER (PARTITION BY rid)) AS log_norm
 FROM __reg_meta2;
 
 CREATE OR REPLACE MACRO __reg_mscore_check(model, tbl, caller) AS TABLE
@@ -1933,19 +1934,27 @@ __reg_mtrue AS (
 ),
 __reg_mrm AS (
   SELECT s.rid, max(CASE WHEN s.class = t.lab THEN s.log_p END) AS log_p_true,
+         max(CASE WHEN s.class = t.lab THEN s.e END) AS true_logit,
+         max(s.maxe) AS max_logit, max(s.log_norm) AS log_norm,
          arg_max(s.class, s.p) AS pred, any_value(t.lab) AS truelab
   FROM __reg_msoftmax(model, '__reg_minput') s JOIN __reg_mtrue t ON t.rid = s.rid
   WHERE s.p IS NOT NULL GROUP BY s.rid
 ),
 __reg_mlossunit AS (
-  SELECT coalesce(nullif(max(-coalesce(log_p_true,'-Infinity'::DOUBLE)),0.0),1.0) AS unit
+  SELECT coalesce(nullif(max(CASE WHEN log_p_true IS NULL THEN 'Infinity'::DOUBLE
+                                 WHEN isfinite(log_p_true) THEN abs(log_p_true)
+                                 ELSE greatest(abs(true_logit),abs(max_logit)) END),0.0),1.0) AS unit
   FROM __reg_mrm
 )
 SELECT count(*)::BIGINT AS n,
        avg(CASE WHEN pred = truelab THEN 1.0 ELSE 0.0 END) AS accuracy,
        -- Preserve finite log probabilities even when exp(log_p) underflows.
        -- A label absent from the model has probability zero and infinite loss.
-       CASE WHEN isfinite(any_value(unit)) THEN -avg(log_p_true/unit)*any_value(unit)
+       -- An individual finite-logit loss can exceed DOUBLE while its mean fits.
+       -- Scale the separate logits before subtracting in that case.
+       CASE WHEN isfinite(any_value(unit))
+            THEN avg(CASE WHEN isfinite(log_p_true) THEN -log_p_true/unit
+                          ELSE max_logit/unit-true_logit/unit+log_norm/unit END)*any_value(unit)
             ELSE 'Infinity'::DOUBLE END AS log_loss
 FROM __reg_mrm CROSS JOIN __reg_mlossunit WHERE (SELECT ok FROM __reg_mncheck);
 
