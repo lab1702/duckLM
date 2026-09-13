@@ -1453,7 +1453,9 @@ __reg_agg AS (
     FROM __reg_pearson_rows CROSS JOIN __reg_errorunits
 ),
 -- Fit the intercept-only null on the evaluated rows, retaining their offsets.
--- The score changes sign at the unique intercept-only optimum.
+-- The score changes sign at the unique intercept-only optimum. Bisect until
+-- the root is exact or the bounds are adjacent DOUBLE values. The guard covers
+-- the full exponent range, including subnormals, even with widely spaced offsets.
 -- The no-offset path keeps the exact mean baseline, without recursion.
 __reg_null_data AS (
     SELECT list(struct_pack(y := y, o := o)) AS rows,
@@ -1476,7 +1478,7 @@ __reg_null_bounds(it, lo, hi) AS (
                CASE WHEN family = 'logistic' THEN __reg_logit_resid(r.y,mid+r.o)
                     ELSE __reg_nb_score(r.y,mid+r.o,alpha) END)) AS score
       FROM (SELECT *, lo/2.0+hi/2.0 AS mid FROM __reg_null_bounds
-            WHERE it < 80 AND lo < hi) b, __reg_null_data d
+            WHERE it < 2200 AND lo < lo/2.0+hi/2.0 AND lo/2.0+hi/2.0 < hi) b, __reg_null_data d
     )
 ),
 -- The power-variance families have an analytic intercept-only score root:

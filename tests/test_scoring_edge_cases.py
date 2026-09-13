@@ -356,6 +356,18 @@ def test_logit_null_likelihood_stays_finite_with_extreme_offsets(con):
     assert result['bic'] == pytest.approx(400.0+np.log(2))
 
 
+@pytest.mark.parametrize('family,positive_outcome', [('logit', 1), ('nbinom', 2)])
+@pytest.mark.parametrize('offset', [-1e30, -1e300])
+def test_offset_null_root_converges_with_widely_spaced_offsets(con, family, positive_outcome, offset):
+    con.execute("CREATE TABLE wide_null_model AS SELECT '(Intercept)' feature, 0.::DOUBLE coefficient")
+    con.execute('CREATE TABLE wide_null_data(y DOUBLE,expo DOUBLE)')
+    con.executemany('INSERT INTO wide_null_data VALUES (?,?)', [(0, offset), (0, 0), (positive_outcome, 0)])
+    result = _metrics(con, f"{family}_evaluate('wide_null_model','wide_null_data','y',offset_col:='expo')")
+    assert np.isfinite(result['null_deviance'])
+    assert result['null_deviance'] == pytest.approx(result['deviance'], rel=1e-12)
+    assert result['pseudo_r2'] == pytest.approx(0, abs=1e-12)
+
+
 def test_multinomial_scoring_reuses_one_snapshot(con):
     con.execute('SELECT setseed(.42)')
     con.execute("CREATE TABLE snapshot_model AS SELECT * FROM (VALUES ('a','(Intercept)',0.),('a','x',0.),('b','(Intercept)',0.),('b','x',1.))t(class,feature,coefficient)")
