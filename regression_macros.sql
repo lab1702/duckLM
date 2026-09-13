@@ -3225,6 +3225,8 @@ __reg_robraw AS (
                 ELSE __reg_exp_scale(r.pres,ln(abs(v))+ln(r.sw)-u.units[j]) END END) END AS sg
   FROM __reg_rww r JOIN __reg_rows0 raw USING (__reg_rid__)
   LEFT JOIN __reg_clv cl ON cl.__reg_rid__ = r.__reg_rid__ CROSS JOIN __reg_rounits u
+  -- Model-based errors do not use the sandwich covariance inputs.
+  WHERE robust != 'none' OR cluster_col IS NOT NULL
 ),
 -- A common information scale cancels between sandwich bread and scores.
 -- Remove it before inversion, which could otherwise overflow for tiny means.
