@@ -37,6 +37,13 @@ automatically chooses the number of parallel workers. Install or update the
 dependencies above before running tests in an existing environment. For debugging,
 pass `-n 0` to run serially.
 
+To measure Student-t quantile performance, run
+`.venv/bin/python benchmarks/benchmark_t_ppf.py` from the repo root. Optionally
+pass `--baseline /path/to/previous_regression_macros.sql` to compare timings and
+check exact output equality on ordinary, central, and extreme-tail inputs.
+The benchmark uses one DuckDB thread and reports medians; run it without other
+CPU-heavy jobs for comparable timings. Timing is informational, not a test gate.
+
 ## SQL smoke test — `smoke.sql`
 
 No Python required — just the DuckDB CLI. Fits each family on deterministic

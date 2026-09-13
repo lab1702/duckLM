@@ -2875,7 +2875,12 @@ CREATE OR REPLACE MACRO __reg_t_ppf(p, df) AS (
                 ], lambda upper:
                   list_transform([
                     list_reduce(list_transform(range(80), lambda i: struct_pack(lo := 0.0::DOUBLE, hi := 0.0::DOUBLE)),
-                      lambda bounds, unused: CASE WHEN __reg_t_sf(bounds.lo/2.0 + bounds.hi/2.0, dd) > q
+                      -- Once the midpoint rounds to an endpoint, further bisection
+                      -- cannot change the returned quantile. Skip the expensive
+                      -- survival function for the remaining fixed-budget steps.
+                      lambda bounds, unused: CASE
+                        WHEN bounds.lo/2.0 + bounds.hi/2.0 IN (bounds.lo, bounds.hi) THEN bounds
+                        WHEN __reg_t_sf(bounds.lo/2.0 + bounds.hi/2.0, dd) > q
                         THEN struct_pack(lo := bounds.lo/2.0 + bounds.hi/2.0, hi := bounds.hi)
                         ELSE struct_pack(lo := bounds.lo, hi := bounds.lo/2.0 + bounds.hi/2.0) END,
                       struct_pack(lo := 0.0::DOUBLE, hi := upper))
