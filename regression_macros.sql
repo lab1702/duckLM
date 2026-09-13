@@ -1389,7 +1389,7 @@ __reg_meta AS (
 __reg_offset AS (SELECT rid, v AS o FROM __reg_long WHERE col = offset_col),
 -- Linear predictor z = offset + b0 + sum(coef * feature); NULL if a model
 -- feature (or a requested offset) is missing or NULL for the row.
-__reg_z AS (
+__reg_z_raw AS (
     SELECT l.rid,
            CASE WHEN count(*) = m.kfeat
                      AND (offset_col IS NULL OR any_value(o.o) IS NOT NULL)
@@ -1410,6 +1410,11 @@ __reg_z AS (
     LEFT JOIN __reg_offset o ON o.rid = n.__reg_rid__
     WHERE m.kfeat = 0 AND (offset_col IS NULL OR o.o IS NOT NULL)
 ),
+-- Keep the NULL-score filter above the score projection. Without this boundary,
+-- filter pushdown expands __reg_dot in both the filter and the projection, so
+-- each surviving row is scored twice. OFFSET 0 preserves every row and avoids
+-- forcing an additional materialized copy of the scores.
+__reg_z AS (SELECT * FROM __reg_z_raw OFFSET 0),
 __reg_y AS (SELECT rid, v AS y FROM __reg_long WHERE col = outcome),
 -- One row per evaluated observation: actual y, linear predictor z, and the
 -- mean response yhat under the family's inverse link.

@@ -24,6 +24,37 @@ def _metrics(con, call):
     return dict(zip([column[0] for column in result.description], result.fetchone()))
 
 
+@pytest.mark.parametrize('family', ['linreg', 'logit', 'poisson', 'gamma', 'tweedie', 'nbinom'])
+@pytest.mark.parametrize('empty', [False, True])
+def test_evaluation_filters_incomplete_scores_before_outcome_validation(con, family, empty):
+    con.execute("CREATE TABLE filter_model AS SELECT * FROM "
+                "(VALUES ('(Intercept)', .3), ('x1', .2), ('x2', -.1)) t(feature, coefficient)")
+    con.execute('CREATE TABLE filter_rows(x1 DOUBLE, x2 DOUBLE, expo DOUBLE, y DOUBLE)')
+    # Invalid outcomes on unscorable rows must not trigger domain validation.
+    con.execute('INSERT INTO filter_rows VALUES '
+                '(NULL, 1., .1, -99.), (1., NULL, .1, -99.), '
+                '(1., 2., NULL, -99.), (1., 2., .1, NULL)')
+    call = f"{family}_evaluate('filter_model','filter_rows','y',offset_col:='expo')"
+    if empty:
+        with pytest.raises(duckdb.Error, match='no rows with a non-NULL prediction and outcome'):
+            _metrics(con, call)
+        return
+
+    outcomes = [0., 1., 1., 0., 1.] if family == 'logit' else [1., 2., 3., 2., 4.]
+    con.executemany('INSERT INTO filter_rows VALUES (?, ?, ?, ?)',
+                    [(i / 5., i / 7., i / 10., y) for i, y in enumerate(outcomes)])
+    con.execute('CREATE TABLE filter_complete AS SELECT * FROM filter_rows '
+                'WHERE x1 IS NOT NULL AND x2 IS NOT NULL AND expo IS NOT NULL AND y IS NOT NULL')
+    actual = _metrics(con, call)
+    expected = _metrics(con, call.replace("'filter_rows'", "'filter_complete'"))
+    assert actual['n'] == 5
+    for metric in expected:
+        if expected[metric] is None:
+            assert actual[metric] is None
+        else:
+            assert actual[metric] == pytest.approx(expected[metric], rel=1e-12, abs=1e-12)
+
+
 @pytest.mark.parametrize('logit', [40.0, 100.0, 700.0])
 def test_logistic_tail_loss_matches_offset_null(con, logit):
     con.execute("CREATE TABLE tail_model AS SELECT '(Intercept)' feature,0.::DOUBLE coefficient")

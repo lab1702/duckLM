@@ -44,6 +44,15 @@ check exact output equality on ordinary, central, and extreme-tail inputs.
 The benchmark uses one DuckDB thread and reports medians; run it without other
 CPU-heavy jobs for comparable timings. Timing is informational, not a test gate.
 
+For evaluation, run `.venv/bin/python benchmarks/benchmark_evaluate.py --baseline
+/path/to/previous_regression_macros.sql` (as one command). This compares all six
+single-outcome families at 1,000–100,000 rows and includes a 24-feature workload.
+It checks metric agreement within floating-point reduction roundoff and reports
+median `EXPLAIN ANALYZE` latency. Pass `--output /tmp/evaluate.json` to retain
+timings and DuckDB's buffer-memory/spill measurements. Run it without concurrent
+CPU-heavy jobs; memory measurements include resident inputs and may retain
+connection high-water marks.
+
 ## SQL smoke test — `smoke.sql`
 
 No Python required — just the DuckDB CLI. Fits each family on deterministic
