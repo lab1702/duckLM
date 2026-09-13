@@ -79,6 +79,15 @@ iteration counts through a benchmark-only diagnostic macro. Use `--output
 Run without competing CPU-heavy jobs; memory includes resident inputs and
 diagnostic-query high-water marks.
 
+For ordinary model fitting, run `.venv/bin/python benchmarks/benchmark_fit.py
+--baseline /path/to/previous_regression_macros.sql` (as one command). This checks
+all six families across narrow/wide designs, weights and offsets with missing
+rows, elastic-net penalties, explicit IRLS/GD, and singular fallback. It compares
+public coefficients and internal coefficients, solver choice, iteration counts,
+and convergence movement through a benchmark-only diagnostic macro. Use
+`--output /tmp/fit.json` to retain detailed timing, buffer-memory, and spill
+measurements. The same timing and memory caveats apply.
+
 ## SQL smoke test — `smoke.sql`
 
 No Python required — just the DuckDB CLI. Fits each family on deterministic

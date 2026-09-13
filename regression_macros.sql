@@ -747,58 +747,81 @@ __reg_irls(it, betas, move, proposed_move) AS (
                                CASE WHEN a = b AND a > 1 THEN v + sumw * l2 ELSE v END)) AS XWXpen
                 FROM (
                     SELECT it, betas, sumw,
-                           list_transform(range(1, len(betas) + 1), lambda a:
-                               list_transform(range(1, len(betas) + 1), lambda b:
-                                   list_sum(list_transform(res, lambda ob: ob.wirls * ob.xs[a] * ob.xs[b])))) AS XWX,
-                           list_transform(range(1, len(betas) + 1), lambda a:
-                               list_sum(list_transform(res, lambda ob: ob.wr * ob.xs[a]))) AS XWr
+                           -- A scalar guard keeps NULL-bearing vectors on the
+                           -- original sum path; dot products reject NULL elements.
+                           CASE WHEN wok THEN
+                             list_transform(wx, lambda wc: list_transform(xcols, lambda xc:
+                               list_dot_product(wc, xc)))
+                           ELSE list_transform(wx, lambda wc: list_transform(xcols, lambda xc:
+                             list_sum(list_transform(list_zip(wc,xc), lambda pair: pair[1]*pair[2])))) END AS XWX,
+                           CASE WHEN rok THEN
+                             list_transform(xcols, lambda xc:
+                               list_dot_product(wr, xc))
+                           ELSE list_transform(xcols, lambda xc:
+                             list_sum(list_transform(list_zip(wr,xc), lambda pair: pair[1]*pair[2]))) END AS XWr
                     FROM (
-                        -- Features already carry sqrt(w): keep the information factor
-                        -- unweighted, and multiply the working RHS by sqrt(w).
-                        -- Poisson/NB absorb root information into coordinates and RHS
-                        -- before multiplication, retaining finite weighted information.
-                        SELECT it, betas, sumw,
-                               list_transform(mus, lambda e: struct_pack(
-                                   xs := CASE WHEN family IN ('poisson','nbinom')
-                                              THEN list_transform(e.xs,lambda v: __reg_exp_scale(v,__reg_fit_loginfo(e.eta,family,log_alpha_int,l1=0 AND l2=0)/2.0))
-                                              ELSE e.xs END,
-                                   wirls := (CASE family
-                                              WHEN 'logistic' THEN __reg_logit_var(e.eta)
-                                              WHEN 'linear'   THEN 1.0
-                                              WHEN 'poisson'  THEN 1.0
-                                              WHEN 'gamma'    THEN 1.0
-                                              WHEN 'tweedie'  THEN exp((2.0-power)*e.eta)
-                                              WHEN 'nbinom'   THEN 1.0 END),
-                                   wr := CASE WHEN family IN ('poisson','nbinom')
-                                              THEN __reg_exp_scale(e.linpred,__reg_fit_loginfo(e.eta,family,log_alpha_int,l1=0 AND l2=0)/2.0)
-                                                 + __reg_exp_scale(__reg_weighted_fit_score(e.wy,e.w,e.eta,family,power,log_alpha_int,l1=0 AND l2=0),-__reg_fit_loginfo(e.eta,family,log_alpha_int,l1=0 AND l2=0)/2.0)
-                                              ELSE (CASE family
-                                              WHEN 'logistic' THEN __reg_logit_var(e.eta)
-                                              WHEN 'linear'   THEN 1.0
-                                              WHEN 'poisson'  THEN e.mu
-                                              WHEN 'gamma'    THEN 1.0
-                                              WHEN 'tweedie'  THEN exp((2.0-power)*e.eta)
-                                              WHEN 'nbinom'   THEN __reg_nb_fit_info(ln(e.mu),log_alpha_int,l1=0 AND l2=0) END) * e.linpred
-                                         + __reg_weighted_fit_score(e.wy,e.w,
-                                             CASE WHEN family IN ('linear','logistic','poisson','gamma','tweedie') THEN e.eta ELSE ln(e.mu) END,
-                                             family,power,log_alpha_int,l1=0 AND l2=0)
-                                   END)) AS res
+                        -- Reuse each weighted column across the matrix row.
+                        -- Poisson/NB rescale coordinates on every IRLS iteration,
+                        -- so derive columns from res, not the original design.
+                        -- Keep (weight * x_a) * x_b and packed row order intact.
+                        SELECT *,
+                               list_transform(range(1, len(betas) + 1), lambda a:
+                                 list_transform(res, lambda ob: ob.xs[a])) AS xcols,
+                               list_transform(range(1, len(betas) + 1), lambda a:
+                                 list_transform(res, lambda ob: ob.wirls * ob.xs[a])) AS wx,
+                               list_transform(res, lambda ob: ob.wr) AS wr,
+                               list_aggregate(list_transform(res, lambda ob: ob.wirls IS NOT NULL
+                                 AND coalesce(list_count(ob.xs)=len(ob.xs),false)), 'bool_and') AS wok,
+                               list_aggregate(list_transform(res, lambda ob: ob.wr IS NOT NULL
+                                 AND coalesce(list_count(ob.xs)=len(ob.xs),false)), 'bool_and') AS rok
                         FROM (
-                            SELECT g.it, g.betas, p.sumw, c.log_alpha_int AS log_alpha_int,
-                                   list_transform(p.rows, lambda rw: struct_pack(
-                                       xs := rw.wxs, w := rw.sw, wy := rw.wy,
-                                       linpred := list_dot_product(rw.wxs,g.betas),
-                                       eta := __reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas)+rw.o,
-                                       mu := CASE family
-                                               WHEN 'logistic' THEN 1.0 / (1.0 + exp(-greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o, 700.0), -700.0)))
-                                               WHEN 'linear'   THEN __reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o
-                                               WHEN 'poisson'  THEN exp(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o)
-                                               ELSE exp(greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o, 700.0), -700.0)) END
-                                       )) AS mus
-                            FROM __reg_irls g, __reg_packed p, __reg_cfg c
-                            -- isfinite() stops promptly on a singular step (NaN move),
-                            -- since NaN >= tol is TRUE in DuckDB and would otherwise loop
-                            WHERE g.it < max_iter AND g.move >= tol AND isfinite(g.move)
+                            -- Features already carry sqrt(w): keep the information factor
+                            -- unweighted, and multiply the working RHS by sqrt(w).
+                            -- Poisson/NB absorb root information into coordinates and RHS
+                            -- before multiplication, retaining finite weighted information.
+                            SELECT it, betas, sumw,
+                                   list_transform(mus, lambda e: struct_pack(
+                                       xs := CASE WHEN family IN ('poisson','nbinom')
+                                                  THEN list_transform(e.xs,lambda v: __reg_exp_scale(v,__reg_fit_loginfo(e.eta,family,log_alpha_int,l1=0 AND l2=0)/2.0))
+                                                  ELSE e.xs END,
+                                       wirls := (CASE family
+                                                  WHEN 'logistic' THEN __reg_logit_var(e.eta)
+                                                  WHEN 'linear'   THEN 1.0
+                                                  WHEN 'poisson'  THEN 1.0
+                                                  WHEN 'gamma'    THEN 1.0
+                                                  WHEN 'tweedie'  THEN exp((2.0-power)*e.eta)
+                                                  WHEN 'nbinom'   THEN 1.0 END),
+                                       wr := CASE WHEN family IN ('poisson','nbinom')
+                                                  THEN __reg_exp_scale(e.linpred,__reg_fit_loginfo(e.eta,family,log_alpha_int,l1=0 AND l2=0)/2.0)
+                                                     + __reg_exp_scale(__reg_weighted_fit_score(e.wy,e.w,e.eta,family,power,log_alpha_int,l1=0 AND l2=0),-__reg_fit_loginfo(e.eta,family,log_alpha_int,l1=0 AND l2=0)/2.0)
+                                                  ELSE (CASE family
+                                                  WHEN 'logistic' THEN __reg_logit_var(e.eta)
+                                                  WHEN 'linear'   THEN 1.0
+                                                  WHEN 'poisson'  THEN e.mu
+                                                  WHEN 'gamma'    THEN 1.0
+                                                  WHEN 'tweedie'  THEN exp((2.0-power)*e.eta)
+                                                  WHEN 'nbinom'   THEN __reg_nb_fit_info(ln(e.mu),log_alpha_int,l1=0 AND l2=0) END) * e.linpred
+                                             + __reg_weighted_fit_score(e.wy,e.w,
+                                                 CASE WHEN family IN ('linear','logistic','poisson','gamma','tweedie') THEN e.eta ELSE ln(e.mu) END,
+                                                 family,power,log_alpha_int,l1=0 AND l2=0)
+                                       END)) AS res
+                            FROM (
+                                SELECT g.it, g.betas, p.sumw, c.log_alpha_int AS log_alpha_int,
+                                       list_transform(p.rows, lambda rw: struct_pack(
+                                           xs := rw.wxs, w := rw.sw, wy := rw.wy,
+                                           linpred := list_dot_product(rw.wxs,g.betas),
+                                           eta := __reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas)+rw.o,
+                                           mu := CASE family
+                                                   WHEN 'logistic' THEN 1.0 / (1.0 + exp(-greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o, 700.0), -700.0)))
+                                                   WHEN 'linear'   THEN __reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o
+                                                   WHEN 'poisson'  THEN exp(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o)
+                                                   ELSE exp(greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o, 700.0), -700.0)) END
+                                           )) AS mus
+                                FROM __reg_irls g, __reg_packed p, __reg_cfg c
+                                -- isfinite() stops promptly on a singular step (NaN move),
+                                -- since NaN >= tol is TRUE in DuckDB and would otherwise loop
+                                WHERE g.it < max_iter AND g.move >= tol AND isfinite(g.move)
+                            )
                         )
                     )
                 )
