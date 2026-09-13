@@ -1095,7 +1095,7 @@ ORDER BY __reg_rid__;
 -- admits exact zeros alongside positive values (e.g. insurance pure premium).
 -- Matches sklearn TweedieRegressor(power=p, alpha=0, link='log').
 CREATE OR REPLACE MACRO tweedie_fit(tbl, outcome, power := 1.5, max_iter := 50000, learning_rate := NULL, tol := 1e-10, l2 := 0.0, offset_col := NULL, weights_col := NULL, l1 := 0.0, solver := 'auto') AS TABLE
-SELECT * FROM __reg_fit(tbl, outcome, 'tweedie', 'tweedie_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1, NULL, solver);
+SELECT * FROM __reg_fit(tbl, outcome, CASE WHEN power=1.0 THEN 'poisson' ELSE 'tweedie' END, 'tweedie_fit', max_iter, learning_rate, tol, l2, offset_col, weights_col, power, l1, NULL, solver);
 
 CREATE OR REPLACE MACRO tweedie_predict(model, tbl, offset_col := NULL) AS TABLE
 SELECT * EXCLUDE (__reg_rid__, __reg_score__),
@@ -1185,6 +1185,24 @@ CREATE OR REPLACE MACRO __reg_nb_halfdev(y, eta, alpha) AS (
                     +__reg_bd0_inv_alpha(alpha,__reg_softplus(ln(y)+ln(alpha))-__reg_softplus(eta+ln(alpha))) END
          )[1] END
   )[1]
+);
+-- Root of exp(loga)*(exp(q)-1-q), without forming the deviance first.
+CREATE OR REPLACE MACRO __reg_bd0_root(loga, q) AS (
+  CASE WHEN abs(q)<0.001 THEN __reg_exp_scale(abs(q),
+         (loga+ln(0.5+q*(1.0/6.0+q*(1.0/24.0+q*(1.0/120.0+q/720.0)))))/2.0)
+       WHEN q<0 THEN __reg_exp_scale(sqrt(exp(q)-1.0-q),loga/2.0)
+       ELSE __reg_exp_scale(sqrt(greatest(1.0-(1.0+q)*exp(-q),0.0)),(loga+q)/2.0) END
+);
+CREATE OR REPLACE MACRO __reg_nb_halfdev_root(y, eta, alpha, root_weight) AS (
+  list_transform([__reg_nb_halfdev(y,eta,alpha)],lambda dev:
+    CASE WHEN root_weight=0 THEN 0.0
+         WHEN isfinite(dev) THEN root_weight*sqrt(greatest(dev,0.0))
+         ELSE list_transform([struct_pack(
+           a := __reg_bd0_root(ln(y)+2.0*ln(root_weight),__reg_softplus(-ln(alpha)-ln(y))-__reg_softplus(-ln(alpha)-eta)),
+           b := __reg_bd0_root(-ln(alpha)+2.0*ln(root_weight),__reg_softplus(ln(y)+ln(alpha))-__reg_softplus(eta+ln(alpha))))],lambda roots:
+           list_transform([greatest(roots.a,roots.b)],lambda unit:
+             CASE WHEN unit=0 OR isinf(unit) THEN unit
+                  ELSE unit*sqrt(pow(roots.a/unit,2)+pow(roots.b/unit,2)) END)[1])[1] END)[1]
 );
 CREATE OR REPLACE MACRO __reg_nb_ll(y, eta, alpha) AS (
   list_transform([1.0/alpha], lambda r:
@@ -3783,6 +3801,8 @@ __reg_diag AS (
               WHEN family = 'nbinom' AND p.y=0
                 THEN -__reg_exp_scale(p.sw,0.5*ln(2.0)+CASE WHEN p.eta+ln(alpha)<-30.0 THEN p.eta/2.0
                      ELSE (ln(__reg_softplus(p.eta+ln(alpha)))-ln(alpha))/2.0 END)
+              WHEN family = 'nbinom'
+                THEN sign(ln(p.y)-p.eta)*sqrt(2.0)*__reg_nb_halfdev_root(p.y,p.eta,alpha,p.sw)
               ELSE sign(p.resid) * p.sw * sqrt(2.0) * sqrt(greatest(p.halfdev, 0.0)) END AS deviance_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN pearson_resid/(SELECT unit FROM __reg_punits) / sqrt(dp.phi*(1.0-l.h)) END AS std_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN

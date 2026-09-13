@@ -343,3 +343,18 @@ def test_poisson_fit_preserves_large_internal_means_with_tiny_weights(con, solve
     rows = con.execute("SELECT y,prediction FROM poisson_predict('poisson_tail_model','poisson_weighted_tail',offset_col:='o')").fetchall()
     for actual, prediction in rows:
         assert prediction == pytest.approx(actual, rel=1e-9, abs=0)
+
+
+@pytest.mark.parametrize('solver', ['auto', 'gd', 'irls'])
+def test_tweedie_power_one_uses_stable_poisson_offset_fit(con, solver):
+    con.execute('CREATE OR REPLACE TABLE power_one_offsets AS SELECT i::DOUBLE x,1.0 y,1000.0*i o FROM range(-1,2)t(i)')
+    call = f"SELECT * FROM tweedie_fit('power_one_offsets','y',power:=1,offset_col:='o',solver:='{solver}',max_iter:=1000)"
+    if solver == 'irls':
+        # The explicit solver rejects this ill-conditioned initial information;
+        # auto must use the same stable GD fallback as the Poisson fit.
+        with pytest.raises(duckdb.Error, match='irls solver did not converge'):
+            con.execute(call).fetchall()
+        return
+    coefficients = dict(con.execute(call).fetchall())
+    assert coefficients['(Intercept)'] == pytest.approx(0, abs=1e-7)
+    assert coefficients['x'] == pytest.approx(-1000, abs=1e-7)

@@ -1427,3 +1427,20 @@ def test_linear_intervals_preserve_finite_endpoints_near_double_limit(con, sign,
     intervals = con.execute("SELECT conf_low,conf_high FROM linreg_predict_ci('large_ci_model','large_ci_data','y')").fetchall()
     for pred_low, pred_high in intervals:
         assert (pred_low if sign>0 else pred_high) == pytest.approx(expected, rel=1e-12)
+
+
+@pytest.mark.parametrize('weight', [1e-320, 1e-310])
+def test_nbinom_weighted_deviance_root_survives_unweighted_overflow(con, weight):
+    from decimal import Decimal, localcontext
+    con.execute('CREATE TABLE nb_root_data(x DOUBLE,y DOUBLE,o DOUBLE,w DOUBLE)')
+    con.executemany('INSERT INTO nb_root_data VALUES (?,?,?,?)', [(-1,1,0,1),(1,1,0,1),(0,1e308,-1000,weight)])
+    con.execute("CREATE TABLE nb_root_model AS SELECT * FROM nbinom_fit('nb_root_data','y',offset_col:='o',weights_col:='w',max_iter:=1000)")
+    intercept = con.execute("SELECT coefficient FROM nb_root_model WHERE feature='(Intercept)'").fetchone()[0]
+    residual = con.execute("SELECT deviance_resid FROM nbinom_influence('nb_root_model','nb_root_data','y',offset_col:='o',weights_col:='w') WHERE x=0").fetchone()[0]
+    with localcontext() as ctx:
+        ctx.prec = 800
+        y = Decimal(1e308)
+        mu = Decimal(intercept-1000).exp()
+        halfdev = y*(y/mu).ln()-(y+1)*((1+y)/(1+mu)).ln()
+        expected = float((2*Decimal(weight)*halfdev).sqrt())
+    assert residual == pytest.approx(expected, rel=1e-10)
