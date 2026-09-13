@@ -1522,6 +1522,11 @@ class TestInference:
         for f, c in summ:
             assert c == pytest.approx(fitc[f], rel=1e-12)
 
+    @pytest.mark.parametrize('sql_type,bits', [('TINYINT', 8), ('SMALLINT', 16), ('INTEGER', 32), ('BIGINT', 64), ('HUGEINT', 128)])
+    def test_normal_cdf_at_minimum_signed_integer(self, con, sql_type, bits):
+        value = -(2 ** (bits - 1))
+        assert con.execute(f"SELECT norm_cdf('{value}'::{sql_type})").fetchone()[0] == 0.0
+
     def test_normal_and_t_utilities(self, con):
         from scipy import stats as st
         for z in [-3.5, -1.0, 0.0, 0.4, 1.96, 2.8, 5.0]:

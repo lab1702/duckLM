@@ -693,11 +693,11 @@ __reg_seed AS (
 -- uses the __reg_matinv fold (a recursive-CTE inverse cannot nest here). D omits
 -- the intercept. Gated by solver = 'irls' so it is inert (base row only) under
 -- the default gradient-descent solver, and vice versa.
-__reg_irls(it, betas, move) AS (
+__reg_irls(it, betas, move, proposed_move) AS (
     -- cross-join __reg_cfg and touch c.step so ALL input validation (which lives
     -- in the step CASE: l2/l1 sign, bad solver, l1-with-irls, missing offset/
     -- weights) fires for the irls path too, not just gradient descent
-    SELECT 0, seed.betas, 1e308::DOUBLE
+    SELECT 0, seed.betas, 1e308::DOUBLE, 1e308::DOUBLE
     FROM __reg_seed seed, __reg_cfg c
     WHERE c.step IS NOT NULL
       -- irls is the solver under solver := 'irls' and under the 'auto' default.
@@ -707,18 +707,22 @@ __reg_irls(it, betas, move) AS (
       AND solver IN ('irls', 'auto')
     UNION ALL
     SELECT it + 1, betas_new,
-           list_aggregate(list_transform(betas_new, lambda v, j: abs(v - betas[j])), 'max')
+           list_aggregate(list_transform(betas_new, lambda v, j: abs(v - betas[j])), 'max'),
+           list_aggregate(list_transform(proposed, lambda v, j: abs(v - betas[j])), 'max')
     FROM (
+        SELECT it, betas, proposed,
+               __reg_irls_step(betas, proposed, step_rows, family) AS betas_new
+        FROM (
         -- Without L1 the penalised normal equations are solved exactly by inverting
         -- X'WX. With L1 no inverse exists, so the same normal equations go to
         -- coordinate descent instead (proximal Newton / glmnet), warm-started from
         -- the current iterate. The threshold is on the sum scale, matching the
         -- mean-loss objective the gd path minimises.
         SELECT it, betas,
-               __reg_irls_step(betas, CASE WHEN l1 = 0.0
+               CASE WHEN l1 = 0.0
                     THEN list_transform(__reg_matinv(XWXpen), lambda invrow: list_dot_product(invrow, XWr))
                     ELSE __reg_cd(XWXpen, XWr, betas, sumw * __reg_penalty.l1_internal, len(betas), 100)
-               END, step_rows, family) AS betas_new
+               END AS proposed
         FROM (
             SELECT it, betas, XWr, XWXpen, sumw
             FROM (
@@ -779,6 +783,7 @@ __reg_irls(it, betas, move) AS (
             )
         )
         CROSS JOIN __reg_cfg __reg_penalty
+        )
         CROSS JOIN (SELECT list_transform(rows, lambda rw: struct_pack(xs := rw.xs, w := rw.sw)) AS step_rows FROM __reg_packed) __reg_step_data
     )
 ),
@@ -788,10 +793,12 @@ __reg_irls(it, betas, move) AS (
 -- solver := 'auto' fall back to gradient descent instead of returning garbage.
 -- Empty (=> ok false) when irls did not run at all, which is exactly the gate gd
 -- wants: solver := 'gd' needs gd to run.
-__reg_irls_beta AS (SELECT betas, move FROM __reg_irls ORDER BY it DESC LIMIT 1),
+-- A tiny damped step can mean stagnation, not convergence. Stop promptly but
+-- accept it only when the undamped proposal is also small; otherwise use GD.
+__reg_irls_beta AS (SELECT betas, move, proposed_move FROM __reg_irls ORDER BY it DESC LIMIT 1),
 __reg_irls_ok AS (
     SELECT coalesce(
-             (SELECT move < tol AND list_aggregate(
+             (SELECT move < tol AND proposed_move < tol AND list_aggregate(
                         list_transform(betas, lambda v: coalesce(isfinite(v) AND abs(v) < 1e100, false)),
                         'bool_and')
               FROM __reg_irls_beta),
@@ -2632,7 +2639,7 @@ CREATE OR REPLACE MACRO __reg_norm_q(a) AS (          -- upper tail P(Z>a), a>=0
   END
 );
 CREATE OR REPLACE MACRO norm_cdf(z) AS (
-  CASE WHEN z >= 0.0 THEN 1.0 - __reg_norm_q(z::DOUBLE) ELSE __reg_norm_q((-z)::DOUBLE) END
+  CASE WHEN z::DOUBLE >= 0.0 THEN 1.0 - __reg_norm_q(z::DOUBLE) ELSE __reg_norm_q(-(z::DOUBLE)) END
 );
 CREATE OR REPLACE MACRO __reg_acklam_tail(q) AS (
   (((((-7.784894002430293e-03*q-3.223964580411365e-01)*q-2.400758277161838e+00)*q

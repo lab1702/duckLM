@@ -256,6 +256,21 @@ def test_zero_weight_outlier_does_not_limit_irls_steps(con,family):
     assert dict(con.execute(call).fetchall())==pytest.approx(expected,rel=1e-10,abs=1e-10)
 
 
+@pytest.mark.parametrize('solver', ['auto', 'irls'])
+def test_irls_damping_does_not_false_converge_with_tiny_weight_outlier(con, solver):
+    con.execute('CREATE OR REPLACE TABLE tiny_weight(x DOUBLE,y DOUBLE,w DOUBLE)')
+    rows = [(-1, 0, 1)] * 3 + [(-1, 1, 1)] + [(1, 1, 1)] * 3 + [(1, 0, 1)]
+    con.executemany('INSERT INTO tiny_weight VALUES (?,?,?)', rows + [(1e100, 1, 1e-250)])
+    call = f"SELECT * FROM logit_fit('tiny_weight','y',weights_col:='w',solver:='{solver}')"
+    if solver == 'irls':
+        with pytest.raises(duckdb.Error, match='irls solver did not converge'):
+            con.execute(call).fetchall()
+    else:
+        coefficients = dict(con.execute(call).fetchall())
+        assert coefficients['x'] == pytest.approx(np.log(3), rel=1e-7)
+        assert coefficients['(Intercept)'] == pytest.approx(0, abs=1e-8)
+
+
 @pytest.mark.parametrize('family', ['linreg', 'logit', 'poisson', 'gamma', 'tweedie', 'nbinom'])
 @pytest.mark.parametrize('weight', ['NaN', 'Infinity', '-Infinity'])
 def test_fit_rejects_nonfinite_sample_weights(con, family, weight):
