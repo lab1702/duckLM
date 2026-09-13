@@ -2155,6 +2155,13 @@ __reg_cv_cfg AS (
          f.d + 1 AS D1, ma.M AS M
   FROM __reg_cv_feats f, __reg_cv_marr ma, __reg_cv_chk chk WHERE chk.ok
 ),
+-- Preserve packed row order while reusing the design columns across models
+-- and IRLS iterations. Do not materialize an n-by-d-by-d outer product.
+__reg_cv_columns AS MATERIALIZED (
+  SELECT list_transform(range(1, c.D1 + 1), lambda j:
+           list_transform(p.rows, lambda rw: rw.xs[j])) AS xcols
+  FROM __reg_cv_packed p, __reg_cv_cfg c
+),
 -- IRLS / Fisher scoring for all M models at once -- the cross-validation
 -- counterpart of __reg_fit's irls branch. Each iteration solves the penalised
 -- normal equations B_m <- (X'W X + n_m*l2_m*D)^-1 X'W z per model, reaching the
@@ -2196,60 +2203,79 @@ __reg_cv_irls(it, B, move) AS (
                          CASE WHEN a = b AND a > 1 THEN v + mntrain[m] * ml2[m] ELSE v END))) AS XWXpen
       FROM (
         SELECT it, B, M, D1, mntrain, ml2, ml1,
-               list_transform(range(1, M + 1), lambda m:
-                   list_transform(range(1, D1 + 1), lambda a:
-                       list_transform(range(1, D1 + 1), lambda b:
-                           list_sum(list_transform(res, lambda ob:
-                               ob.wirls[m] * ob.xs[a] * ob.xs[b]))))) AS XWX,
-               list_transform(range(1, M + 1), lambda m:
-                   list_transform(range(1, D1 + 1), lambda a:
-                       list_sum(list_transform(res, lambda ob: ob.wr[m] * ob.xs[a])))) AS XWr
+               -- NULL-bearing vectors retain list_sum semantics for failed
+               -- models; list_dot_product rejects NULL elements. Sanitize its
+               -- arguments too: nested lambdas may evaluate an unused branch.
+               list_transform(products, lambda prod:
+                 CASE WHEN prod.wok THEN
+                   list_transform(prod.wx, lambda wx:
+                     list_transform(xcols, lambda xc: list_dot_product(list_transform(wx, lambda v: coalesce(v,0.0)), xc)))
+                 ELSE
+                   list_transform(prod.wx, lambda wx:
+                     list_transform(xcols, lambda xc:
+                       list_sum(list_transform(list_zip(wx, xc), lambda pair: pair[1] * pair[2])))) END) AS XWX,
+               list_transform(products, lambda prod:
+                 CASE WHEN prod.rok THEN
+                   list_transform(xcols, lambda xc: list_dot_product(list_transform(prod.wr, lambda v: coalesce(v,0.0)), xc))
+                 ELSE
+                   list_transform(xcols, lambda xc:
+                     list_sum(list_transform(list_zip(prod.wr, xc), lambda pair: pair[1] * pair[2]))) END) AS XWr
         FROM (
-          -- per row and model: expected-information weight and working response,
-          -- both zeroed on the rows held out of that model's training folds
-          SELECT it, B, M, D1, mntrain, ml2, ml1,
-                 list_transform(lps, lambda e: struct_pack(
-                   xs := e.xs,
-                   wirls := list_transform(e.lp, lambda l, m:
-                     CASE WHEN mfold[m] = e.fold THEN 0.0 ELSE
-                       (CASE family
-                          WHEN 'logistic' THEN (1.0/(1.0+exp(-greatest(least(l,700.0),-700.0))))
-                                             * (1.0 - 1.0/(1.0+exp(-greatest(least(l,700.0),-700.0))))
-                          WHEN 'linear'   THEN 1.0
-                          WHEN 'poisson'  THEN exp(greatest(least(l,700.0),-700.0))
-                          WHEN 'gamma'    THEN 1.0
-                          WHEN 'tweedie'  THEN exp((2.0-mpow[m])*l)
-                          WHEN 'nbinom'   THEN __reg_nb_fit_info(greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
-                        END) END),
-                   wr := list_transform(e.lp, lambda l, m:
-                     CASE WHEN mfold[m] = e.fold THEN 0.0 ELSE
-                       (CASE family
-                          WHEN 'logistic' THEN (1.0/(1.0+exp(-greatest(least(l,700.0),-700.0))))
-                                             * (1.0 - 1.0/(1.0+exp(-greatest(least(l,700.0),-700.0))))
-                          WHEN 'linear'   THEN 1.0
-                          WHEN 'poisson'  THEN exp(greatest(least(l,700.0),-700.0))
-                          WHEN 'gamma'    THEN 1.0
-                          WHEN 'tweedie'  THEN exp((2.0-mpow[m])*l)
-                          WHEN 'nbinom'   THEN __reg_nb_fit_info(greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
-                        END) * l
-                     + (CASE family
-                          WHEN 'gamma'    THEN __reg_exp_scale(e.yt,-l) - 1.0
-                          WHEN 'tweedie'  THEN __reg_weighted_tw_score(e.yt,1.0,l,mpow[m])
-                          WHEN 'nbinom'   THEN __reg_nb_fit_score(e.yt,greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
-                          WHEN 'logistic' THEN e.yt - 1.0/(1.0+exp(-greatest(least(l,700.0),-700.0)))
-                          WHEN 'linear'   THEN e.yt - l
-                          WHEN 'poisson'  THEN e.yt - exp(greatest(least(l,700.0),-700.0))
-                        END) END)
-                 )) AS res
+          -- Multiply each design column by its model weights once, preserving
+          -- (weight * x_a) * x_b and the original row order in the sums.
+          SELECT *, list_transform(range(1, M + 1), lambda m: struct_pack(
+            wx := list_transform(range(1, D1 + 1), lambda a:
+              list_transform(res, lambda ob: ob.wirls[m] * ob.xs[a])),
+            wr := list_transform(res, lambda ob: ob.wr[m]),
+            wok := list_aggregate(list_transform(res, lambda ob: ob.wirls[m] IS NOT NULL), 'bool_and'),
+            rok := list_aggregate(list_transform(res, lambda ob: ob.wr[m] IS NOT NULL), 'bool_and'))) AS products
           FROM (
-            SELECT g.it, g.B, c.M, c.D1, ma.mfold, ma.ml2, ma.ml1, ma.mntrain, ma.mpow, ma.mlogalp_int,
-                   -- one dot product per (row, model); mu is derived from it below
-                   list_transform(p.rows, lambda rw: struct_pack(
-                       xs := rw.xs, yt := rw.yt, fold := rw.fold,
-                       lp := list_transform(g.B, lambda bm, m: list_dot_product(rw.xs, bm)))) AS lps
-            FROM __reg_cv_irls g, __reg_cv_packed p, __reg_cv_cfg c, __reg_cv_marr ma
-            WHERE g.it < max_iter AND g.move >= tol AND isfinite(g.move)
-          )
+            -- per row and model: expected-information weight and working response,
+            -- both zeroed on the rows held out of that model's training folds
+            SELECT it, B, M, D1, mntrain, ml2, ml1,
+                   list_transform(lps, lambda e: struct_pack(
+                     xs := e.xs,
+                     wirls := list_transform(e.lp, lambda l, m:
+                       CASE WHEN mfold[m] = e.fold THEN 0.0 ELSE
+                         (CASE family
+                            WHEN 'logistic' THEN (1.0/(1.0+exp(-greatest(least(l,700.0),-700.0))))
+                                               * (1.0 - 1.0/(1.0+exp(-greatest(least(l,700.0),-700.0))))
+                            WHEN 'linear'   THEN 1.0
+                            WHEN 'poisson'  THEN exp(greatest(least(l,700.0),-700.0))
+                            WHEN 'gamma'    THEN 1.0
+                            WHEN 'tweedie'  THEN exp((2.0-mpow[m])*l)
+                            WHEN 'nbinom'   THEN __reg_nb_fit_info(greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
+                          END) END),
+                     wr := list_transform(e.lp, lambda l, m:
+                       CASE WHEN mfold[m] = e.fold THEN 0.0 ELSE
+                         (CASE family
+                            WHEN 'logistic' THEN (1.0/(1.0+exp(-greatest(least(l,700.0),-700.0))))
+                                               * (1.0 - 1.0/(1.0+exp(-greatest(least(l,700.0),-700.0))))
+                            WHEN 'linear'   THEN 1.0
+                            WHEN 'poisson'  THEN exp(greatest(least(l,700.0),-700.0))
+                            WHEN 'gamma'    THEN 1.0
+                            WHEN 'tweedie'  THEN exp((2.0-mpow[m])*l)
+                            WHEN 'nbinom'   THEN __reg_nb_fit_info(greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
+                          END) * l
+                       + (CASE family
+                            WHEN 'gamma'    THEN __reg_exp_scale(e.yt,-l) - 1.0
+                            WHEN 'tweedie'  THEN __reg_weighted_tw_score(e.yt,1.0,l,mpow[m])
+                            WHEN 'nbinom'   THEN __reg_nb_fit_score(e.yt,greatest(least(l,700.0),-700.0),mlogalp_int[m],ml1[m]=0 AND ml2[m]=0)
+                            WHEN 'logistic' THEN e.yt - 1.0/(1.0+exp(-greatest(least(l,700.0),-700.0)))
+                            WHEN 'linear'   THEN e.yt - l
+                            WHEN 'poisson'  THEN e.yt - exp(greatest(least(l,700.0),-700.0))
+                          END) END)
+                   )) AS res
+            FROM (
+              SELECT g.it, g.B, c.M, c.D1, ma.mfold, ma.ml2, ma.ml1, ma.mntrain, ma.mpow, ma.mlogalp_int,
+                     -- one dot product per (row, model); mu is derived from it below
+                     list_transform(p.rows, lambda rw: struct_pack(
+                         xs := rw.xs, yt := rw.yt, fold := rw.fold,
+                         lp := list_transform(g.B, lambda bm, m: list_dot_product(rw.xs, bm)))) AS lps
+              FROM __reg_cv_irls g, __reg_cv_packed p, __reg_cv_cfg c, __reg_cv_marr ma
+              WHERE g.it < max_iter AND g.move >= tol AND isfinite(g.move)
+            )
+          ) CROSS JOIN __reg_cv_columns
         )
       )
     )

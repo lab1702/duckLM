@@ -69,6 +69,16 @@ offsets and incomplete rows, and intervals on separate scoring data. Use
 and spill measurements. It reuses helpers from the evaluation and summary
 benchmarks; the same timing and memory caveats apply.
 
+For cross-validation, run `.venv/bin/python benchmarks/benchmark_cv.py --baseline
+/path/to/previous_regression_macros.sql` (as one command). This compares all six
+families, L1/L2 and power/dispersion sweeps, refinement, wider designs and grids,
+incomplete rows, and singular fallbacks. It checks scores and selected parameters;
+for unrefined grids it also checks internal coefficients, solver choice, and
+iteration counts through a benchmark-only diagnostic macro. Use `--output
+/tmp/cv.json` to retain detailed timing, buffer-memory, and spill measurements.
+Run without competing CPU-heavy jobs; memory includes resident inputs and
+diagnostic-query high-water marks.
+
 ## SQL smoke test — `smoke.sql`
 
 No Python required — just the DuckDB CLI. Fits each family on deterministic
