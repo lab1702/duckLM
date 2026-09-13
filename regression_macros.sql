@@ -2958,13 +2958,14 @@ CREATE OR REPLACE MACRO __reg_logit_pearson(y, eta, root_weight := 1.0) AS (
        WHEN y = 1 THEN exp(-eta/2.0+ln(root_weight)) WHEN y = 0 THEN -exp(eta/2.0+ln(root_weight))
        ELSE __reg_mul_div(root_weight,__reg_logit_resid(y,eta),sqrt(__reg_logit_var(eta))) END
 );
-CREATE OR REPLACE MACRO __reg_logit_devres(y, eta) AS (
-  CASE WHEN (y = 1 AND eta >= 0) OR (y = 0 AND eta <= 0)
-       THEN (2*y-1)*sqrt(2.0)*exp(-abs(eta)/2.0)
+CREATE OR REPLACE MACRO __reg_logit_devres(y, eta, root_weight := 1.0) AS (
+  CASE WHEN root_weight=0 THEN 0.0
+       WHEN (y = 1 AND eta >= 0) OR (y = 0 AND eta <= 0)
+       THEN (2*y-1)*sqrt(2.0)*exp(ln(root_weight)-abs(eta)/2.0)
             * CASE WHEN abs(eta) > 30 THEN 1.0
                    ELSE sqrt(__reg_log1p(exp(-abs(eta)))/exp(-abs(eta))) END
-       ELSE sign(__reg_logit_resid(y,eta))*sqrt(2.0)*sqrt(
-            y*greatest(-eta,0.0)+(1-y)*greatest(eta,0.0)+__reg_log1p(exp(-abs(eta)))) END
+       ELSE __reg_mul_div(root_weight,sign(__reg_logit_resid(y,eta))*sqrt(2.0)*sqrt(
+            y*greatest(-eta,0.0)+(1-y)*greatest(eta,0.0)+__reg_log1p(exp(-abs(eta)))),1.0) END
 );
 
 -- Retain information scales in logs until they are combined with sample
@@ -3964,7 +3965,7 @@ __reg_diag AS (
               WHEN family = 'tweedie' THEN __reg_tw_pearson(p.y,p.eta,power,p.sw)
               WHEN family = 'linear' THEN p.resid
               ELSE __reg_mul_div(p.sw,p.resid,sqrt(p.Vmu)) END AS pearson_resid,
-         CASE WHEN family = 'logistic' THEN p.sw*__reg_logit_devres(p.y,p.eta)
+         CASE WHEN family = 'logistic' THEN __reg_logit_devres(p.y,p.eta,p.sw*sqrt(ws.wscale))
               WHEN family = 'linear' THEN p.resid
               WHEN family IN ('poisson','gamma','tweedie')
                 THEN (CASE WHEN p.y=0 THEN -1.0 ELSE sign(ln(p.y)-p.eta) END)
@@ -3988,7 +3989,7 @@ SELECT n.* EXCLUDE (__reg_rid__), d.hat,
        __reg_mul_div(d.pearson_resid*(CASE WHEN family IN ('logistic','poisson','nbinom') THEN 1.0 ELSE sqrt(ws.wscale) END),
          (SELECT CASE WHEN family='tweedie' THEN exp((1.0-power/2.0)*shift) ELSE runit END
           FROM __reg_resunits CROSS JOIN __reg_responseunits),1.0) AS pearson_resid,
-       __reg_mul_div(d.deviance_resid*(CASE WHEN family IN ('poisson','gamma','tweedie') THEN 1.0 ELSE sqrt(ws.wscale) END),
+       __reg_mul_div(d.deviance_resid*(CASE WHEN family IN ('logistic','poisson','gamma','tweedie') THEN 1.0 ELSE sqrt(ws.wscale) END),
          (SELECT CASE WHEN family='tweedie' THEN exp((1.0-power/2.0)*shift) ELSE runit END
           FROM __reg_resunits CROSS JOIN __reg_responseunits),1.0) AS deviance_resid,
        d.std_resid AS std_resid,

@@ -1535,3 +1535,18 @@ def test_translated_multinomial_summary_matches_centered_information(con):
                                             ('x', coefficients[k, 1] if k < 2 else 0.)]])
     actual = con.execute("SELECT std_error FROM multinom_summary('translated_model','translated','y') ORDER BY class,feature").fetchnumpy()['std_error']
     np.testing.assert_allclose(actual, expected, rtol=1e-9)
+
+
+@pytest.mark.parametrize('sign', [-1, 1])
+@pytest.mark.parametrize('eta,weight', [(1500.,1e308), (1600.,1e200), (1450.,1e-100)])
+def test_logistic_deviance_combines_weights_before_tail_underflow(con, sign, eta, weight):
+    from decimal import Decimal, localcontext
+    con.execute("CREATE TABLE tail_model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient", [sign*eta])
+    con.execute('CREATE TABLE tail_rows AS SELECT ?::DOUBLE y,?::DOUBLE w FROM range(3)', [(sign+1)/2, weight])
+    with localcontext() as context:
+        context.prec = 800
+        tail = (-Decimal.from_float(eta)).exp()
+        expected = sign*float((2*Decimal.from_float(weight)*(1+tail).ln()).sqrt())
+    actual = con.execute("SELECT deviance_resid FROM logit_influence('tail_model','tail_rows','y',weights_col:='w')").fetchall()
+    for row in actual:
+        assert row[0] == pytest.approx(expected, rel=1e-12, abs=5e-324)
