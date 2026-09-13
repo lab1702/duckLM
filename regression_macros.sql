@@ -673,18 +673,32 @@ __reg_cfg AS (
     FROM __reg_feats f, __reg_packed p, __reg_ycheck y, __reg_namecheck nc
     WHERE y.ok AND nc.ok
 ),
+-- Extreme Poisson offsets can overflow even a root-weighted initial mean.
+-- Compute an intercept-only starting point using log-sum-exp in that case.
+__reg_poisson_seed AS (
+    SELECT max(log_root_mean) AS max_log_root_mean,
+           ln(sum(sw*wy))-max(log_mean_max)-ln(sum(exp(log_mean-log_mean_max))) AS intercept
+    FROM (
+      SELECT r.sw AS sw,r.wy AS wy,ln(r.sw)+r.o AS log_root_mean,
+             2.0*ln(r.sw)+r.o AS log_mean,
+             max(2.0*ln(r.sw)+r.o) OVER () AS log_mean_max
+      FROM __reg_packed,unnest(rows) t(r) WHERE family='poisson'
+    )
+),
 -- Gamma's (also Tweedie power=2) initial weighted y/mean can overflow before damping is
 -- possible. In that case start above every log response/offset ratio, making
 -- all response/mean ratios at most one. Ordinary starts remain unchanged.
 __reg_seed AS (
     SELECT list_transform(range(f.d+1),lambda i:
-      CASE WHEN (family='gamma' OR (family='tweedie' AND power=2.0)) AND i=0 AND max_logscore>700.0
-           THEN intercept ELSE 0.0::DOUBLE END) AS betas
+      CASE WHEN family='poisson' AND i=0 AND ps.max_log_root_mean>700.0
+           THEN ps.intercept
+           WHEN (family='gamma' OR (family='tweedie' AND power=2.0)) AND i=0 AND max_logscore>700.0
+           THEN gs.intercept ELSE 0.0::DOUBLE END) AS betas
     FROM __reg_feats f CROSS JOIN (
       SELECT max(ln(nullif(abs(r.wy),0.0))-r.o) AS max_logscore,
              max(ln(nullif(abs(r.wy),0.0))-ln(nullif(r.sw,0.0))-r.o) AS intercept
       FROM __reg_packed, unnest(rows) t(r) WHERE family='gamma' OR (family='tweedie' AND power=2.0)
-    )
+    ) gs CROSS JOIN __reg_poisson_seed ps
 ),
 -- IRLS / Fisher scoring (solver := 'irls'): each iteration solves the weighted
 -- least squares beta <- (X'WX + sumw*l2*D)^-1 X'W z on the standardized data,
@@ -741,17 +755,24 @@ __reg_irls(it, betas, move, proposed_move) AS (
                     FROM (
                         -- Features already carry sqrt(w): keep the information factor
                         -- unweighted, and multiply the working RHS by sqrt(w).
+                        -- Poisson absorbs sqrt(mu) into both coordinates and RHS
+                        -- before multiplication, retaining finite weighted information.
                         SELECT it, betas, sumw,
                                list_transform(mus, lambda e: struct_pack(
-                                   xs := e.xs,
+                                   xs := CASE WHEN family='poisson'
+                                              THEN list_transform(e.xs,lambda v: __reg_exp_scale(v,e.eta/2.0))
+                                              ELSE e.xs END,
                                    wirls := (CASE family
                                               WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
                                               WHEN 'linear'   THEN 1.0
-                                              WHEN 'poisson'  THEN e.mu
+                                              WHEN 'poisson'  THEN 1.0
                                               WHEN 'gamma'    THEN 1.0
                                               WHEN 'tweedie'  THEN exp((2.0-power)*e.eta)
                                               WHEN 'nbinom'   THEN __reg_nb_fit_info(ln(e.mu),log_alpha_int,l1=0 AND l2=0) END),
-                                   wr := (CASE family
+                                   wr := CASE WHEN family='poisson'
+                                              THEN __reg_exp_scale(e.linpred,e.eta/2.0)
+                                                 + __reg_exp_scale(__reg_weighted_tw_score(e.wy,e.w,e.eta,1.0),-e.eta/2.0)
+                                              ELSE (CASE family
                                               WHEN 'logistic' THEN e.mu * (1.0 - e.mu)
                                               WHEN 'linear'   THEN 1.0
                                               WHEN 'poisson'  THEN e.mu
@@ -759,9 +780,9 @@ __reg_irls(it, betas, move, proposed_move) AS (
                                               WHEN 'tweedie'  THEN exp((2.0-power)*e.eta)
                                               WHEN 'nbinom'   THEN __reg_nb_fit_info(ln(e.mu),log_alpha_int,l1=0 AND l2=0) END) * e.linpred
                                          + __reg_weighted_fit_score(e.wy,e.w,
-                                             CASE WHEN family IN ('linear','logistic','gamma','tweedie') THEN e.eta ELSE ln(e.mu) END,
+                                             CASE WHEN family IN ('linear','logistic','poisson','gamma','tweedie') THEN e.eta ELSE ln(e.mu) END,
                                              family,power,log_alpha_int,l1=0 AND l2=0)
-                                   )) AS res
+                                   END)) AS res
                         FROM (
                             SELECT g.it, g.betas, p.sumw, c.log_alpha_int AS log_alpha_int,
                                    list_transform(p.rows, lambda rw: struct_pack(
@@ -771,6 +792,7 @@ __reg_irls(it, betas, move, proposed_move) AS (
                                        mu := CASE family
                                                WHEN 'logistic' THEN 1.0 / (1.0 + exp(-greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o, 700.0), -700.0)))
                                                WHEN 'linear'   THEN __reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o
+                                               WHEN 'poisson'  THEN exp(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o)
                                                ELSE exp(greatest(least(__reg_fit_dot(rw.xs,rw.wxs,rw.sw,g.betas) + rw.o, 700.0), -700.0)) END
                                        )) AS mus
                             FROM __reg_irls g, __reg_packed p, __reg_cfg c
@@ -1260,7 +1282,7 @@ CREATE OR REPLACE MACRO __reg_weighted_fit_score(wy, sw, eta, family, power, log
     CASE family
       WHEN 'linear' THEN wy-sw*eta
       WHEN 'logistic' THEN wy-sw*__reg_sigmoid(eta)
-      WHEN 'poisson' THEN wy-sw*exp(least(eta,700.0))
+      WHEN 'poisson' THEN __reg_weighted_tw_score(wy,sw,eta,1.0)
       WHEN 'gamma' THEN __reg_exp_scale(wy,-eta)-sw
       WHEN 'tweedie' THEN __reg_weighted_tw_score(wy,sw,eta,power)
       WHEN 'nbinom' THEN CASE WHEN eta >= 0
@@ -1271,7 +1293,7 @@ CREATE OR REPLACE MACRO __reg_weighted_fit_score(wy, sw, eta, family, power, log
 CREATE OR REPLACE MACRO __reg_weighted_fit_observed(wy, sw, eta, family, power, logalpha, unpenalized) AS (
   list_transform([exp(greatest(least(eta,700.0),-700.0))], lambda mu:
     CASE family
-      WHEN 'poisson' THEN sw*exp(least(eta,700.0))
+      WHEN 'poisson' THEN __reg_exp_scale(sw,eta)
       WHEN 'gamma' THEN __reg_exp_scale(wy,-eta)
       WHEN 'tweedie' THEN __reg_weighted_tw_observed(wy,sw,eta,power)
       WHEN 'nbinom' THEN exp(__reg_nb_fit_shift(logalpha,unpenalized)+least(eta,700.0)+ln(sw)
@@ -3252,8 +3274,8 @@ SELECT feature, coefficient, __reg_exp_scale(scaled_std_error,ln(ru.runit)+score
        CASE WHEN std_error IS NULL THEN NULL
             WHEN uset THEN 2.0 * __reg_t_sf(abs(coefficient / std_error), df)
             ELSE 2.0 * norm_cdf(-abs(coefficient / std_error)) END AS p_value,
-       coefficient - crit * std_error AS conf_low,
-       coefficient + crit * std_error AS conf_high
+       CASE WHEN std_error IS NOT NULL THEN __reg_dot([coefficient,-crit],[1.0,std_error]) END AS conf_low,
+       CASE WHEN std_error IS NOT NULL THEN __reg_dot([coefficient,crit],[1.0,std_error]) END AS conf_high
 FROM __reg_percoef CROSS JOIN __reg_resunits ru CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok ORDER BY i;
 
 CREATE OR REPLACE MACRO logit_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL, robust := 'none', cluster_col := NULL) AS TABLE
@@ -3491,7 +3513,7 @@ __reg_scoords AS (
   -- Combine response and feature units before forming large extrapolation
   -- coordinates, including absolute information weights; the interval standard
   -- error then already has response units without a compensating late division.
-  SELECT sf.*, list_transform(sf.xs, lambda v,a: __reg_exp_scale(v,ln(ru.runit)+ln(pu.unit)-ln(cp.se_weight_scale)-cp.units[a])/cp.dsc[a]) AS zs
+  SELECT sf.*, list_transform(sf.xs, lambda v,a: __reg_exp_scale(v,ln(ru.runit)+ln(pu.unit)-ln(cp.se_weight_scale)-cp.units[a]-ln(cp.dsc[a]))) AS zs
   FROM __reg_sfeat sf CROSS JOIN __reg_cparams cp CROSS JOIN __reg_resunits ru CROSS JOIN __reg_punits pu
 ),
 __reg_sdesign AS (

@@ -1410,3 +1410,20 @@ def test_logistic_intervals_combine_extrapolation_and_absolute_weight_scales(con
     con.execute('CREATE TABLE interval_logit_new AS SELECT 1e200::DOUBLE x')
     low,high = con.execute("SELECT conf_low,conf_high FROM logit_predict_ci('interval_logit_model','interval_logit_rows','y',newdata:='interval_logit_new',weights_col:='w')").fetchone()
     assert (low,high) == (0.,1.)
+
+
+@pytest.mark.parametrize('sign', [-1, 1])
+@pytest.mark.parametrize('outcomes', [[0., 1.5, 1.5], [-1., 1.5, 1.5, 1.5, 1.5]])
+def test_linear_intervals_preserve_finite_endpoints_near_double_limit(con, sign, outcomes):
+    from scipy.stats import t
+    con.execute("CREATE TABLE large_ci_model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient", [sign*1e308])
+    con.execute('CREATE TABLE large_ci_data(y DOUBLE)')
+    con.executemany('INSERT INTO large_ci_data VALUES (?)', [(sign*y*1e308,) for y in outcomes])
+    standard_error, low, high = con.execute("SELECT std_error,conf_low,conf_high FROM linreg_summary('large_ci_model','large_ci_data','y')").fetchone()
+    assert standard_error == pytest.approx(5e307, rel=1e-12)
+    critical = t.ppf(.975, len(outcomes)-1)
+    expected = sign*(1-critical*.5)*1e308
+    assert (low if sign>0 else high) == pytest.approx(expected, rel=1e-12)
+    intervals = con.execute("SELECT conf_low,conf_high FROM linreg_predict_ci('large_ci_model','large_ci_data','y')").fetchall()
+    for pred_low, pred_high in intervals:
+        assert (pred_low if sign>0 else pred_high) == pytest.approx(expected, rel=1e-12)

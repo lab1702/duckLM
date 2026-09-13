@@ -329,3 +329,17 @@ def test_tweedie_fit_retains_extreme_offset_scores(con, solver, power):
     rows = con.execute("SELECT y,prediction FROM tweedie_predict('tweedie_tail_model','tweedie_tail',offset_col:='o')").fetchall()
     for actual, prediction in rows:
         assert prediction == pytest.approx(actual,rel=1e-6,abs=0)
+
+
+@pytest.mark.parametrize('solver', ['auto', 'gd', 'irls'])
+def test_poisson_fit_preserves_large_internal_means_with_tiny_weights(con, solver):
+    con.execute('CREATE OR REPLACE TABLE poisson_weighted_tail(x DOUBLE,y DOUBLE,w DOUBLE,o DOUBLE)')
+    con.executemany('INSERT INTO poisson_weighted_tail VALUES (?,?,?,?)', [
+        (-1, 1e-300, 1, np.log(1e-300)), (1, 1e-300, 1, np.log(1e-300)),
+        (0, 1e300, 1e-320, np.log(1e300))])
+    con.execute(f"CREATE OR REPLACE TABLE poisson_tail_model AS SELECT * FROM poisson_fit('poisson_weighted_tail','y',weights_col:='w',offset_col:='o',solver:='{solver}')")
+    beta = con.execute('SELECT coefficient FROM poisson_tail_model').fetchnumpy()['coefficient']
+    np.testing.assert_allclose(beta, [0, 0], atol=1e-9)
+    rows = con.execute("SELECT y,prediction FROM poisson_predict('poisson_tail_model','poisson_weighted_tail',offset_col:='o')").fetchall()
+    for actual, prediction in rows:
+        assert prediction == pytest.approx(actual, rel=1e-9, abs=0)
