@@ -3069,6 +3069,13 @@ __reg_rows0 AS (
   FROM __reg_rowsraw r CROSS JOIN __reg_weightcheck wc
        CROSS JOIN __reg_weightscale ws CROSS JOIN __reg_beta beta WHERE wc.ok
 ),
+-- Compute the predictor once after zero-weight rows have been made harmless.
+-- Reusing this column avoids expanding the numerically guarded dot product in
+-- response/residual units, every information coordinate, and the weighted rows.
+__reg_scored AS MATERIALIZED (
+  SELECT __reg_rid__, xs, y, wt, sw,
+         __reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0
+),
 -- A common Tweedie response unit cancels from coefficient uncertainty and
 -- standardized diagnostics. Remove extreme units before information powers
 -- or Pearson squares overflow; restore raw diagnostic residual units at output.
@@ -3076,26 +3083,26 @@ __reg_responseunits AS (
   SELECT CASE WHEN family='tweedie' AND isfinite(anchor) AND abs((2.0-power)*anchor)>600.0
               THEN anchor ELSE 0.0 END AS shift
   FROM (SELECT arg_min(eta,struct_pack(weight := -sw,magnitude := abs(eta),value := eta)) FILTER (WHERE sw>0) AS anchor
-        FROM (SELECT sw,__reg_dot(xs || [off],bvec || [1.0]) AS eta FROM __reg_rows0))
+        FROM __reg_scored)
 ),
 -- Linear uncertainty is accumulated in root-weighted residual units and restored only
 -- after square roots. This preserves small/large finite response scales.
 __reg_resunits AS (
   SELECT CASE WHEN family = 'linear'
-              THEN coalesce(nullif(max(sw*__reg_center_scale(y,__reg_dot(xs || [off],bvec || [1.0])))
+              THEN coalesce(nullif(max(sw*__reg_center_scale(y,eta))
                                    FILTER (WHERE sw > 0),0.0),1.0)
               ELSE 1.0 END AS runit
-  FROM __reg_rows0
+  FROM __reg_scored
 ),
 -- Joint root-information/feature scales, stored in logs so even a scale
 -- outside DOUBLE range can cancel before coordinates or standard errors form.
 __reg_xunits AS (
   SELECT list(logunit ORDER BY i) AS units
   FROM (SELECT ix.i, coalesce(nullif(max(ln(nullif(abs(r.xs[ix.i]),0.0))+ln(nullif(r.sw,0.0))
-                   +0.5*__reg_log_info(__reg_dot(r.xs || [r.off],r.bvec || [1.0])-tu.shift,family,power,alpha))
+                   +0.5*__reg_log_info(r.eta-tu.shift,family,power,alpha))
                    FILTER (WHERE r.sw>0 AND r.xs[ix.i]!=0),'-Infinity'::DOUBLE),0.0) AS logunit
         FROM range(1,(SELECT k FROM __reg_beta)+2) ix(i)
-        LEFT JOIN __reg_rows0 r ON true CROSS JOIN __reg_responseunits tu GROUP BY ix.i)
+        LEFT JOIN __reg_scored r ON true CROSS JOIN __reg_responseunits tu GROUP BY ix.i)
 ),
 __reg_rww AS (
   SELECT r.__reg_rid__, list_transform(r.xs, lambda v,j: __reg_exp_scale(v,ln(nullif(r.sw,0.0))+0.5*__reg_log_info(r.eta,family,power,alpha)-u.units[j])) AS xs,
@@ -3112,9 +3119,8 @@ __reg_rww AS (
               __reg_logit_score_coord(v,r.sw,r.y,r.eta,u.units[j])) END AS logit_scores
   FROM (SELECT *, CASE family WHEN 'logistic' THEN 1.0/(1.0+exp(-greatest(-700.0,least(eta,700.0))))
                              WHEN 'linear' THEN eta ELSE exp(eta) END AS mu
-        FROM (SELECT r.* REPLACE (__reg_response_scale(y,tu.shift) AS y),
-                     __reg_dot(xs || [off],bvec || [1.0])-tu.shift AS eta
-              FROM __reg_rows0 r CROSS JOIN __reg_responseunits tu)) r
+        FROM (SELECT r.* REPLACE (__reg_response_scale(y,tu.shift) AS y, r.eta-tu.shift AS eta)
+              FROM __reg_scored r CROSS JOIN __reg_responseunits tu)) r
   CROSS JOIN __reg_xunits u CROSS JOIN __reg_resunits ru
 ),
 -- Retain a root residual unit: its square may overflow while the SE is finite.
@@ -3315,15 +3321,22 @@ __reg_percoef AS (
                      THEN sqrt(phi * Rinv[gs.i][gs.i]) / dsc[gs.i] / (CASE WHEN est THEN 1.0 ELSE sqrt(wscale) END) ELSE NULL END
          END AS scaled_std_error
   FROM __reg_final, unnest(range(1, len(bvec)+1)) AS gs(i)
+),
+-- Bind the standard error before passing it through the tail/interval macros.
+-- Reusing a SELECT-list alias there expands its expression during binding.
+__reg_outputbase AS (
+  SELECT i, feature, coefficient, uset, df, crit,
+         __reg_exp_scale(scaled_std_error,ln(ru.runit)+score_logunit-feature_logunit) AS std_error
+  FROM __reg_percoef CROSS JOIN __reg_resunits ru CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok
 )
-SELECT feature, coefficient, __reg_exp_scale(scaled_std_error,ln(ru.runit)+score_logunit-feature_logunit) AS std_error,
+SELECT feature, coefficient, std_error,
        coefficient / std_error AS statistic,
        CASE WHEN std_error IS NULL THEN NULL
             WHEN uset THEN 2.0 * __reg_t_sf(abs(coefficient / std_error), df)
             ELSE 2.0 * norm_cdf(-abs(coefficient / std_error)) END AS p_value,
        CASE WHEN std_error IS NOT NULL THEN __reg_dot([coefficient,-crit],[1.0,std_error]) END AS conf_low,
        CASE WHEN std_error IS NOT NULL THEN __reg_dot([coefficient,crit],[1.0,std_error]) END AS conf_high
-FROM __reg_percoef CROSS JOIN __reg_resunits ru CROSS JOIN __reg_inputcheck WHERE __reg_inputcheck.ok ORDER BY i;
+FROM __reg_outputbase ORDER BY i;
 
 CREATE OR REPLACE MACRO logit_summary(model, tbl, outcome, conf_level := 0.95, offset_col := NULL, weights_col := NULL, robust := 'none', cluster_col := NULL) AS TABLE
 SELECT * FROM __reg_summary(model, tbl, outcome, 'logistic', 'logit_summary', conf_level, offset_col, weights_col, NULL, NULL, robust, cluster_col);

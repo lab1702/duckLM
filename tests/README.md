@@ -53,6 +53,14 @@ timings and DuckDB's buffer-memory/spill measurements. Run it without concurrent
 CPU-heavy jobs; memory measurements include resident inputs and may retain
 connection high-water marks.
 
+For coefficient summaries, run `.venv/bin/python benchmarks/benchmark_summary.py
+--baseline /path/to/previous_regression_macros.sql` (as one command). This checks
+all six single-outcome families, linear row/feature scaling, and weighted HC3 and
+cluster summaries with offsets. Detailed `EXPLAIN ANALYZE` profiles separate
+binding, optimization, and total latency. Use `--output /tmp/summary.json` to
+retain measurements, including buffer memory and spill; the same timing and
+memory caveats above apply. The script reuses setup from `benchmark_evaluate.py`.
+
 ## SQL smoke test — `smoke.sql`
 
 No Python required — just the DuckDB CLI. Fits each family on deterministic
