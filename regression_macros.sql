@@ -227,9 +227,9 @@ CREATE OR REPLACE MACRO __reg_center_scale(v, mu) AS (
 );
 CREATE OR REPLACE MACRO __reg_mul_div(a, b, c) AS (
   CASE WHEN a = 0 OR b = 0 THEN 0.0
-       WHEN isfinite(a*b) AND a*b != 0 THEN (a*b)/c
-       WHEN isfinite(a/c) AND a/c != 0 THEN (a/c)*b
-       WHEN isfinite(b/c) AND b/c != 0 THEN (b/c)*a
+       WHEN isfinite(a*b) AND a*b != 0 AND isfinite((a*b)/c) AND (a*b)/c != 0 THEN (a*b)/c
+       WHEN isfinite(a/c) AND a/c != 0 AND isfinite((a/c)*b) AND (a/c)*b != 0 THEN (a/c)*b
+       WHEN isfinite(b/c) AND b/c != 0 AND isfinite((b/c)*a) AND (b/c)*a != 0 THEN (b/c)*a
        ELSE sign(a)*sign(b)*sign(c)*exp(ln(abs(a))+ln(abs(b))-ln(abs(c))) END
 );
 

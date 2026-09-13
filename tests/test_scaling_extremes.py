@@ -385,3 +385,14 @@ def test_tweedie_fit_preserves_large_common_offset_shifts(con, solver, shift, of
     # Every observation is exactly fitted, independently of positive weights.
     assert coefficients['(Intercept)'] == pytest.approx(-shift, abs=1e-8)
     assert coefficients['x'] == pytest.approx(.3-offset_slope, abs=1e-8)
+
+
+@pytest.mark.parametrize('solver', ['auto', 'gd', 'irls'])
+@pytest.mark.parametrize('sign', [-1, 1])
+def test_linear_fit_preserves_the_smallest_nonconstant_double_scale(con, solver, sign):
+    tiny = np.nextafter(0., 1.)
+    con.execute('CREATE TABLE subnormal_fit(x DOUBLE,y DOUBLE)')
+    con.executemany('INSERT INTO subnormal_fit VALUES (?,?)', [(0.,0.),(tiny,sign*tiny)]*2)
+    coefficients = dict(con.execute(f"SELECT * FROM linreg_fit('subnormal_fit','y',solver:='{solver}',max_iter:=1000)").fetchall())
+    assert coefficients['(Intercept)'] == 0.
+    assert coefficients['x'] == pytest.approx(sign, rel=1e-10)
