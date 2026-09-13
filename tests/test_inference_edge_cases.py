@@ -1550,3 +1550,28 @@ def test_logistic_deviance_combines_weights_before_tail_underflow(con, sign, eta
     actual = con.execute("SELECT deviance_resid FROM logit_influence('tail_model','tail_rows','y',weights_col:='w')").fetchall()
     for row in actual:
         assert row[0] == pytest.approx(expected, rel=1e-12, abs=5e-324)
+
+
+@pytest.mark.parametrize('power', [1e20, 1e155, 1e308])
+@pytest.mark.parametrize('robust', ['hc0', 'hc1', 'hc2', 'hc3'])
+def test_tweedie_exact_mean_retains_observed_information_at_large_power(con, power, robust):
+    con.execute("CREATE TABLE unit_model AS SELECT * FROM (VALUES ('(Intercept)',0.::DOUBLE),('x',0.))t(feature,coefficient)")
+    con.execute('CREATE TABLE unit_rows AS SELECT i::DOUBLE x,1.::DOUBLE y FROM range(3)t(i)')
+    hats = con.execute(f"SELECT hat FROM tweedie_influence('unit_model','unit_rows','y',power:={power}) ORDER BY x").fetchnumpy()['hat']
+    np.testing.assert_allclose(hats, [5/6, 1/3, 5/6], rtol=1e-12)
+    errors = con.execute(f"SELECT std_error FROM tweedie_summary('unit_model','unit_rows','y',power:={power},robust:='{robust}')").fetchall()
+    assert errors == [(0.,), (0.,)]
+
+
+def test_tweedie_near_mean_large_power_leverage_matches_observed_hessian(con):
+    x = np.arange(4, dtype=float)
+    y = 1 + np.array([1e-10, 3e-10, 2e-10, 4e-10])
+    power = 1e20
+    design = np.column_stack([np.ones(4), x])
+    weights = 1+(power-1)*(y-1)
+    inverse = np.linalg.inv(design.T@(weights[:, None]*design))
+    expected = weights*np.einsum('ij,jk,ik->i', design, inverse, design)
+    load(con, 'near_mean_rows', pd.DataFrame({'x': x, 'y': y}))
+    con.execute("CREATE TABLE near_mean_model AS SELECT * FROM (VALUES ('(Intercept)',0.::DOUBLE),('x',0.))t(feature,coefficient)")
+    actual = con.execute(f"SELECT hat FROM tweedie_influence('near_mean_model','near_mean_rows','y',power:={power}) ORDER BY x").fetchnumpy()['hat']
+    np.testing.assert_allclose(actual, expected, rtol=1e-12)

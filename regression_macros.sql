@@ -2985,13 +2985,22 @@ CREATE OR REPLACE MACRO __reg_observed_ratio(y, eta, family, power, alpha) AS (
                               -__reg_softplus(ln(alpha)+eta))
        ELSE 1.0 END
 );
+-- Scaled Tweedie observed-information factor. Near an exact mean, retain
+-- the unit term explicitly: (2-p)+(p-1)*exp(lr) cancels it at large p.
+CREATE OR REPLACE MACRO __reg_tw_observed_factor(log_ratio, power) AS (
+  CASE WHEN abs(log_ratio)<1e-4
+       THEN (1.0+(power-1.0)*__reg_exp_diff_quotient(0.0,1.0,log_ratio))
+            *exp(-greatest(log_ratio,0.0))
+       ELSE (2.0-power)*exp(-greatest(log_ratio,0.0))
+            +(power-1.0)*exp(least(log_ratio,0.0)) END
+);
 -- Observed information must be combined with root weights and coordinates
 -- before exponentiation; an unweighted response/mean ratio can overflow.
 CREATE OR REPLACE MACRO __reg_observed_sign(y, eta, family, power) AS (
   CASE WHEN family='gamma' THEN sign(y)
        WHEN family='tweedie' THEN
          list_transform([coalesce(ln(nullif(y,0.0))-eta,'-Infinity'::DOUBLE)], lambda lr:
-           sign((2.0-power)*exp(-greatest(lr,0.0))+(power-1.0)*exp(least(lr,0.0))))[1]
+           sign(__reg_tw_observed_factor(lr,power)))[1]
        ELSE 1.0 END
 );
 CREATE OR REPLACE MACRO __reg_log_observed(y, eta, family, power, alpha) AS (
@@ -2999,8 +3008,7 @@ CREATE OR REPLACE MACRO __reg_log_observed(y, eta, family, power, alpha) AS (
        WHEN family='tweedie' THEN
          list_transform([coalesce(ln(nullif(y,0.0))-eta,'-Infinity'::DOUBLE)], lambda lr:
            (2.0-power)*eta+greatest(lr,0.0)
-           +coalesce(ln(nullif(abs((2.0-power)*exp(-greatest(lr,0.0))
-                           +(power-1.0)*exp(least(lr,0.0))),0.0)),'-Infinity'::DOUBLE))[1]
+           +coalesce(ln(nullif(abs(__reg_tw_observed_factor(lr,power)),0.0)),'-Infinity'::DOUBLE))[1]
        WHEN family='nbinom' THEN eta
            +CASE WHEN y=0 THEN 0.0 ELSE __reg_softplus(ln(alpha)+ln(y)) END
            -2.0*__reg_softplus(ln(alpha)+eta)
