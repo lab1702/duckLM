@@ -850,3 +850,37 @@ def test_negative_binomial_offset_null_score_retains_overflowing_mean_ratio(con)
     actual = _metrics(con, "nbinom_evaluate('nb_null_model','nb_null_rows','y',offset_col:='o')")
     assert actual['null_deviance'] == pytest.approx(expected_null, rel=1e-12)
     assert actual['pseudo_r2'] == pytest.approx(1-expected_model/expected_null, rel=1e-12)
+
+
+@pytest.mark.parametrize('outcome,alpha', [(1e308,1e-310), (1e-300,1e-310), (1e308,1e308)])
+def test_nb_offset_null_root_is_invariant_to_score_accumulation_order(con, outcome, alpha):
+    with localcontext() as context:
+        context.prec = 800
+        yy = Decimal.from_float(outcome)
+        scaled_alpha = Decimal.from_float(alpha)*yy
+        offsets = [Decimal.from_float(-.1), Decimal.from_float(.1)]
+        low, high = offsets
+        for _ in range(120):
+            mid = (low+high)/2
+            means = [(mid+offset).exp() for offset in offsets]
+            score = sum((1-q)/(1+scaled_alpha*q) for q in means)
+            if score>0:
+                low = mid
+            else:
+                high = mid
+        root = (low+high)/2
+        inverse_alpha = 1/scaled_alpha
+        halfdev = sum(-(root+offset)-(1+inverse_alpha)*
+                      ((1+inverse_alpha)/((root+offset).exp()+inverse_alpha)).ln()
+                      for offset in offsets)
+        expected_null = float(100*yy*halfdev)  # 50 copies of each offset, 2*halfdev
+    con.execute("CREATE TABLE order_model AS SELECT '(Intercept)' feature,ln(?::DOUBLE) coefficient", [outcome])
+    results = []
+    for offsets in [[-.1]*50+[.1]*50, [.1]*50+[-.1]*50, [-.1,.1]*50]:
+        con.execute('CREATE OR REPLACE TABLE order_rows(y DOUBLE,o DOUBLE)')
+        con.executemany('INSERT INTO order_rows VALUES (?,?)', [(outcome, offset) for offset in offsets])
+        result = _metrics(con, f"nbinom_evaluate('order_model','order_rows','y',alpha:={alpha},offset_col:='o')")
+        assert result['null_deviance'] == pytest.approx(expected_null, rel=1e-9, abs=5e-324)
+        assert result['pseudo_r2'] == pytest.approx(1-result['deviance']/expected_null, rel=1e-8, abs=1e-10)
+        results.append(result['null_deviance'])
+    np.testing.assert_allclose(results, results[0], rtol=1e-12, atol=5e-324)

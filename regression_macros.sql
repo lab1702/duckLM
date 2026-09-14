@@ -1283,11 +1283,23 @@ CREATE OR REPLACE MACRO __reg_nb_pearson(y, eta, alpha, root_weight := 1.0, log_
          WHEN exp(eta)>0 THEN __reg_exp_scale(y-exp(eta),-eta/2.0-logden/2.0+ln(root_weight)+log_scale)
          ELSE __reg_exp_scale(y,-eta/2.0-logden/2.0+ln(root_weight)+log_scale)-exp(eta/2.0-logden/2.0+ln(root_weight)+log_scale) END)[1]
 );
-CREATE OR REPLACE MACRO __reg_nb_score(y, eta, alpha) AS (
+-- Bound both positive and negative NB score components in log units. A
+-- per-iteration maximum gives the null-root sum a common scale without losing
+-- tiny outcomes or ratios suppressed by a large dispersion/mean product.
+CREATE OR REPLACE MACRO __reg_nb_score_unit(y, eta, alpha) AS (
+  CASE WHEN eta>=0 THEN
+         greatest(coalesce(ln(nullif(y,0.0)),'-Infinity'::DOUBLE)-eta,0.0)
+           -ln(exp(-eta)+alpha)
+       ELSE greatest(coalesce(ln(nullif(y,0.0)),'-Infinity'::DOUBLE),eta)
+           -__reg_softplus(ln(alpha)+eta) END
+);
+CREATE OR REPLACE MACRO __reg_nb_score(y, eta, alpha, log_scale := 0.0) AS (
   CASE WHEN eta >= 0 THEN
-         ((CASE WHEN isfinite(exp(eta)) THEN y/exp(eta)
-                ELSE __reg_exp_scale(y,-eta) END)-1.0)/(exp(-eta)+alpha)
-       ELSE (y-exp(eta))/(1.0+alpha*exp(eta)) END
+         __reg_exp_scale((CASE WHEN isfinite(exp(eta)) THEN y/exp(eta)
+                              ELSE __reg_exp_scale(y,-eta) END)-1.0,
+                         -ln(exp(-eta)+alpha)-log_scale)
+       WHEN y=0 THEN -__reg_exp_scale(1.0,eta-__reg_softplus(ln(alpha)+eta)-log_scale)
+       ELSE __reg_exp_scale(y-exp(eta),-__reg_softplus(ln(alpha)+eta)-log_scale) END
 );
 
 -- Pearson residual for variance mu^power, restoring its log scale only after
@@ -1574,9 +1586,12 @@ __reg_null_bounds(it, lo, hi) AS (
       SELECT it, lo, hi, mid,
              list_sum(list_transform(d.rows, lambda r:
                CASE WHEN family = 'logistic' THEN __reg_logit_resid(r.y,mid+r.o)
-                    ELSE __reg_nb_score(r.y,mid+r.o,alpha) END)) AS score
+                    ELSE __reg_nb_score(r.y,mid+r.o,alpha,score_scale.log_unit) END)) AS score
       FROM (SELECT *, lo/2.0+hi/2.0 AS mid FROM __reg_null_bounds
-            WHERE it < 2200 AND lo < lo/2.0+hi/2.0 AND lo/2.0+hi/2.0 < hi) b, __reg_null_data d
+            WHERE it < 2200 AND lo < lo/2.0+hi/2.0 AND lo/2.0+hi/2.0 < hi) b, __reg_null_data d,
+           LATERAL (SELECT CASE WHEN family='nbinom' THEN
+             list_max(list_transform(d.rows,lambda r: __reg_nb_score_unit(r.y,mid+r.o,alpha)))
+             ELSE 0.0 END AS log_unit) score_scale
     )
 ),
 -- The power-variance families have an analytic intercept-only score root:
