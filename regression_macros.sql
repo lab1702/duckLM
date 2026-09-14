@@ -480,9 +480,11 @@ __reg_scales AS MATERIALIZED (
 __reg_stats AS MATERIALIZED (
     SELECT m.col, row_number() OVER (ORDER BY m.col) AS j, m.mu,
            CASE WHEN m.constant THEN 1.0
-                ELSE __reg_mul_div(m.scale,
+                -- A nonconstant subnormal column can have an SD below the
+                -- smallest positive DOUBLE. Keep a representable positive unit.
+                ELSE greatest('5e-324'::DOUBLE, __reg_mul_div(m.scale,
                      sqrt(sum(__reg_weighted_center(s.v,m.mu,w.sw,nullif(m.scale,0.0)) ^ 2) FILTER (WHERE w.sw > 0)),
-                     sqrt(sum(w.w) FILTER (WHERE w.sw > 0))) END AS sigma
+                     sqrt(sum(w.w) FILTER (WHERE w.sw > 0)))) END AS sigma
     FROM __reg_scales m JOIN __reg_clong s ON s.col = m.col
     JOIN __reg_w w ON w.rid = s.rid
     GROUP BY m.col, m.mu, m.constant, m.scale
@@ -515,7 +517,9 @@ __reg_ycenter AS (
 ),
 __reg_ystdev AS (
     SELECT any_value(mu) AS mu,
-           __reg_mul_div(any_value(scale),sqrt(sum(pow(__reg_weighted_center(v,mu,sw,nullif(scale,0.0)),2))),sqrt(sum(w))) AS sd
+           CASE WHEN max(scale)>0 THEN greatest('5e-324'::DOUBLE,
+             __reg_mul_div(any_value(scale),sqrt(sum(pow(__reg_weighted_center(v,mu,sw,nullif(scale,0.0)),2))),sqrt(sum(w))))
+                ELSE 0.0 END AS sd
     FROM __reg_ycenter
 ),
 -- A common offset is an unpenalized intercept shift in every family. Center
@@ -1266,7 +1270,9 @@ CREATE OR REPLACE MACRO __reg_nb_pearson(y, eta, alpha, root_weight := 1.0, log_
          ELSE __reg_exp_scale(y,-eta/2.0-logden/2.0+ln(root_weight)+log_scale)-exp(eta/2.0-logden/2.0+ln(root_weight)+log_scale) END)[1]
 );
 CREATE OR REPLACE MACRO __reg_nb_score(y, eta, alpha) AS (
-  CASE WHEN eta >= 0 THEN (y/exp(eta)-1.0)/(exp(-eta)+alpha)
+  CASE WHEN eta >= 0 THEN
+         ((CASE WHEN isfinite(exp(eta)) THEN y/exp(eta)
+                ELSE __reg_exp_scale(y,-eta) END)-1.0)/(exp(-eta)+alpha)
        ELSE (y-exp(eta))/(1.0+alpha*exp(eta)) END
 );
 
@@ -1805,7 +1811,8 @@ __reg_mstats AS MATERIALIZED (
          row_number() OVER (ORDER BY col) AS j,
          CASE WHEN min(v) = max(v) THEN min(v) ELSE any_value(mu_raw) END AS mu,
          CASE WHEN min(v) = max(v) THEN 1.0
-              ELSE max(scale)*sqrt(avg(pow(__reg_centered(v,mu_raw,nullif(scale,0.0)),2))) END AS sigma
+              ELSE greatest('5e-324'::DOUBLE,
+                   max(scale)*sqrt(avg(pow(__reg_centered(v,mu_raw,nullif(scale,0.0)),2)))) END AS sigma
   FROM (SELECT *,max(__reg_center_scale(v,mu_raw)) OVER (PARTITION BY col) AS scale
         FROM (SELECT *,CASE WHEN isfinite(avg(v-vbase) OVER (PARTITION BY col))
                             THEN vbase+avg(v-vbase) OVER (PARTITION BY col)
@@ -2118,7 +2125,8 @@ __reg_cv_stats AS MATERIALIZED (
   SELECT col, row_number() OVER (ORDER BY col) AS j,
          CASE WHEN min(v)=max(v) THEN min(v) ELSE any_value(mu_raw) END AS mu,
          CASE WHEN min(v)=max(v) THEN 1.0
-              ELSE max(scale)*sqrt(avg(pow(__reg_centered(v,mu_raw,nullif(scale,0.0)),2))) END AS sigma
+              ELSE greatest('5e-324'::DOUBLE,
+                   max(scale)*sqrt(avg(pow(__reg_centered(v,mu_raw,nullif(scale,0.0)),2)))) END AS sigma
   FROM (SELECT *,max(__reg_center_scale(v,mu_raw)) OVER (PARTITION BY col) AS scale
         FROM (SELECT *,CASE WHEN isfinite(avg(v-vbase) OVER (PARTITION BY col))
                             THEN vbase+avg(v-vbase) OVER (PARTITION BY col)
@@ -2133,7 +2141,9 @@ __reg_cv_ys AS MATERIALIZED (
          CASE WHEN family='logistic' THEN 1.0
               WHEN family IN ('poisson','gamma','tweedie','nbinom') THEN (CASE WHEN mu=0.0 THEN 1.0 ELSE mu END)
               WHEN coalesce(sd,0)=0.0 THEN 1.0 ELSE sd END AS sd_y
-  FROM (SELECT any_value(mu_raw) AS mu,max(scale)*sqrt(avg(pow(__reg_centered(y,mu_raw,nullif(scale,0.0)),2))) AS sd
+  FROM (SELECT any_value(mu_raw) AS mu,
+               CASE WHEN max(scale)>0 THEN greatest('5e-324'::DOUBLE,
+                 max(scale)*sqrt(avg(pow(__reg_centered(y,mu_raw,nullif(scale,0.0)),2)))) ELSE 0.0 END AS sd
         FROM (SELECT *,max(__reg_center_scale(y,mu_raw)) OVER () AS scale
               FROM (SELECT *,CASE WHEN isfinite(avg(y-ybase) OVER ())
                                   THEN ybase+avg(y-ybase) OVER ()
@@ -2541,7 +2551,8 @@ __reg_nbd_stats AS MATERIALIZED (
   SELECT col, row_number() OVER (ORDER BY col) AS j,
          CASE WHEN min(v)=max(v) THEN min(v) ELSE any_value(mu_raw) END AS mu,
          CASE WHEN min(v)=max(v) THEN 1.0
-              ELSE max(scale)*sqrt(avg(pow(__reg_centered(v,mu_raw,nullif(scale,0.0)),2))) END AS sigma
+              ELSE greatest('5e-324'::DOUBLE,
+                   max(scale)*sqrt(avg(pow(__reg_centered(v,mu_raw,nullif(scale,0.0)),2)))) END AS sigma
   FROM (SELECT *,max(__reg_center_scale(v,mu_raw)) OVER (PARTITION BY col) AS scale
         FROM (SELECT *,CASE WHEN isfinite(avg(v-vbase) OVER (PARTITION BY col))
                             THEN vbase+avg(v-vbase) OVER (PARTITION BY col)

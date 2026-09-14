@@ -833,3 +833,20 @@ def test_linear_r2_centers_large_outcome_means(con, baseline, reverse, pattern):
     metrics = _metrics(con, "linreg_evaluate('mean_model','mean_rows','y')")
     assert metrics['r2'] == pytest.approx(expected, abs=1e-14)
     assert metrics['adj_r2'] == pytest.approx(1-(1-expected)*5/4, abs=1e-14)
+
+
+def test_negative_binomial_offset_null_score_retains_overflowing_mean_ratio(con):
+    con.execute("CREATE TABLE nb_null_model AS SELECT '(Intercept)' feature,ln(1e308) coefficient UNION ALL SELECT 'x',0.")
+    con.execute('CREATE TABLE nb_null_rows AS SELECT * FROM (VALUES (0.,1e308,0.),(1.,1e308,2.))t(x,y,o)')
+    # At this scale NB(alpha=1) agrees with the Gamma limit to DOUBLE
+    # precision. Its offset null mean has an independent closed-form optimum.
+    offset = np.array([0., 2.])
+    log_mean = float(np.log(1e308))
+    null_intercept = log_mean+np.log(np.exp(-offset).mean())
+    null_log_ratio = log_mean-null_intercept-offset
+    model_log_ratio = -offset
+    expected_null = 2*np.sum(np.exp(null_log_ratio)-1-null_log_ratio)
+    expected_model = 2*np.sum(np.exp(model_log_ratio)-1-model_log_ratio)
+    actual = _metrics(con, "nbinom_evaluate('nb_null_model','nb_null_rows','y',offset_col:='o')")
+    assert actual['null_deviance'] == pytest.approx(expected_null, rel=1e-12)
+    assert actual['pseudo_r2'] == pytest.approx(1-expected_model/expected_null, rel=1e-12)

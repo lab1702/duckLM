@@ -396,3 +396,23 @@ def test_linear_fit_preserves_the_smallest_nonconstant_double_scale(con, solver,
     coefficients = dict(con.execute(f"SELECT * FROM linreg_fit('subnormal_fit','y',solver:='{solver}',max_iter:=1000)").fetchall())
     assert coefficients['(Intercept)'] == 0.
     assert coefficients['x'] == pytest.approx(sign, rel=1e-10)
+
+
+@pytest.mark.parametrize('solver', ['auto', 'gd', 'irls'])
+@pytest.mark.parametrize('sign', [-1, 1])
+def test_sparse_subnormal_variance_keeps_a_positive_fitting_scale(con, solver, sign):
+    tiny = np.nextafter(0., 1.)
+    con.execute('CREATE TABLE sparse_subnormal(x DOUBLE,y DOUBLE)')
+    con.executemany('INSERT INTO sparse_subnormal VALUES (?,?)', [(0.,0.)]*9+[(tiny,sign*tiny)])
+    coefficients = dict(con.execute(f"SELECT * FROM linreg_fit('sparse_subnormal','y',solver:='{solver}',max_iter:=1000)").fetchall())
+    assert coefficients['(Intercept)'] == 0.
+    assert coefficients['x'] == pytest.approx(sign, rel=1e-9)
+
+
+@pytest.mark.parametrize('family', ['linear', 'poisson'])
+def test_cv_handles_a_sparse_subnormal_feature(con, family):
+    tiny = np.nextafter(0., 1.)
+    con.execute('CREATE TABLE sparse_cv(x DOUBLE,y DOUBLE)')
+    con.executemany('INSERT INTO sparse_cv VALUES (?,?)', [(0.,1.)]*9+[(tiny,2.)])
+    rows = con.execute(f"SELECT * FROM cv_l2('sparse_cv','y','{family}',[.1],k:=2,max_iter:=100)").fetchdf()
+    assert np.isfinite(rows.select_dtypes(include=[np.number]).to_numpy()).all()
