@@ -681,7 +681,11 @@ __reg_cfg AS (
 -- Compute an intercept-only starting point using log-sum-exp in that case.
 __reg_poisson_seed AS (
     SELECT max(log_root_mean) AS max_log_root_mean,
-           ln(sum(sw*wy))-max(log_mean_max)-ln(sum(exp(log_mean-log_mean_max))) AS intercept
+           -- Zero counts have no finite intercept MLE. A unit-total starting
+           -- mean keeps the extreme-offset seed finite while iterations lower it;
+           -- ordinary offsets also must not evaluate an unused ln(0).
+           coalesce(ln(nullif(sum(sw*wy),0.0)),0.0)
+             -max(log_mean_max)-ln(sum(exp(log_mean-log_mean_max))) AS intercept
     FROM (
       SELECT r.sw AS sw,r.wy AS wy,ln(r.sw)+r.o AS log_root_mean,
              2.0*ln(r.sw)+r.o AS log_mean,

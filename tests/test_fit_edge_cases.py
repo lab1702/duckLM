@@ -374,3 +374,33 @@ def test_logistic_fit_keeps_information_after_sigmoid_rounding(con, solver, mino
     expected = (2*majority_label-1)*-np.log(minority_weight)
     assert coefficients['(Intercept)'] == pytest.approx(expected, abs=1e-8)
     assert coefficients['x'] == pytest.approx(0, abs=1e-8)
+
+
+@pytest.mark.parametrize('family', ['poisson', 'nbinom', 'tweedie'])
+@pytest.mark.parametrize('solver', ['auto', 'gd', 'irls'])
+@pytest.mark.parametrize('offset', [0., 2000.])
+@pytest.mark.parametrize('weighted', [False, True])
+def test_zero_count_fits_use_the_documented_solver_behavior(family, solver, offset, weighted):
+    with duckdb.connect() as con:
+        con.execute((Path(__file__).resolve().parents[1]/'regression_macros.sql').read_text())
+        con.execute('CREATE TABLE zero_counts AS SELECT i::DOUBLE x,0.::DOUBLE y,?*(i%2) o FROM range(4)t(i)', [offset])
+        if weighted:
+            con.execute('ALTER TABLE zero_counts ADD COLUMN w DOUBLE')
+            con.execute('UPDATE zero_counts SET w=x+1')
+        weights = ",weights_col:='w'" if weighted else ''
+        power = ',power:=1.' if family == 'tweedie' else ''
+        query = f"CREATE TABLE zero_model AS SELECT * FROM {family}_fit('zero_counts','y',solver:='{solver}',max_iter:=20,offset_col:='o'{weights}{power})"
+        if solver == 'irls':
+            # Explicit IRLS requires convergence. Its documented error should
+            # replace the accidental seed-logarithm exception for this no-MLE case.
+            with pytest.raises(duckdb.Error, match='irls solver did not converge'):
+                con.execute(query)
+            return
+        con.execute(query)
+        coefficients = dict(con.execute('SELECT * FROM zero_model').fetchall())
+        assert coefficients.keys() == {'(Intercept)', 'x'}
+        assert np.isfinite(list(coefficients.values())).all()
+        predictions = con.execute(f"SELECT prediction FROM {family}_predict('zero_model','zero_counts',offset_col:='o')").fetchnumpy()['prediction']
+        assert np.isfinite(predictions).all()
+        assert (predictions >= 0).all()
+        assert predictions.mean() < 1.

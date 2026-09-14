@@ -565,7 +565,7 @@ DuckDB; qualified and quoted names are supported.
   is arbitrary (as it is for every solver). Forcing `solver := 'irls'`, and
   `*_summary` / `*_predict_ci` / `*_influence`, instead return a clear error /
   NULL because the covariance is undefined there.
-- Data with no finite maximum-likelihood solution — perfectly separable
+- Under `auto` or `gd`, data with no finite maximum-likelihood solution — perfectly separable
   logistic data, or an all-zero-count Poisson outcome —
   still terminates with large coefficients rather than erroring, but only
   after running all `max_iter` iterations. (IRLS diverges to ~1e305 on separable
