@@ -566,7 +566,7 @@ DuckDB; qualified and quoted names are supported.
   `*_summary` / `*_predict_ci` / `*_influence`, instead return a clear error /
   NULL because the covariance is undefined there.
 - Data with no finite maximum-likelihood solution — perfectly separable
-  logistic data, or an all-zero-count Poisson/all-constant Gamma outcome —
+  logistic data, or an all-zero-count Poisson outcome —
   still terminates with large coefficients rather than erroring, but only
   after running all `max_iter` iterations. (IRLS diverges to ~1e305 on separable
   data, which the `'auto'` solver treats as a failure and falls back to `gd`, so
@@ -574,7 +574,8 @@ DuckDB; qualified and quoted names are supported.
   logistic** data a positive `l2` gives a finite, fast solution (it penalizes the
   diverging slopes). For an **all-zero Poisson** outcome it's the *intercept*
   that diverges, and `l2` does not penalize the intercept (by design, matching
-  glmnet/sklearn), so lower `max_iter` instead.
+  glmnet/sklearn), so lower `max_iter` instead. A constant positive Gamma
+  outcome has a finite mean-model solution: intercept `ln(y)` and zero slopes.
 - Guarded name collisions (clear errors, never silent misbehavior): column
   *and table* names beginning with `__reg_` are reserved everywhere, checked
   case-insensitively; a *feature* named `(Intercept)` is rejected at fit time

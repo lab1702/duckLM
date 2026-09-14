@@ -2,22 +2,24 @@
 
 Table macros for DuckDB **1.5+**, no extensions and no driver required. For each
 of binary logistic, ordinary-least-squares linear, Poisson, Gamma, Tweedie,
-negative-binomial (all but linear use a log link) and **multinomial (softmax)**
-regression, duckLM provides **fit**, **predict**, **evaluate**, **summary**
-(standard errors, p-values, confidence intervals), **prediction intervals** and
-**influence diagnostics** — plus cross-validation, robust/cluster-robust SEs,
-and a fast IRLS solver. The single-outcome families take optional
-ridge/lasso/elastic-net regularization, an offset/exposure term, and sample
-weights.
+negative-binomial and **multinomial (softmax)** regression, duckLM provides
+**fit**, **predict**, **evaluate**, and **summary** (standard errors, p-values,
+and coefficient confidence intervals). Binary logistic uses a logit link,
+linear uses an identity link, and the other single-outcome families use a log link.
 
-Everything runs inside DuckDB: training is Fisher-scoring IRLS by default —
-with coordinate descent for the L1 term, and Nesterov-accelerated gradient
-descent as an automatic fallback on a rank-deficient design — all implemented
-with a recursive CTE and list lambdas, sharing a single optimizer core across
-all families; even the coefficient
-covariance (matrix inversion) and the normal/Student-t distributions are
-computed in pure SQL. All outputs are verified against statsmodels / scikit-learn
-to machine precision.
+The single-outcome families also provide **prediction intervals**, **influence
+diagnostics**, cross-validation, robust/cluster-robust SEs, and a fast IRLS
+solver. They take optional ridge/lasso/elastic-net regularization, an
+offset/exposure term, and sample weights.
+
+Everything runs inside DuckDB. The single-outcome families share an optimizer
+core: Fisher-scoring IRLS by default, with coordinate descent for the L1 term
+and Nesterov-accelerated gradient descent as an automatic fallback on a
+rank-deficient design. Multinomial fitting uses its own accelerated-gradient
+solver. All are implemented with recursive CTEs and list lambdas; even the
+coefficient covariance (matrix inversion) and normal/Student-t distributions
+are computed in pure SQL. Tests compare outputs with scikit-learn and
+independent NumPy/SciPy references.
 
 ## Setup
 
