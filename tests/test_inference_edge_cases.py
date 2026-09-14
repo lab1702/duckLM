@@ -1575,3 +1575,31 @@ def test_tweedie_near_mean_large_power_leverage_matches_observed_hessian(con):
     con.execute("CREATE TABLE near_mean_model AS SELECT * FROM (VALUES ('(Intercept)',0.::DOUBLE),('x',0.))t(feature,coefficient)")
     actual = con.execute(f"SELECT hat FROM tweedie_influence('near_mean_model','near_mean_rows','y',power:={power}) ORDER BY x").fetchnumpy()['hat']
     np.testing.assert_allclose(actual, expected, rtol=1e-12)
+
+
+@pytest.mark.parametrize('eta', [-1e-8, 1e-8, -1e-150, 1e-150])
+def test_nb_near_mean_deviance_root_survives_unweighted_underflow(con, eta):
+    from decimal import Decimal, localcontext
+    con.execute("CREATE TABLE nb_tiny_deviance_model AS SELECT '(Intercept)' feature,?::DOUBLE coefficient", [eta])
+    con.execute('CREATE TABLE nb_tiny_deviance_rows AS SELECT 1.::DOUBLE y,1e308::DOUBLE w FROM range(3)')
+    with localcontext() as context:
+        context.prec = 1000
+        mu = Decimal.from_float(eta).exp()
+        weight = Decimal.from_float(1e308)
+        r = 1/weight
+        halfdev = (1/mu).ln()-(1+r)*((1+r)/(mu+r)).ln()
+        expected = (-1 if eta>0 else 1)*float((2*weight*halfdev).sqrt())
+    rows = con.execute("SELECT deviance_resid FROM nbinom_influence('nb_tiny_deviance_model','nb_tiny_deviance_rows','y',alpha:=1e308,weights_col:='w')").fetchall()
+    for row in rows:
+        assert row[0] == pytest.approx(expected, rel=1e-12, abs=5e-324)
+
+
+def test_nb_fitted_near_mean_weighted_deviance_is_nonzero(con):
+    con.execute('''CREATE TABLE nb_near_fit_rows AS SELECT x,y,1e308::DOUBLE w
+        FROM (VALUES (-1.),(1.))a(x),(VALUES (1.-1e-8),(1.+1e-8))b(y)''')
+    con.execute("CREATE TABLE nb_near_fit_model AS SELECT * FROM nbinom_fit('nb_near_fit_rows','y',alpha:=1e308,weights_col:='w')")
+    residuals = con.execute("SELECT y,deviance_resid FROM nbinom_influence('nb_near_fit_model','nb_near_fit_rows','y',alpha:=1e308,weights_col:='w')").fetchall()
+    for y, residual in residuals:
+        # With alpha and weight equal at 1e308, near-mean NB deviance has
+        # the unit-weight Gamma limit; the error here is second order in y-1.
+        assert residual == pytest.approx(y-1, rel=1e-7, abs=1e-16)

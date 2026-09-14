@@ -1227,7 +1227,17 @@ CREATE OR REPLACE MACRO __reg_bd0_root(loga, q) AS (
 CREATE OR REPLACE MACRO __reg_nb_halfdev_root(y, eta, alpha, root_weight) AS (
   list_transform([__reg_nb_halfdev(y,eta,alpha)],lambda dev:
     CASE WHEN root_weight=0 THEN 0.0
-         WHEN isfinite(dev) THEN root_weight*sqrt(greatest(dev,0.0))
+         -- Near the mean, the half-deviance may underflow before its root and
+         -- absolute observation weight are applied. Keep curvature in logs.
+         WHEN y>0 AND abs(ln(y)-eta)<1e-3 THEN
+           list_transform([struct_pack(t := ln(y)-eta,
+             w := 1.0/(1.0+exp(ln(y)+ln(alpha))),
+             logh := least(ln(y),-ln(alpha))-__reg_log1p(exp(-abs(ln(y)+ln(alpha)))))],lambda z:
+             __reg_exp_scale(abs(z.t),ln(root_weight)+0.5*(z.logh+
+               ln(0.5+z.t*((1.0-2.0*z.w)/6.0
+                 +z.t*((1.0-6.0*z.w+6.0*z.w*z.w)/24.0
+                 +z.t*(1.0-2.0*z.w)*(1.0-12.0*z.w+12.0*z.w*z.w)/120.0))))))[1]
+         WHEN isfinite(dev) AND dev>=1e-300 THEN root_weight*sqrt(dev)
          ELSE list_transform([struct_pack(
            a := __reg_bd0_root(ln(y)+2.0*ln(root_weight),__reg_softplus(-ln(alpha)-ln(y))-__reg_softplus(-ln(alpha)-eta)),
            b := __reg_bd0_root(-ln(alpha)+2.0*ln(root_weight),__reg_softplus(ln(y)+ln(alpha))-__reg_softplus(eta+ln(alpha))))],lambda roots:
@@ -3995,10 +4005,10 @@ __reg_diag AS (
                      *__reg_tw_halfdev(p.y,p.eta,CASE family WHEN 'poisson' THEN 1.0 WHEN 'gamma' THEN 2.0 ELSE power END,
                                       root_result:=true,root_weight:=p.sw*sqrt(ws.wscale)*sqrt(2.0))
               WHEN family = 'nbinom' AND p.y=0
-                THEN -__reg_exp_scale(p.sw,0.5*ln(2.0)+CASE WHEN p.eta+ln(alpha)<-30.0 THEN p.eta/2.0
+                THEN -__reg_exp_scale(p.sw,0.5*ln(ws.wscale)+0.5*ln(2.0)+CASE WHEN p.eta+ln(alpha)<-30.0 THEN p.eta/2.0
                      ELSE (ln(__reg_softplus(p.eta+ln(alpha)))-ln(alpha))/2.0 END)
               WHEN family = 'nbinom'
-                THEN sign(ln(p.y)-p.eta)*sqrt(2.0)*__reg_nb_halfdev_root(p.y,p.eta,alpha,p.sw)
+                THEN sign(ln(p.y)-p.eta)*sqrt(2.0)*__reg_nb_halfdev_root(p.y,p.eta,alpha,p.sw*sqrt(ws.wscale))
               ELSE sign(p.resid) * p.sw * sqrt(2.0) * sqrt(greatest(p.halfdev, 0.0)) END AS deviance_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN pearson_resid/(SELECT unit FROM __reg_punits) / sqrt(dp.phi*(1.0-l.h)) END AS std_resid,
          CASE WHEN isfinite(l.h) AND l.h < 1.0 THEN
@@ -4012,7 +4022,7 @@ SELECT n.* EXCLUDE (__reg_rid__), d.hat,
        __reg_mul_div(d.pearson_resid*(CASE WHEN family IN ('logistic','poisson','nbinom') THEN 1.0 ELSE sqrt(ws.wscale) END),
          (SELECT CASE WHEN family='tweedie' THEN exp((1.0-power/2.0)*shift) ELSE runit END
           FROM __reg_resunits CROSS JOIN __reg_responseunits),1.0) AS pearson_resid,
-       __reg_mul_div(d.deviance_resid*(CASE WHEN family IN ('logistic','poisson','gamma','tweedie') THEN 1.0 ELSE sqrt(ws.wscale) END),
+       __reg_mul_div(d.deviance_resid*(CASE WHEN family IN ('logistic','poisson','gamma','tweedie','nbinom') THEN 1.0 ELSE sqrt(ws.wscale) END),
          (SELECT CASE WHEN family='tweedie' THEN exp((1.0-power/2.0)*shift) ELSE runit END
           FROM __reg_resunits CROSS JOIN __reg_responseunits),1.0) AS deviance_resid,
        d.std_resid AS std_resid,
