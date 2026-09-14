@@ -2241,8 +2241,8 @@ class TestAutoSolver:
 
 
 # --------------------------------------------------------------------------- #
-# __reg_cv solves its M = k * |grid| models with IRLS, falling back to gradient
-# descent for an L1 sweep or a singular fold
+# __reg_cv solves its M = k * |grid| models with IRLS (coordinate descent for
+# L1 penalties), falling back to gradient descent when IRLS cannot converge.
 # --------------------------------------------------------------------------- #
 class TestCvIRLS:
     def _gen(self, seed, n=1200):
@@ -2264,26 +2264,37 @@ class TestCvIRLS:
         "cv_alpha('cvt','yc',[0.5,1.5], k := 3)",
     ])
     def test_cv_irls_matches_gd_deviance(self, con, call):
-        # the IRLS path must select the same hyperparameter and report the same
-        # CV deviance as the gradient-descent path did (gd converges only to tol,
-        # so compare at that tolerance rather than to machine precision)
-        _load(con, "cvt", self._gen(31))
-        new = con.execute(f"SELECT * FROM {call}").fetchall()
-        # force the gd path by asking for the same grid with a zero L1 sweep, which
-        # cannot use irls -- the L1 = 0 model is exactly the unpenalised one
-        assert all(np.isfinite(d) for _, d in new)
-        assert len(new) >= 2
+        # Use an isolated installation with an empty IRLS seed. Its public CV
+        # wrappers must run the actual GD fallback, with identical preprocessing,
+        # folds and hyperparameters. Production macros remain untouched.
+        source = MACRO_FILE.read_text()
+        seed = source.index('__reg_cv_irls(it, B, move) AS (')
+        union = source.index('  UNION ALL', seed)
+        assert source[seed:union].endswith('  FROM __reg_cv_cfg c\n')
+        gd_source = source[:union] + '  WHERE false\n' + source[union:]
+        data = self._gen(31)
+        _load(con, "cvt", data)
+        call = call[:-1] + ', max_iter := 5000, tol := 1e-9)'
+        irls = dict(con.execute(f"SELECT * FROM {call}").fetchall())
+        with duckdb.connect() as gd_con:
+            gd_con.execute(gd_source)
+            _load(gd_con, "cvt", data)
+            gd = dict(gd_con.execute(f"SELECT * FROM {call}").fetchall())
+        assert len(irls) >= 2
+        assert irls.keys() == gd.keys()
+        assert all(np.isfinite(d) for d in irls.values())
+        for parameter in irls:
+            assert irls[parameter] == pytest.approx(gd[parameter], rel=1e-6, abs=1e-8)
+        assert min(irls, key=irls.get) == min(gd, key=gd.get)
 
     def test_cv_l2_zero_matches_cv_l1_zero(self, con):
-        # l2 := 0 (irls path) and l1 := 0 (gd path) describe the SAME models, so
-        # their CV deviances must agree -- this pins irls against gd end to end
+        # Both public sweeps describe the same unpenalized models at zero.
         _load(con, "cvt", self._gen(32))
-        irls = con.execute("SELECT cv_deviance FROM cv_l2('cvt','y','logistic',[0.0], k := 4)").fetchone()[0]
-        gd = con.execute("SELECT cv_deviance FROM cv_l1('cvt','y','logistic',[0.0], k := 4)").fetchone()[0]
-        assert irls == pytest.approx(gd, rel=1e-6), (irls, gd)
+        l2 = con.execute("SELECT cv_deviance FROM cv_l2('cvt','y','logistic',[0.0], k := 4)").fetchone()[0]
+        l1 = con.execute("SELECT cv_deviance FROM cv_l1('cvt','y','logistic',[0.0], k := 4)").fetchone()[0]
+        assert l2 == pytest.approx(l1, rel=1e-6), (l2, l1)
 
-    def test_cv_l1_still_uses_gd(self, con):
-        # irls cannot do L1; cv_l1 must still produce sane, finite deviances
+    def test_cv_l1_reports_finite_deviances(self, con):
         _load(con, "cvt", self._gen(33))
         r = con.execute("SELECT * FROM cv_l1('cvt','y','logistic',[0.0,0.05,0.2], k := 4) ORDER BY l1").fetchall()
         assert len(r) == 3
